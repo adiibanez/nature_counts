@@ -1,0 +1,19 @@
+FROM nvcr.io/nvidia/deepstream:6.4-samples
+
+# Install TensorRT dev headers matching DS 6.4 (TRT 8.6 + CUDA 12.2)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnvinfer-dev \
+    libnvinfer-plugin-dev \
+    libnvonnxparsers-dev \
+    libnvparsers-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CUDA 12.2 dev tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-nvcc-12-2 \
+    cuda-cudart-dev-12-2 \
+    cuda-cccl-12-2 \
+    libcublas-dev-12-2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /DeepStream-Yolo

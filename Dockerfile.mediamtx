@@ -1,0 +1,11 @@
+FROM bluenviron/mediamtx:latest AS mediamtx
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mediamtx /mediamtx /mediamtx
+COPY --from=mediamtx /mediamtx.yml /mediamtx.yml
+
+ENTRYPOINT ["/mediamtx"]

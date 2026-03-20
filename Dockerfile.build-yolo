@@ -1,0 +1,29 @@
+FROM nvcr.io/nvidia/deepstream:6.0.1-samples
+
+# Layer 1: Fix expired NVIDIA repo key (cached after first build)
+RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub
+
+# Layer 2: Install TensorRT dev headers pinned to container's CUDA 11.3 version (cached)
+RUN apt-get update && apt-get install -y --allow-downgrades \
+    libnvinfer-dev=8.0.1-1+cuda11.3 \
+    libnvinfer-plugin-dev=8.0.1-1+cuda11.3 \
+    libnvonnxparsers-dev=8.0.1-1+cuda11.3 \
+    libnvparsers-dev=8.0.1-1+cuda11.3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 3: Compile (this layer rebuilds when source changes)
+# Source is mounted at build time via build context, not COPY, so we use
+# the build script to docker-run this image instead.
+# But we can also just set the workdir for interactive use.
+# Layer 3: Install CUDA 11.4 dev headers (cuda_runtime_api.h, crt/host_defines.h, nvcc)
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
+    cuda-nvcc-11-4 \
+    cuda-cudart-dev-11-4 \
+    cuda-cccl-11-4 \
+    libcublas-11-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 4: Create linker symlink for libcublas (only versioned .so exists in cuda-11.4)
+RUN ln -s /usr/local/cuda-11.4/lib64/libcublas.so.11 /usr/local/cuda-11.4/lib64/libcublas.so
+
+WORKDIR /DeepStream-Yolo

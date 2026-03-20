@@ -1,0 +1,38 @@
+# Large binary / model files
+*.engine
+*.weights
+*.onnx
+*.onnx.data
+*.pt
+*.whl
+*.zip
+*.tar.gz
+
+# Videos
+videos/
+recording_10min.mp4
+*.mp4
+
+# Third-party checkouts (clone fresh if needed)
+DeepStream-Yolo/
+YOLO-Fish/
+darknet/
+checkouts/
+
+# OS-NVR archive
+os-nvr_docker/
+os-nvr_docker.tar.gz
+
+# Separate git repos (managed independently)
+phoenix-app/
+reefmonitor/
+
+# Google Drive binary
+gdrive
+
+# Compiled shared libraries and object files (rebuilt per platform)
+*.so
+*.o
+
+# Images (non-essential)
+hermit_crab*.png

@@ -1,0 +1,58 @@
+###############################################
+# MediaMTX — RTSP hub + WebRTC/HLS output
+###############################################
+
+rtspTransports: [udp, tcp]
+
+# WebRTC for low-latency browser playback
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: ""
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: yes
+webrtcAdditionalHosts: []
+
+# HLS as fallback
+hlsAlwaysRemux: yes
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 500ms
+
+paths:
+  # --- RAW camera inputs (file or real cameras) ---
+  # For testing: FFmpeg loops pre-encoded H.264 files (no transcoding)
+  # Run videos/preencode.sh first to prepare the files.
+  raw-cam1:
+    runOnInit: >
+      ffmpeg -re -stream_loop -1
+      -i /videos/rtsp-ready/P5_2025-03-07_420.mp4
+      -an -c:v copy
+      -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+
+  raw-cam2:
+    runOnInit: >
+      ffmpeg -re -stream_loop -1
+      -i /videos/rtsp-ready/cam_1.mp4
+      -an -c:v copy
+      -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+
+  raw-cam3:
+    runOnInit: >
+      ffmpeg -re -stream_loop -1
+      -i /videos/rtsp-ready/cam_2.mp4
+      -an -c:v copy
+      -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+
+  # For real cameras, add entries like:
+  # raw-cam1:
+  #   source: rtsp://192.168.1.195:8554/cam1
+
+  # --- Processed output from DeepStream ---
+  # DeepStream pushes RTSP directly via ffmpeg forwarder to cam1.
+  # The all_others wildcard auto-creates the path.
+
+  # Wildcard: accepts any RTSP publisher on any path
+  all_others:

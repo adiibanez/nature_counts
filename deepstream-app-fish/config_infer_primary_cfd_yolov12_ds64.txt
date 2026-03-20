@@ -1,0 +1,30 @@
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+model-color-format=0
+# ONNX model exported from CFD YOLOv12x via DeepStream-Yolo export script
+onnx-file=cfd-yolov12x-1.00.onnx
+# No model-engine-file: force TensorRT rebuild from ONNX on first run
+# (DS 6.4 uses TRT 8.6 / CUDA 12.2 — engine from DS 6.0 is incompatible)
+labelfile-path=cfd_labels.txt
+batch-size=3
+network-mode=0
+num-detected-classes=1
+interval=3
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+# YOLOv12 uses center-padding (letterbox) - must preserve aspect ratio
+maintain-aspect-ratio=1
+symmetric-padding=1
+# Input resolution: 640px for performance on GTX 1080 Ti
+infer-dims=3;640;640
+# Updated parser compiled for DS 6.4
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=libnvdsinfer_custom_impl_Yolo_cfd_ds64.so
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.25
+topk=300

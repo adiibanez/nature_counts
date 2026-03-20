@@ -1,0 +1,121 @@
+################################################################################
+# Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+################################################################################
+#
+# CFD YOLOv12x - single video test config
+# Minimal setup to validate the model loads and produces correct detections.
+# Single file source, batch-size=1, interval=0 (infer every frame).
+# Replace the URI below with a path to a known fish video inside the container.
+
+[application]
+enable-perf-measurement=1
+perf-measurement-interval-sec=5
+
+[tiled-display]
+enable=1
+rows=1
+columns=1
+width=1280
+height=720
+gpu-id=0
+nvbuf-memory-type=0
+
+[source0]
+enable=1
+#Type - 1=CameraV4L2 2=URI 3=MultiURI 4=RTSP
+type=2
+uri=file:///videos/BOCCocoPt_1_1652437801.mp4
+num-sources=1
+gpu-id=0
+cudadec-memtype=0
+
+[sink0]
+enable=1
+#Type - 1=FakeSink 2=EglSink 3=File 4=RTSP
+type=4
+sync=0
+source-id=0
+gpu-id=0
+nvbuf-memory-type=0
+codec=1
+rtsp-port=8554
+udp-port=5400
+
+[sink1]
+enable=1
+type=3
+sync=0
+source-id=0
+gpu-id=0
+nvbuf-memory-type=0
+container=1
+#1=mp4 2=mkv
+codec=1
+#1=h264 2=h265
+output-file=/videos/inference_output.mp4
+
+[osd]
+enable=1
+gpu-id=0
+border-width=2
+text-size=12
+text-color=1;1;1;1;
+text-bg-color=0.3;0.3;0.3;1
+font=Serif
+show-clock=0
+display-text=1
+display-bbox=1
+display-mask=0
+nvbuf-memory-type=0
+
+[streammux]
+gpu-id=0
+live-source=0
+batch-size=1
+batched-push-timeout=4000
+width=1280
+height=720
+enable-padding=1
+nvbuf-memory-type=0
+
+[primary-gie]
+enable=1
+gpu-id=0
+batch-size=1
+bbox-border-color0=1;0;0;1
+interval=0
+gie-unique-id=1
+nvbuf-memory-type=0
+config-file=config_infer_primary_cfd_yolov12.txt
+
+[tracker]
+enable=1
+tracker-width=640
+tracker-height=384
+ll-lib-file=/opt/nvidia/deepstream/deepstream-6.0/lib/libnvds_nvmultiobjecttracker.so
+ll-config-file=config_tracker_IOU.yml
+gpu-id=0
+enable-batch-process=1
+enable-past-frame=0
+display-tracking-id=1
+
+[tests]
+file-loop=0

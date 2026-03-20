@@ -1,0 +1,37 @@
+ffmpeg \
+      -i /home/adrianibanez/orca_data/DeepAL_ComParE/ComParE2019_OrcaActivity/wav/devel_0585.wav \
+      -i http://3998e124110a52ad2dc83793a9569ba1.balena-devices.com/archive/hls/live2.m3u8 \
+      -pix_fmt yuvj420p \
+      -x264-params keyint=48:min-keyint=48:scenecut=-1 \
+      -s 1280x720 \
+      -b:v 400k \
+      -b:a 64k \
+      -ar 44100 \
+      -r 10 \
+      -acodec aac \
+      -vcodec libx264 \
+      -preset ultrafast \
+      -crf 28 \
+      -threads 4 \
+      -f flv \
+      rtmp://a.rtmp.youtube.com/live2/5uty-kbyy-7p6z-zwx5-9m53
+      
+      
+      
+ffmpeg \
+      -i /home/adrianibanez/Downloads/40208185_coral-reefs_by_mintwhalecap_preview.mp3 \
+      -i rtsp://localhost:8555/ds-test \
+      -pix_fmt yuvj420p \
+      -x264-params keyint=48:min-keyint=48:scenecut=-1 \
+      -s 1320x1080 \
+      -b:v 2000k \
+      -b:a 64k \
+      -ar 44100 \
+      -r 10 \
+      -acodec aac \
+      -vcodec libx264 \
+      -preset ultrafast \
+      -crf 28 \
+      -threads 4 \
+      -f flv \
+      rtmp://a.rtmp.youtube.com/live2/5uty-kbyy-7p6z-zwx5-9m53

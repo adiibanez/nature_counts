@@ -1,0 +1,1 @@
+gst-launch-1.0 filesrc location=rtsp://192.168.1.195:8554/cam1 ! qtdemux ! h264parse ! nvv4l2decoder ! m.sink_0 nvstreammux name=m batch-size=1 width=1920 height=1080 ! nvof preset-level=2 ! tee name=t ! queue ! nvofvisual ! nvmultistreamtiler width=1920 height=1080 ! nveglglessink t. ! queue ! nvmultistreamtiler width=1920 height=1080 ! nvvideoconvert ! nveglglessink

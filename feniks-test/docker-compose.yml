@@ -1,0 +1,129 @@
+version: '3'
+services:
+  redis:
+    image: redis
+    container_name: redis-instance
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+  mongo:
+    image: mongo:latest
+    container_name: mongo-instance
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+  mngr:
+    image: gokalpgoren/mngr:v1.0.0-amd64
+    container_name: mngr-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - mongo
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+      - WEBSERVER_PORT=8072
+      - MONGODB_CS=mongodb://localhost:27017
+      - DEEPSTACK_DT=0
+      - DEEPSTACK_OD=1
+      - DEEPSTACK_FR=0
+      - ROOT_DIR_PATH=/ai-data
+      - SNAPSHOT_PROC_COUNT=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /ai-data:/ai-data
+  ffmpeg_service:
+    image: gokalpgoren/ffmpeg_service:v1.0.0-amd64
+    container_name: ffmpeg_service-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - mngr
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /ai-data:/ai-data
+  snapshot_service:
+    image: gokalpgoren/snapshot_service:v1.0.0-amd64
+    container_name: snapshot_service-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - ffmpeg_service
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+  smcp:
+    image: gokalpgoren/smcp:v1.0.0-amd64
+    container_name: smcp-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - mongo
+      - mngr
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+    volumes:
+      - /ai-data:/ai-data
+  onvf:
+    image: gokalpgoren/onvf:v1.0.0-amd64
+    container_name: onvf-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  webapp:
+    image: gokalpgoren/webapp:v1.0.0-amd64
+    container_name: webapp-instance
+    restart: unless-stopped
+    depends_on:
+      - mngr
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+    ports:
+      - '8081:80'
+  cv2_read_service:
+    image: gokalpgoren/cv2_read_service:v1.0.0-amd64
+    container_name: cv2_read_service-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+  detect_service_pytorch:
+    image: gokalpgoren/detect_service_pytorch:v1.0.0-amd64
+    container_name: detect_service_pytorch-instance
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - ffmpeg_service
+      - snapshot_service
+      - smcp
+    environment:
+      - TZ=Europe/Berlin
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+
