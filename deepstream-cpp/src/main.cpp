@@ -2,6 +2,7 @@
 #include "pipeline.h"
 #include "thumbnail.h"
 #include "phoenix_client.h"
+#include "probes.h"
 
 #include <gst/gst.h>
 #include <csignal>
@@ -74,6 +75,14 @@ static gboolean bus_callback(GstBus* /*bus*/, GstMessage* msg, gpointer data) {
 // Phoenix connection + detection push loop (runs in its own thread)
 static void phoenix_thread_fn(const Config& cfg) {
     PhoenixClient phoenix(cfg.phoenix_url, cfg.phoenix_token);
+
+    phoenix.set_command_callback([](const std::string& event, const json& payload) {
+        if (event == "set_thumbnails") {
+            bool enabled = payload.value("enabled", true);
+            g_thumbnails_enabled.store(enabled, std::memory_order_relaxed);
+            LOG("Thumbnails %s via runtime command", enabled ? "enabled" : "disabled");
+        }
+    });
 
     while (g_running) {
         try {

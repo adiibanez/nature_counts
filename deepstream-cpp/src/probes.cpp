@@ -5,10 +5,14 @@
 #include <gstnvdsmeta.h>
 #include <nvbufsurface.h>
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <cstring>
 #include <ctime>
+
+// Runtime toggle — can be flipped by Phoenix command
+std::atomic<bool> g_thumbnails_enabled{true};
 
 // Shared state between tracker probe and appsink callbacks
 static std::mutex g_det_lock;
@@ -23,6 +27,10 @@ extern ThumbnailWorker* g_thumb_worker;
 static GstPadProbeReturn tracker_src_probe(
     GstPad* /*pad*/, GstPadProbeInfo* info, gpointer /*user_data*/)
 {
+    // Fish list disabled — skip all metadata extraction and detection pushing
+    if (!g_thumbnails_enabled.load(std::memory_order_relaxed))
+        return GST_PAD_PROBE_OK;
+
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!buf) return GST_PAD_PROBE_OK;
 
@@ -92,6 +100,7 @@ static GstPadProbeReturn tracker_src_probe(
 
 void install_tracker_probe(GstElement* tracker, const Config& cfg) {
     g_cfg = &cfg;
+    g_thumbnails_enabled.store(cfg.enable_thumbnails);
     GstPad* src_pad = gst_element_get_static_pad(tracker, "src");
     gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER,
                       tracker_src_probe, nullptr, nullptr);
@@ -106,6 +115,12 @@ GstFlowReturn appsink_new_sample(GstElement* appsink, gpointer user_data) {
 
     GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
     if (!sample) return GST_FLOW_OK;
+
+    // Thumbnails disabled — drop the frame, tracker probe pushes detections directly
+    if (!g_thumbnails_enabled.load(std::memory_order_relaxed)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
 
     // Grab pending detection for this camera
     json det;

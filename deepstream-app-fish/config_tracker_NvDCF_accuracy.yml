@@ -53,7 +53,7 @@ TrajectoryManagement:
   
 DataAssociator:
   dataAssociatorType: 0 # the type of data associator among { DEFAULT= 0 }
-  associationMatcherType: 1 # the type of matching algorithm among { GREEDY=0, GLOBAL=1 }
+  associationMatcherType: 0 # the type of matching algorithm among { GREEDY=0, GLOBAL=1 }
   checkClassMatch: 1  # If checked, only the same-class objects are associated with each other. Default: true
 
   # [Association Metric: Thresholds for valid candidates]
@@ -68,7 +68,7 @@ DataAssociator:
   matchingScoreWeight4Iou: 0.1   # Weight for the IOU score
 
 StateEstimator:
-  stateEstimatorType: 2  # the type of state estimator among { DUMMY=0, SIMPLE=1, REGULAR=2 }
+  stateEstimatorType: 1  # the type of state estimator among { DUMMY=0, SIMPLE=1, REGULAR=2 }
 
   # [Dynamics Modeling]
   processNoiseVar4Loc: 2.0    # Process noise variance for bbox center
@@ -83,7 +83,7 @@ VisualTracker:
   # [NvDCF: Feature Extraction]
   useColorNames: 1     # Use ColorNames feature
   useHog: 1            # Use Histogram-of-Oriented-Gradient (HOG) feature  
-  featureImgSizeLevel: 4  # Size of a feature image. Valid range: {1, 2, 3, 4, 5}, from the smallest to the largest
+  featureImgSizeLevel: 3  # Size of a feature image. Valid range: {1, 2, 3, 4, 5}, from the smallest to the largest
   featureFocusOffsetFactor_y: -0.2 # The offset for the center of hanning window relative to the feature height. The center of hanning window would move by (featureFocusOffsetFactor_y*featureMatSize.height) in vertical direction
 
   # [NvDCF: Correlation Filter]

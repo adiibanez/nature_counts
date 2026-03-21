@@ -35,6 +35,7 @@ struct Config {
     std::string phoenix_token = "dev-secret-token";
 
     // Thumbnails
+    bool enable_thumbnails = true;  // initial state, can be toggled at runtime
     int thumb_size = 96;
     int thumb_max_rate = 2;
     int thumb_width = 480;

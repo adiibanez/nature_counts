@@ -45,12 +45,17 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
+      # Skip plugin registry scan — uses 100% CPU and the container already has a pre-built registry
+      GST_REGISTRY_UPDATE: "no"
+      GST_REGISTRY_FORK: "no"
       DS_CONFIG_DIR: /opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       SOURCE_URIS: "rtsp://mediamtx:8554/raw-cam1,rtsp://mediamtx:8554/raw-cam2,rtsp://mediamtx:8554/raw-cam3"
       FILE_LOOP: "0"
       RTSP_BITRATE: "4000000"
       PHOENIX_URL: ws://phoenix:4005/deepstream/websocket
       DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
+      # Set to 0 to disable thumbnail generation on boot (can be toggled at runtime from UI)
+      ENABLE_THUMBNAILS: "${ENABLE_THUMBNAILS:-1}"
     volumes:
       - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       - ./videos:/videos

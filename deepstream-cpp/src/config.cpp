@@ -29,6 +29,7 @@ Config load_config() {
     cfg.rtsp_bitrate = env_int("RTSP_BITRATE", 4000000);
     cfg.file_loop = env_int("FILE_LOOP", 0) != 0;
     cfg.infer_interval = env_int("INFER_INTERVAL", 3);
+    cfg.enable_thumbnails = env_int("ENABLE_THUMBNAILS", 1) != 0;
 
     cfg.phoenix_url = env("PHOENIX_URL", "ws://phoenix:4005/deepstream/websocket");
     cfg.phoenix_token = env("DEEPSTREAM_TOKEN", "dev-secret-token");

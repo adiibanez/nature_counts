@@ -11,6 +11,8 @@ using json = nlohmann::json;
 
 class PhoenixClient {
 public:
+    using CommandCallback = std::function<void(const std::string&, const json&)>;
+
     PhoenixClient(const std::string& url, const std::string& token);
     ~PhoenixClient();
 
@@ -19,6 +21,9 @@ public:
 
     // Push a detection batch to ingestion:lobby
     void push_detections(int cam_id, const json& payload);
+
+    // Register a callback for incoming pipeline commands (e.g. set_thumbnails)
+    void set_command_callback(CommandCallback cb) { command_callback_ = std::move(cb); }
 
     // Disconnect
     void close();
@@ -44,6 +49,7 @@ private:
     std::condition_variable join_cv_;
     bool join_received_ = false;
     bool join_ok_ = false;
+    CommandCallback command_callback_;
 
     static constexpr int HEARTBEAT_INTERVAL_SEC = 30;
 };

@@ -73,6 +73,7 @@ NUM_SOURCES = int(os.environ.get("NUM_SOURCES", "1"))
 FILE_LOOP = int(os.environ.get("FILE_LOOP", "0"))
 
 RTSP_BITRATE = int(os.environ.get("RTSP_BITRATE", "4000000"))
+ENABLE_THUMBNAILS = int(os.environ.get("ENABLE_THUMBNAILS", "1")) != 0
 
 # Where to push processed RTSP streams (mediamtx)
 RTSP_OUTPUT_BASE = os.environ.get("RTSP_OUTPUT_BASE", "rtsp://mediamtx:8554/cam")
@@ -243,7 +244,6 @@ def _tracker_src_probe(pad, info, _user_data):
             except StopIteration:
                 break
 
-        # Store latest detection — appsink will add thumbnails and push
         det = {
             "cam_id": source_id,
             "ts": int(time.time() * 1000),
@@ -254,8 +254,16 @@ def _tracker_src_probe(pad, info, _user_data):
             },
             "objects": objects,
         }
-        with _det_lock:
-            _pending_detections[source_id] = det
+        if ENABLE_THUMBNAILS:
+            # Store for appsink to add thumbnails
+            with _det_lock:
+                _pending_detections[source_id] = det
+        else:
+            # Push directly without thumbnails
+            try:
+                detection_queue.put_nowait(det)
+            except queue.Full:
+                pass
 
         try:
             l_frame = l_frame.next
@@ -365,14 +373,21 @@ def create_pipeline():
         logger.warning("pyds not available — detection metadata disabled")
 
     # --- Per-camera branches ---
-    # demux → q → osd(GPU) → tee ─┬─ q → conv(I420) → enc → parse → rtspclientsink
-    #                               └─ q(leaky,2fps) → conv(RGBA,CPU) → appsink (thumbs)
+    # demux → q → tee ─┬─ q → osd → conv(I420) → enc → parse → rtspclientsink
+    #                   └─ q(leaky,2fps) → conv(RGBA,CPU) → appsink (clean thumbs)
     for i in range(num_sources):
         rtsp_url = "{0}{1}".format(RTSP_OUTPUT_BASE, i + 1)
-        logger.info("Branch %d: demux → osd → tee → enc+thumb → %s", i, rtsp_url)
+        logger.info("Branch %d: demux → tee → osd+enc / thumb → %s", i, rtsp_url)
 
         q = Gst.ElementFactory.make("queue", "q-{0}".format(i))
         pipeline.add(q)
+
+        tee = Gst.ElementFactory.make("tee", "tee-{0}".format(i))
+        pipeline.add(tee)
+
+        # --- Render branch (OSD is here, after tee, so thumbnails get clean frames) ---
+        q_render = Gst.ElementFactory.make("queue", "q-render-{0}".format(i))
+        pipeline.add(q_render)
 
         # Default process-mode is GPU_MODE (1) — do NOT set to 0 (that's CPU!)
         osd = Gst.ElementFactory.make("nvdsosd", "osd-{0}".format(i))
@@ -380,13 +395,6 @@ def create_pipeline():
         osd.set_property("display-bbox", 1)
         osd.set_property("display-mask", 0)
         pipeline.add(osd)
-
-        tee = Gst.ElementFactory.make("tee", "tee-{0}".format(i))
-        pipeline.add(tee)
-
-        # --- Render branch ---
-        q_render = Gst.ElementFactory.make("queue", "q-render-{0}".format(i))
-        pipeline.add(q_render)
 
         conv = Gst.ElementFactory.make("nvvideoconvert", "conv-{0}".format(i))
         conv.set_property("gpu-id", GPU_ID)
@@ -413,52 +421,54 @@ def create_pipeline():
         pipeline.add(rtsp_sink)
 
         # --- Thumbnail branch: low-rate RGBA appsink for detection crops ---
-        q_thumb = Gst.ElementFactory.make("queue", "q-thumb-{0}".format(i))
-        q_thumb.set_property("max-size-buffers", 2)
-        q_thumb.set_property("leaky", 2)
-        pipeline.add(q_thumb)
+        if ENABLE_THUMBNAILS:
+            q_thumb = Gst.ElementFactory.make("queue", "q-thumb-{0}".format(i))
+            q_thumb.set_property("max-size-buffers", 2)
+            q_thumb.set_property("leaky", 2)
+            pipeline.add(q_thumb)
 
-        thumb_rate = Gst.ElementFactory.make("videorate", "thumb-rate-{0}".format(i))
-        thumb_rate.set_property("drop-only", True)
-        thumb_rate.set_property("max-rate", 2)
-        pipeline.add(thumb_rate)
+            thumb_rate = Gst.ElementFactory.make("videorate", "thumb-rate-{0}".format(i))
+            thumb_rate.set_property("drop-only", True)
+            thumb_rate.set_property("max-rate", 2)
+            pipeline.add(thumb_rate)
 
-        thumb_conv = Gst.ElementFactory.make("nvvideoconvert", "thumb-conv-{0}".format(i))
-        thumb_conv.set_property("gpu-id", GPU_ID)
-        pipeline.add(thumb_conv)
+            thumb_conv = Gst.ElementFactory.make("nvvideoconvert", "thumb-conv-{0}".format(i))
+            thumb_conv.set_property("gpu-id", GPU_ID)
+            pipeline.add(thumb_conv)
 
-        thumb_caps = Gst.ElementFactory.make("capsfilter", "thumb-caps-{0}".format(i))
-        thumb_caps.set_property("caps", Gst.Caps.from_string(
-            "video/x-raw, format=RGBA, width=480, height=270"
-        ))
-        pipeline.add(thumb_caps)
+            thumb_caps = Gst.ElementFactory.make("capsfilter", "thumb-caps-{0}".format(i))
+            thumb_caps.set_property("caps", Gst.Caps.from_string(
+                "video/x-raw, format=RGBA, width=480, height=270"
+            ))
+            pipeline.add(thumb_caps)
 
-        appsink = Gst.ElementFactory.make("appsink", "thumb-sink-{0}".format(i))
-        appsink.set_property("emit-signals", True)
-        appsink.set_property("drop", True)
-        appsink.set_property("max-buffers", 1)
-        appsink.set_property("sync", False)
-        appsink.connect("new-sample", _make_appsink_callback(i))
-        pipeline.add(appsink)
+            appsink = Gst.ElementFactory.make("appsink", "thumb-sink-{0}".format(i))
+            appsink.set_property("emit-signals", True)
+            appsink.set_property("drop", True)
+            appsink.set_property("max-buffers", 1)
+            appsink.set_property("sync", False)
+            appsink.connect("new-sample", _make_appsink_callback(i))
+            pipeline.add(appsink)
 
         # --- Link ---
         demux_pad = demux.request_pad_simple("src_{0}".format(i))
         demux_pad.link(q.get_static_pad("sink"))
-        q.link(osd)
-        osd.link(tee)
+        q.link(tee)
 
         tee.link(q_render)
-        q_render.link(conv)
+        q_render.link(osd)
+        osd.link(conv)
         conv.link(capsf)
         capsf.link(enc)
         enc.link(parse)
         parse.link(rtsp_sink)
 
-        tee.link(q_thumb)
-        q_thumb.link(thumb_rate)
-        thumb_rate.link(thumb_conv)
-        thumb_conv.link(thumb_caps)
-        thumb_caps.link(appsink)
+        if ENABLE_THUMBNAILS:
+            tee.link(q_thumb)
+            q_thumb.link(thumb_rate)
+            thumb_rate.link(thumb_conv)
+            thumb_conv.link(thumb_caps)
+            thumb_caps.link(appsink)
 
     return pipeline, num_sources
 
@@ -572,8 +582,9 @@ def main():
     phoenix_thread.start()
 
     # Thumbnail worker — crops thumbnails off the GStreamer thread
-    thumb_thread = threading.Thread(target=_thumbnail_worker, daemon=True)
-    thumb_thread.start()
+    if ENABLE_THUMBNAILS:
+        thumb_thread = threading.Thread(target=_thumbnail_worker, daemon=True)
+        thumb_thread.start()
 
     # GStreamer runs in the main thread
     run_gstreamer_loop()

@@ -139,30 +139,29 @@ Pipeline create_pipeline(const Config& cfg) {
         LOG("Branch %d: demux -> osd -> tee -> enc+thumb -> %s", i, rtsp_url.c_str());
 
         GstElement* q       = make_element("queue",            fmt("q-%d", i).c_str());
-        GstElement* osd     = make_element("nvdsosd",          fmt("osd-%d", i).c_str());
         GstElement* tee     = make_element("tee",              fmt("tee-%d", i).c_str());
 
-        g_object_set(G_OBJECT(osd),
-            "display-text", TRUE,
-            "display-bbox", TRUE,
-            "display-mask", FALSE,
-            NULL);
+        gst_bin_add_many(GST_BIN(pipeline), q, tee, NULL);
 
-        gst_bin_add_many(GST_BIN(pipeline), q, osd, tee, NULL);
-
-        // Link demux -> q -> osd -> tee
+        // Link demux -> q -> tee (tee before OSD so thumbnail branch gets clean frames)
         GstPad* demux_pad = gst_element_request_pad_simple(demux, fmt("src_%d", i).c_str());
         GstPad* q_sink = gst_element_get_static_pad(q, "sink");
         gst_pad_link(demux_pad, q_sink);
         gst_object_unref(demux_pad);
         gst_object_unref(q_sink);
 
-        gst_element_link(q, osd);
-        gst_element_link(osd, tee);
+        gst_element_link(q, tee);
 
-        // === Render branch: tee -> q -> conv(I420) -> enc -> parse -> rtspclientsink ===
+        // === Render branch: tee -> q -> osd -> conv(I420) -> enc -> parse -> rtspclientsink ===
         GstElement* q_render = make_element("queue",             fmt("q-render-%d", i).c_str());
+        GstElement* osd      = make_element("nvdsosd",           fmt("osd-%d", i).c_str());
         GstElement* conv     = make_element("nvvideoconvert",    fmt("conv-%d", i).c_str());
+
+        g_object_set(G_OBJECT(osd),
+            "display-text", TRUE,
+            "display-bbox", TRUE,
+            "display-mask", FALSE,
+            NULL);
         GstElement* capsf    = make_element("capsfilter",        fmt("caps-%d", i).c_str());
         GstElement* enc      = make_element("nvv4l2h264enc",     fmt("enc-%d", i).c_str());
         GstElement* parse    = make_element("h264parse",         fmt("parse-%d", i).c_str());
@@ -185,10 +184,10 @@ Pipeline create_pipeline(const Config& cfg) {
             NULL);
 
         gst_bin_add_many(GST_BIN(pipeline),
-            q_render, conv, capsf, enc, parse, rtsp_sink, NULL);
+            q_render, osd, conv, capsf, enc, parse, rtsp_sink, NULL);
 
         gst_element_link(tee, q_render);
-        gst_element_link_many(q_render, conv, capsf, enc, parse, rtsp_sink, NULL);
+        gst_element_link_many(q_render, osd, conv, capsf, enc, parse, rtsp_sink, NULL);
 
         // === Thumbnail branch: tee -> q(leaky) -> videorate -> conv(RGBA) -> appsink ===
         GstElement* q_thumb    = make_element("queue",            fmt("q-thumb-%d", i).c_str());

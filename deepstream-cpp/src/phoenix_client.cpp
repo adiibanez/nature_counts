@@ -98,6 +98,8 @@ void PhoenixClient::on_message(const ix::WebSocketMessagePtr& msg) {
                     join_ok_ = payload.contains("status") &&
                                payload["status"].get<std::string>() == "ok";
                     join_cv_.notify_all();
+                } else if (command_callback_) {
+                    command_callback_(event, parsed[4]);
                 }
             }
         } catch (...) {}

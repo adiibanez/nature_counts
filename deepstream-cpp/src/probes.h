@@ -1,7 +1,11 @@
 #pragma once
 
 #include <gst/gst.h>
+#include <atomic>
 #include "config.h"
+
+// Runtime toggle for thumbnail generation (set via Phoenix command or env var)
+extern std::atomic<bool> g_thumbnails_enabled;
 
 // Install the tracker src pad probe. Must be called after pipeline construction.
 void install_tracker_probe(GstElement* tracker, const Config& cfg);
