@@ -55,7 +55,7 @@ services:
       PHOENIX_URL: ws://phoenix:4005/deepstream/websocket
       DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
       # Set to 0 to disable thumbnail generation on boot (can be toggled at runtime from UI)
-      ENABLE_THUMBNAILS: "${ENABLE_THUMBNAILS:-1}"
+      ENABLE_THUMBNAILS: "${ENABLE_THUMBNAILS:-0}"
     volumes:
       - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       - ./videos:/videos

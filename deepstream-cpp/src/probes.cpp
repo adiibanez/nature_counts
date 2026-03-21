@@ -1,33 +1,21 @@
 #include "probes.h"
 #include "thumbnail.h"
 
-#include <gst/app/gstappsink.h>
 #include <gstnvdsmeta.h>
-#include <nvbufsurface.h>
 
 #include <atomic>
-#include <mutex>
-#include <unordered_map>
-#include <cstring>
 #include <ctime>
+#include <unordered_map>
 
 // Runtime toggle — can be flipped by Phoenix command
 std::atomic<bool> g_thumbnails_enabled{true};
 
-// Shared state between tracker probe and appsink callbacks
-static std::mutex g_det_lock;
-static std::unordered_map<int, json> g_pending_detections;
-
-// Reference to config labels (set during install)
 static const Config* g_cfg = nullptr;
-
-// Thumbnail worker (owned by main, set during install)
-extern ThumbnailWorker* g_thumb_worker;
+static std::unordered_map<int, int> g_frame_count;
 
 static GstPadProbeReturn tracker_src_probe(
     GstPad* /*pad*/, GstPadProbeInfo* info, gpointer /*user_data*/)
 {
-    // Fish list disabled — skip all metadata extraction and detection pushing
     if (!g_thumbnails_enabled.load(std::memory_order_relaxed))
         return GST_PAD_PROBE_OK;
 
@@ -43,6 +31,11 @@ static GstPadProbeReturn tracker_src_probe(
         auto* frame_meta = static_cast<NvDsFrameMeta*>(l_frame->data);
         int source_id = frame_meta->source_id;
         guint64 pts = frame_meta->buf_pts;
+
+        // Rate limit: ~2 pushes per second per source
+        int& fc = g_frame_count[source_id];
+        fc++;
+        if (fc % 15 != 0) continue;
 
         json objects = json::array();
 
@@ -91,8 +84,7 @@ static GstPadProbeReturn tracker_src_probe(
             {"objects",    std::move(objects)},
         };
 
-        std::lock_guard<std::mutex> lk(g_det_lock);
-        g_pending_detections[source_id] = std::move(det);
+        g_detection_queue.push(std::move(det));
     }
 
     return GST_PAD_PROBE_OK;
@@ -105,69 +97,4 @@ void install_tracker_probe(GstElement* tracker, const Config& cfg) {
     gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER,
                       tracker_src_probe, nullptr, nullptr);
     gst_object_unref(src_pad);
-}
-
-GstFlowReturn appsink_new_sample(GstElement* appsink, gpointer user_data) {
-    // user_data points to a struct { int cam_id; } allocated by pipeline.cpp
-    struct AppsinkCtx { int cam_id; };
-    auto* ctx = static_cast<AppsinkCtx*>(user_data);
-    int cam_id = ctx->cam_id;
-
-    GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
-    if (!sample) return GST_FLOW_OK;
-
-    // Thumbnails disabled — drop the frame, tracker probe pushes detections directly
-    if (!g_thumbnails_enabled.load(std::memory_order_relaxed)) {
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
-
-    // Grab pending detection for this camera
-    json det;
-    {
-        std::lock_guard<std::mutex> lk(g_det_lock);
-        auto it = g_pending_detections.find(cam_id);
-        if (it == g_pending_detections.end()) {
-            gst_sample_unref(sample);
-            return GST_FLOW_OK;
-        }
-        det = std::move(it->second);
-        g_pending_detections.erase(it);
-    }
-
-    GstBuffer* buf = gst_sample_get_buffer(sample);
-    GstCaps* caps = gst_sample_get_caps(sample);
-    GstStructure* s = gst_caps_get_structure(caps, 0);
-
-    int width = 0, height = 0;
-    gst_structure_get_int(s, "width", &width);
-    gst_structure_get_int(s, "height", &height);
-
-    GstMapInfo map;
-    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) {
-        // Push detection without thumbnails
-        g_detection_queue.push(std::move(det));
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
-
-    // Fast copy — release GStreamer buffer immediately
-    ThumbnailJob job;
-    job.rgba_frame.resize(map.size);
-    std::memcpy(job.rgba_frame.data(), map.data, map.size);
-    gst_buffer_unmap(buf, &map);
-    gst_sample_unref(sample);
-
-    job.frame_width = width;
-    job.frame_height = height;
-    job.source_width = det.value("resolution", json::object()).value("width", g_cfg->muxer_width);
-    job.source_height = det.value("resolution", json::object()).value("height", g_cfg->muxer_height);
-    job.detection = std::move(det);
-
-    if (g_thumb_worker && !g_thumb_worker->submit(std::move(job))) {
-        // Worker overloaded — push without thumbnails
-        g_detection_queue.push(std::move(job.detection));
-    }
-
-    return GST_FLOW_OK;
 }

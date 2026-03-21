@@ -8,8 +8,6 @@
 extern std::atomic<bool> g_thumbnails_enabled;
 
 // Install the tracker src pad probe. Must be called after pipeline construction.
+// Extracts detection metadata and thumbnail crops directly from the GPU buffer
+// using NvBufSurfTransform (no separate GStreamer branch needed).
 void install_tracker_probe(GstElement* tracker, const Config& cfg);
-
-// Create a new-sample callback for per-camera appsink thumbnail extraction.
-// Returns a GCallback suitable for g_signal_connect("new-sample", ...).
-GstFlowReturn appsink_new_sample(GstElement* appsink, gpointer user_data);

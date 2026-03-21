@@ -12,9 +12,6 @@
 
 #define LOG(fmt, ...) fprintf(stderr, "[main] " fmt "\n", ##__VA_ARGS__)
 
-// Global thumbnail worker pointer (referenced by probes.cpp)
-ThumbnailWorker* g_thumb_worker = nullptr;
-
 static GMainLoop* g_main_loop = nullptr;
 static std::atomic<bool> g_running{true};
 
@@ -117,11 +114,6 @@ int main(int argc, char* argv[]) {
     LOG("Loaded config: %zu sources, infer_interval=%d",
         cfg.source_uris.size(), cfg.infer_interval);
 
-    // Thumbnail worker
-    ThumbnailWorker thumb_worker(g_detection_queue, cfg.thumb_size);
-    g_thumb_worker = &thumb_worker;
-    thumb_worker.start();
-
     // Phoenix pusher thread
     std::thread phoenix_thr(phoenix_thread_fn, std::cref(cfg));
 
@@ -154,8 +146,6 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     g_running = false;
-    thumb_worker.stop();
-    g_thumb_worker = nullptr;
     phoenix_thr.join();
 
     LOG("Shutdown complete");
