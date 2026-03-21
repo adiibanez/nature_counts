@@ -82,40 +82,21 @@ PHOENIX_TOKEN = os.environ.get("DEEPSTREAM_TOKEN", "dev-secret-token")
 
 
 # ---------------------------------------------------------------------------
-# Per-camera frame store — updated by per-camera appsinks (RGBA → CPU)
+# Detection extraction + thumbnail cropping
+#
+# Two-stage approach:
+#   1. Tracker probe (GStreamer thread): extracts metadata per camera, stores it
+#   2. Appsink callback (per-camera, 2fps): receives RGBA frame, crops thumbnails
+#      from stored detections, pushes complete batch to Phoenix
+# This ensures thumbnails always match the frame they're cropped from.
 # ---------------------------------------------------------------------------
-_latest_frames = {}  # cam_id → numpy array (RGBA)
-_frame_lock = threading.Lock()
+_pending_detections = {}  # cam_id → latest detection dict (no thumbnails yet)
+_det_lock = threading.Lock()
 _det_frame_count = defaultdict(int)
 
 
-def _make_appsink_callback(cam_id):
-    """Appsink new-sample callback: stores latest RGBA frame for thumbnail crops."""
-    def on_sample(appsink):
-        sample = appsink.emit("pull-sample")
-        if sample is None:
-            return Gst.FlowReturn.OK
-        buf = sample.get_buffer()
-        caps = sample.get_caps()
-        struct = caps.get_structure(0)
-        width = struct.get_value("width")
-        height = struct.get_value("height")
-        success, mapinfo = buf.map(Gst.MapFlags.READ)
-        if success:
-            frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(height, width, 4)
-            with _frame_lock:
-                _latest_frames[cam_id] = frame.copy()
-            buf.unmap(mapinfo)
-        return Gst.FlowReturn.OK
-    return on_sample
-
-
-def _crop_thumbnail(bbox, cam_id):
-    """Crop a bbox region from the stored per-camera RGBA frame → base64 JPEG."""
-    with _frame_lock:
-        frame = _latest_frames.get(cam_id)
-    if frame is None:
-        return None
+def _crop_thumbnail(frame, bbox):
+    """Crop bbox from RGBA frame → base64 JPEG."""
     try:
         x1 = max(0, int(bbox["left"]))
         y1 = max(0, int(bbox["top"]))
@@ -135,8 +116,67 @@ def _crop_thumbnail(bbox, cam_id):
         return None
 
 
+def _make_appsink_callback(cam_id):
+    """Appsink callback: crop thumbnails from fresh RGBA frame + push to Phoenix."""
+    def on_sample(appsink):
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        # Get the pending detection for this camera
+        with _det_lock:
+            det = _pending_detections.pop(cam_id, None)
+        if det is None:
+            return Gst.FlowReturn.OK
+
+        # Map RGBA frame
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        struct = caps.get_structure(0)
+        width = struct.get_value("width")
+        height = struct.get_value("height")
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            # Push without thumbnails
+            try:
+                detection_queue.put_nowait(det)
+            except queue.Full:
+                pass
+            return Gst.FlowReturn.OK
+
+        frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(height, width, 4)
+
+        # Scale bbox coords from source resolution to thumbnail frame resolution
+        src_w = det["resolution"]["width"] or MUXER_WIDTH
+        src_h = det["resolution"]["height"] or MUXER_HEIGHT
+        sx = width / src_w
+        sy = height / src_h
+
+        for obj in det["objects"]:
+            bbox = obj["bbox"]
+            scaled = {
+                "left": bbox["left"] * sx,
+                "top": bbox["top"] * sy,
+                "width": bbox["width"] * sx,
+                "height": bbox["height"] * sy,
+            }
+            thumb = _crop_thumbnail(frame, scaled)
+            if thumb:
+                obj["thumbnail"] = thumb
+
+        buf.unmap(mapinfo)
+
+        try:
+            detection_queue.put_nowait(det)
+        except queue.Full:
+            pass
+
+        return Gst.FlowReturn.OK
+    return on_sample
+
+
 def _tracker_src_probe(pad, info, _user_data):
-    """Post-tracker probe: extract metadata, crop thumbnails, push to Phoenix."""
+    """Post-tracker probe: extract metadata, store for appsink to add thumbnails."""
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
@@ -156,14 +196,6 @@ def _tracker_src_probe(pad, info, _user_data):
         pts = frame_meta.buf_pts
         _det_frame_count[source_id] += 1
 
-        # Only extract every Nth frame to limit CPU use
-        if _det_frame_count[source_id] % 3 != 1:
-            try:
-                l_frame = l_frame.next
-            except StopIteration:
-                break
-            continue
-
         objects = []
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
@@ -175,48 +207,38 @@ def _tracker_src_probe(pad, info, _user_data):
             class_id = obj_meta.class_id
             label = LABELS[class_id] if class_id < len(LABELS) else "object"
             rect = obj_meta.rect_params
-            bbox = {
-                "left": round(rect.left, 1),
-                "top": round(rect.top, 1),
-                "width": round(rect.width, 1),
-                "height": round(rect.height, 1),
-            }
 
-            obj_data = {
+            objects.append({
                 "track_id": obj_meta.object_id,
                 "class_id": class_id,
                 "label": label,
                 "confidence": round(obj_meta.confidence, 3),
-                "bbox": bbox,
-            }
-
-            # Crop thumbnail from the per-camera RGBA frame stored by appsink
-            thumb = _crop_thumbnail(bbox, cam_id=source_id)
-            if thumb:
-                obj_data["thumbnail"] = thumb
-
-            objects.append(obj_data)
+                "bbox": {
+                    "left": round(rect.left, 1),
+                    "top": round(rect.top, 1),
+                    "width": round(rect.width, 1),
+                    "height": round(rect.height, 1),
+                },
+            })
 
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
 
-        if objects or _det_frame_count[source_id] % 15 == 0:
-            batch = {
-                "cam_id": source_id,
-                "ts": int(time.time() * 1000),
-                "pts": pts,
-                "resolution": {
-                    "width": frame_meta.source_frame_width,
-                    "height": frame_meta.source_frame_height,
-                },
-                "objects": objects,
-            }
-            try:
-                detection_queue.put_nowait(batch)
-            except queue.Full:
-                pass
+        # Store latest detection — appsink will add thumbnails and push
+        det = {
+            "cam_id": source_id,
+            "ts": int(time.time() * 1000),
+            "pts": pts,
+            "resolution": {
+                "width": frame_meta.source_frame_width,
+                "height": frame_meta.source_frame_height,
+            },
+            "objects": objects,
+        }
+        with _det_lock:
+            _pending_detections[source_id] = det
 
         try:
             l_frame = l_frame.next
@@ -326,17 +348,16 @@ def create_pipeline():
         logger.warning("pyds not available — detection metadata disabled")
 
     # --- Per-camera branches ---
-    # demux → queue → osd → tee ─┬─ queue → conv(I420) → enc → parse → rtspclientsink
-    #                              └─ queue → conv(RGBA,CPU) → appsink (thumbnails)
+    # demux → q → osd(GPU) → tee ─┬─ q → conv(I420) → enc → parse → rtspclientsink
+    #                               └─ q(leaky,2fps) → conv(RGBA,CPU) → appsink (thumbs)
     for i in range(num_sources):
-        cam_name = "cam{0}".format(i + 1)
         rtsp_url = "{0}{1}".format(RTSP_OUTPUT_BASE, i + 1)
         logger.info("Branch %d: demux → osd → tee → enc+thumb → %s", i, rtsp_url)
 
-        q_demux = Gst.ElementFactory.make("queue", "q-demux-{0}".format(i))
-        pipeline.add(q_demux)
+        q = Gst.ElementFactory.make("queue", "q-{0}".format(i))
+        pipeline.add(q)
 
-        # nvdsosd: CPU mode (default). GPU mode deadlocks with nvv4l2h264enc on desktop GPUs.
+        # Default process-mode is GPU_MODE (1) — do NOT set to 0 (that's CPU!)
         osd = Gst.ElementFactory.make("nvdsosd", "osd-{0}".format(i))
         osd.set_property("display-text", 1)
         osd.set_property("display-bbox", 1)
@@ -346,7 +367,7 @@ def create_pipeline():
         tee = Gst.ElementFactory.make("tee", "tee-{0}".format(i))
         pipeline.add(tee)
 
-        # --- Render branch: encode → rtspclientsink ---
+        # --- Render branch ---
         q_render = Gst.ElementFactory.make("queue", "q-render-{0}".format(i))
         pipeline.add(q_render)
 
@@ -374,11 +395,16 @@ def create_pipeline():
         rtsp_sink.set_property("protocols", "tcp")
         pipeline.add(rtsp_sink)
 
-        # --- Thumbnail branch: appsink captures RGBA frames for crops ---
+        # --- Thumbnail branch: low-rate RGBA appsink for detection crops ---
         q_thumb = Gst.ElementFactory.make("queue", "q-thumb-{0}".format(i))
-        q_thumb.set_property("max-size-buffers", 1)
-        q_thumb.set_property("leaky", 2)  # drop oldest
+        q_thumb.set_property("max-size-buffers", 2)
+        q_thumb.set_property("leaky", 2)
         pipeline.add(q_thumb)
+
+        thumb_rate = Gst.ElementFactory.make("videorate", "thumb-rate-{0}".format(i))
+        thumb_rate.set_property("drop-only", True)
+        thumb_rate.set_property("max-rate", 2)
+        pipeline.add(thumb_rate)
 
         thumb_conv = Gst.ElementFactory.make("nvvideoconvert", "thumb-conv-{0}".format(i))
         thumb_conv.set_property("gpu-id", GPU_ID)
@@ -386,7 +412,7 @@ def create_pipeline():
 
         thumb_caps = Gst.ElementFactory.make("capsfilter", "thumb-caps-{0}".format(i))
         thumb_caps.set_property("caps", Gst.Caps.from_string(
-            "video/x-raw, format=RGBA"
+            "video/x-raw, format=RGBA, width=480, height=270"
         ))
         pipeline.add(thumb_caps)
 
@@ -394,16 +420,16 @@ def create_pipeline():
         appsink.set_property("emit-signals", True)
         appsink.set_property("drop", True)
         appsink.set_property("max-buffers", 1)
+        appsink.set_property("sync", False)
         appsink.connect("new-sample", _make_appsink_callback(i))
         pipeline.add(appsink)
 
-        # --- Link demux.src_i → queue → osd → tee ---
+        # --- Link ---
         demux_pad = demux.request_pad_simple("src_{0}".format(i))
-        demux_pad.link(q_demux.get_static_pad("sink"))
-        q_demux.link(osd)
+        demux_pad.link(q.get_static_pad("sink"))
+        q.link(osd)
         osd.link(tee)
 
-        # --- Link tee → render branch ---
         tee.link(q_render)
         q_render.link(conv)
         conv.link(capsf)
@@ -411,9 +437,9 @@ def create_pipeline():
         enc.link(parse)
         parse.link(rtsp_sink)
 
-        # --- Link tee → thumbnail branch ---
         tee.link(q_thumb)
-        q_thumb.link(thumb_conv)
+        q_thumb.link(thumb_rate)
+        thumb_rate.link(thumb_conv)
         thumb_conv.link(thumb_caps)
         thumb_caps.link(appsink)
 
