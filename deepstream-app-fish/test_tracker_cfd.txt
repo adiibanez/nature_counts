@@ -21,7 +21,7 @@
 ################################################################################
 #
 # CFD YOLOv12x — 6-stream display mode
-# Uses interval=3 (infer every 4th frame) + NvDCF tracker to fill gaps.
+# Uses interval=2 (infer every 3rd frame) + NvDCF tracker to fill gaps.
 # GTX 1080 Ti target: ~12-15 FPS total inference throughput.
 
 [application]
@@ -183,7 +183,7 @@ bbox-border-color0=1;0;0;1
 bbox-border-color1=0;1;1;1
 bbox-border-color2=0;0;1;1
 bbox-border-color3=0;1;0;1
-interval=3
+interval=2
 gie-unique-id=1
 nvbuf-memory-type=0
 config-file=config_infer_primary_cfd_yolov12.txt

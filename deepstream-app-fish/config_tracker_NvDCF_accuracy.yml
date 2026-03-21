@@ -30,37 +30,37 @@ TargetManagement:
 
   # [Creation & Termination Policy]
   minIouDiff4NewTarget: 0.5   # If the IOU between the newly detected object and any of the existing targets is higher than this threshold, this newly detected object will be discarded.
-  minTrackerConfidence: 0.2   # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
-  probationAge: 3 # If the target's age exceeds this, the target will be considered to be valid.
-  maxShadowTrackingAge: 150   # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.
+  minTrackerConfidence: 0.1   # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
+  probationAge: 5 # If the target's age exceeds this, the target will be considered to be valid.
+  maxShadowTrackingAge: 300   # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.
   earlyTerminationAge: 1      # If the shadowTrackingAge reaches this threshold while in TENTATIVE period, the target will be terminated prematurely.
   
 TrajectoryManagement:
-  useUniqueID: 0   # Use 64-bit long Unique ID when assignining tracker ID.
+  useUniqueID: 1   # Use 64-bit long Unique ID when assignining tracker ID.
   enableReAssoc: 1    # Enable Re-Assoc
 
   # [Re-Assoc: Motion-based]  
   minTrajectoryLength4Projection: 20  # min trajectory length required to make projected trajectory
   prepLength4TrajectoryProjection: 10  # the length of the trajectory during which the state estimator is updated to make projections
-  trajectoryProjectionLength: 90  # the length of the projected trajectory
+  trajectoryProjectionLength: 150  # the length of the projected trajectory
 
   # [Re-Assoc: Trajectory Similarity]
   minTrackletMatchingScore: 0.5   # min tracklet similarity score for matching
   maxAngle4TrackletMatching: 30   # max angle difference for tracklet matching [degree]
   minSpeedSimilarity4TrackletMatching: 0.2 # min speed similarity for tracklet matching
   minBboxSizeSimilarity4TrackletMatching: 0.6 # min bbox size similarity for tracklet matching  
-  maxTrackletMatchingTimeSearchRange: 20      # the search space in time for max tracklet similarity
+  maxTrackletMatchingTimeSearchRange: 50      # the search space in time for max tracklet similarity
   
 DataAssociator:
   dataAssociatorType: 0 # the type of data associator among { DEFAULT= 0 }
-  associationMatcherType: 0 # the type of matching algorithm among { GREEDY=0, GLOBAL=1 }
+  associationMatcherType: 1 # the type of matching algorithm among { GREEDY=0, GLOBAL=1 }
   checkClassMatch: 1  # If checked, only the same-class objects are associated with each other. Default: true
 
   # [Association Metric: Thresholds for valid candidates]
   minMatchingScore4Overall: 0.0   # Min total score
   minMatchingScore4SizeSimilarity: 0.5  # Min bbox size similarity score
-  minMatchingScore4Iou: 0.3       # Min IOU score
-  minMatchingScore4VisualSimilarity: 0.6  # Min visual similarity score
+  minMatchingScore4Iou: 0.2       # Min IOU score
+  minMatchingScore4VisualSimilarity: 0.5  # Min visual similarity score
 
   # [Association Metric: Weights]
   matchingScoreWeight4VisualSimilarity: 0.5  # Weight for the visual similarity (in terms of correlation response ratio)
@@ -68,12 +68,12 @@ DataAssociator:
   matchingScoreWeight4Iou: 0.1   # Weight for the IOU score
 
 StateEstimator:
-  stateEstimatorType: 1  # the type of state estimator among { DUMMY=0, SIMPLE=1, REGULAR=2 }
+  stateEstimatorType: 2  # the type of state estimator among { DUMMY=0, SIMPLE=1, REGULAR=2 }
 
   # [Dynamics Modeling]
   processNoiseVar4Loc: 2.0    # Process noise variance for bbox center
   processNoiseVar4Size: 1.0   # Process noise variance for bbox size
-  processNoiseVar4Vel: 0.1    # Process noise variance for velocity
+  processNoiseVar4Vel: 0.2    # Process noise variance for velocity
   measurementNoiseVar4Detector: 2.0    # Measurement noise variance for detector's detection
   measurementNoiseVar4Tracker: 10.0    # Measurement noise variance for tracker's localization
   
@@ -83,10 +83,10 @@ VisualTracker:
   # [NvDCF: Feature Extraction]
   useColorNames: 1     # Use ColorNames feature
   useHog: 1            # Use Histogram-of-Oriented-Gradient (HOG) feature  
-  featureImgSizeLevel: 3  # Size of a feature image. Valid range: {1, 2, 3, 4, 5}, from the smallest to the largest
+  featureImgSizeLevel: 4  # Size of a feature image. Valid range: {1, 2, 3, 4, 5}, from the smallest to the largest
   featureFocusOffsetFactor_y: -0.2 # The offset for the center of hanning window relative to the feature height. The center of hanning window would move by (featureFocusOffsetFactor_y*featureMatSize.height) in vertical direction
 
   # [NvDCF: Correlation Filter]
-  filterLr: 0.075 # learning rate for DCF filter in exponential moving average. Valid Range: [0.0, 1.0]
+  filterLr: 0.05 # learning rate for DCF filter in exponential moving average. Valid Range: [0.0, 1.0]
   filterChannelWeightsLr: 0.1 # learning rate for the channel weights among feature channels. Valid Range: [0.0, 1.0]
   gaussianSigma: 0.75 # Standard deviation for Gaussian for desired response when creating DCF filter [pixels]  

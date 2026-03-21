@@ -6,12 +6,12 @@ model-color-format=0
 onnx-file=cfd-yolov12x-1.00.onnx
 # Explicit engine path so DeepStream reuses the cached TensorRT engine
 # instead of rebuilding from ONNX on every container start.
-model-engine-file=cfd-yolov12x-1.00.onnx_b3_gpu0_fp32.engine
+model-engine-file=cfd-yolov12x-1.00.onnx_b3_gpu0_fp16.engine
 labelfile-path=cfd_labels.txt
 batch-size=3
-network-mode=0
+network-mode=2
 num-detected-classes=1
-interval=3
+interval=2
 gie-unique-id=1
 process-mode=1
 network-type=0
