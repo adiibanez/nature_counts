@@ -50,9 +50,10 @@ paths:
   # raw-cam1:
   #   source: rtsp://192.168.1.195:8554/cam1
 
-  # --- Processed output from DeepStream ---
-  # DeepStream pushes RTSP directly via ffmpeg forwarder to cam1.
-  # The all_others wildcard auto-creates the path.
+  # --- Processed output from DeepStream (pushed via rtspclientsink) ---
+  cam1:
+  cam2:
+  cam3:
 
   # Wildcard: accepts any RTSP publisher on any path
   all_others:

@@ -4,8 +4,7 @@ net-scale-factor=0.00392156862745098
 model-color-format=0
 # ONNX model exported from CFD YOLOv12x via DeepStream-Yolo export script
 onnx-file=cfd-yolov12x-1.00.onnx
-# No model-engine-file: force TensorRT rebuild from ONNX on first run
-# (DS 6.4 uses TRT 8.6 / CUDA 12.2 — engine from DS 6.0 is incompatible)
+model-engine-file=cfd-yolov12x-1.00.onnx_b3_gpu0_fp32.engine
 labelfile-path=cfd_labels.txt
 batch-size=3
 network-mode=0

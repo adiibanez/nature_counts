@@ -17,7 +17,7 @@ docker run --gpus all --rm \
   -v "${SCRIPT_DIR}/DeepStream-Yolo:/DeepStream-Yolo" \
   -w /DeepStream-Yolo \
   "${IMAGE_NAME}" \
-  bash -c "CUDA_VER=12.2 make -C nvdsinfer_custom_impl_Yolo clean && CUDA_VER=12.2 make -C nvdsinfer_custom_impl_Yolo"
+  bash -c "ln -sf /usr/local/cuda-12.3/lib64/libcublas* /usr/local/cuda-12.1/lib64/ && CUDA_VER=12.1 make -C nvdsinfer_custom_impl_Yolo clean && CUDA_VER=12.1 make -C nvdsinfer_custom_impl_Yolo"
 
 echo "=== Build complete ==="
 

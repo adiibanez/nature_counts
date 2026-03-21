@@ -16,20 +16,21 @@ services:
   deepstream:
     build:
       context: ./deepstream-python
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.ds64
     runtime: nvidia
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
-      DS_CONFIG_DIR: /opt/nvidia/deepstream/deepstream-6.0/samples/configs/deepstream-app-fish
-      # RTSP input — same path for files (via MediaMTX) and real cameras
+      DS_CONFIG_DIR: /opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       SOURCE_URIS: "rtsp://mediamtx:8554/raw-cam1,rtsp://mediamtx:8554/raw-cam2,rtsp://mediamtx:8554/raw-cam3"
       FILE_LOOP: "0"
       RTSP_BITRATE: "4000000"
       PHOENIX_URL: ws://phoenix:4005/deepstream/websocket
       DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
     volumes:
-      - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.0/samples/configs/deepstream-app-fish
+      - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
+      - ./deepstream-python/ds_fish_pipeline.py:/app/ds_fish_pipeline.py:ro
+      - ./deepstream-python/phoenix_channel_client.py:/app/phoenix_channel_client.py:ro
       - ./videos:/videos
     depends_on:
       - mediamtx
@@ -49,4 +50,11 @@ services:
       SECRET_KEY_BASE: "${SECRET_KEY_BASE:-0wVxOLNApegdWg+tV6G37XCrEtIbz0X/NwoAp0jRR3/bai8tjzvUhnNzGh9Ffwkp}"
       DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
       NUM_CAMERAS: "3"
+      MEDIAMTX_HOST: "localhost:8889"
+      # Set CAMERAS=rtsp to use Membrane RTSP pipelines (requires Membrane).
+      # Set to "webrtc" or omit to use MediaMTX WebRTC (default).
+      CAMERAS: "${CAMERAS:-webrtc}"
+      DEEPSTREAM_RTSP_BASE: "rtsp://deepstream:8554/cam"
+    volumes:
+      - ./videos:/videos
     restart: unless-stopped

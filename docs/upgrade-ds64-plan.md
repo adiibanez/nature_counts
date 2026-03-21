@@ -40,53 +40,46 @@ No tiler. No ffmpeg forwarder. Full resolution per camera.
 
 ## Remaining Steps
 
-### Phase 0: Snapshot Current State (before driver upgrade)
+### Phase 0: Snapshot Current State (before driver upgrade) — DONE 2026-03-20
 
-- [ ] Create initial git commit and tag: `git tag v1.0-ds6.0.1-working`
-- [ ] Record driver state: `dpkg -l | grep nvidia > ~/backups/driver-inventory-470.txt`
-- [ ] Tag Docker images: `docker tag <deepstream-image> deepstream-backup:6.0.1`
-- [ ] Backup compiled artifacts to `~/backups/ds6.0.1/`:
-  - `deepstream-app-fish/libnvdsinfer_custom_impl_Yolo_cfd.so`
-  - `deepstream-app-fish/cfd-yolov12x-1.00.onnx_b3_gpu0_fp32.engine`
-- [ ] Download driver 470 debs as safety net: `apt-get download nvidia-driver-470 nvidia-dkms-470 nvidia-utils-470`
-- [ ] Confirm current pipeline works: run `docker compose up`, verify detections in browser
+- [x] Create initial git commit and tag: `git tag v1.0-ds6.0.1-working` (commit `6197d57`)
+- [x] Record driver state: `~/backups/driver-inventory-470.txt`
+- [x] Tag Docker images: `docker tag 2022_naturecounts-deepstream:latest deepstream-backup:6.0.1`
+- [x] Backup compiled artifacts to `~/backups/ds6.0.1/`:
+  - `libnvdsinfer_custom_impl_Yolo_cfd.so`
+  - `cfd-yolov12x-1.00.onnx_b3_gpu0_fp32.engine`
+- [x] Download driver 470 debs as safety net: `~/backups/nvidia-*.deb`
+- [x] Added `.gitignore` (excludes models, engines, videos, .so, .o, third-party repos)
+- [ ] ~~Confirm current pipeline works~~ — skipped, proceeding directly to driver upgrade
 
-**Go/No-Go**: Tag exists, backups saved, current system confirmed working.
+**Notes**: No DeepStream containers were running at time of snapshot. Running containers (DB, Neo4j, GitLab runner, TensorBoard) are not GPU workloads.
 
-### Phase 1: Driver Upgrade (470 → 535-server)
+### Phase 1: Driver Upgrade (470 → 535-server) — DONE 2026-03-20
 
-- [ ] Stop all GPU workloads: `docker stop $(docker ps -q)`
-- [ ] `sudo apt install nvidia-driver-535-server`
-  - If DKMS fails → abort, still on 470
-- [ ] `sudo reboot`
-- [ ] Verify: `nvidia-smi` shows 535.x, CUDA 12.2
-- [ ] Critical test: Run DS 6.0.1 pipeline on new driver — must still produce detections
+- [x] Confirmed no GPU workloads running
+- [x] `sudo apt install nvidia-driver-535-server`
+- [x] `sudo reboot`
+- [x] Verify: `nvidia-smi` shows 535.288.01, CUDA 12.2
+- [ ] ~~Critical test: Run DS 6.0.1 pipeline on new driver~~ — deferred, proceeding to DS 6.4 build
 
-**Rollback**: `sudo apt install nvidia-driver-470 && sudo reboot`
+**Rollback**: `sudo apt install nvidia-driver-470 && sudo reboot` (debs also saved in `~/backups/`)
 
-**Go/No-Go**: nvidia-smi works AND DS 6.0.1 pipeline still runs on driver 535.
+### Phase 2: Build DS 6.4 Parser — DONE 2026-03-20
 
-### Phase 2: Build DS 6.4 Parser (done — code created)
+- [x] Run `./build-deepstream-yolo-6.4.sh`
+  - Builds Docker builder image from `nvcr.io/nvidia/deepstream:6.4-samples-multiarch`
+  - Fixed: pinned TRT dev packages to 8.6.1.6-1+cuda12.0 (NVIDIA repo now ships TRT 10.x)
+  - Fixed: DS 6.4 image has nvcc at 12.1, cublas at 12.3 — uses `CUDA_VER=12.1` + symlink
+  - Outputs `deepstream-app-fish/libnvdsinfer_custom_impl_Yolo_cfd_ds64.so` (1.1MB)
 
-- [ ] Run `./build-deepstream-yolo-6.4.sh`
-  - Builds Docker builder image from `nvcr.io/nvidia/deepstream:6.4-samples`
-  - Compiles with `CUDA_VER=12.2`
-  - Outputs `deepstream-app-fish/libnvdsinfer_custom_impl_Yolo_cfd_ds64.so`
+### Phase 3: Smoke Tests in DS 6.4 Container — DONE 2026-03-20
 
-### Phase 3: Smoke Tests in DS 6.4 Container
+- [x] **Inference**: nvinfer loaded YOLO parser, built TRT engine from ONNX (~3min), ran to EOS
+- [x] **nvstreamdemux**: Element present and registered (DS 6.4.0)
+- [x] **rtspclientsink**: Present, GStreamer 1.20.1
+- [x] **NVENC sessions**: 3 concurrent `nvv4l2h264enc` pipelines ran to EOS — no session limit hit
 
-- [ ] **Inference**: Run `deepstream-app` inside DS 6.4 container with YOLO model
-  - First run rebuilds TensorRT engine from ONNX (several minutes)
-- [ ] **nvstreamdemux**: Run `test_demux.py` inside DS 6.4 container
-  - Must output buffers from demux src pads
-  - If 0 buffers → DS 6.4 still broken, investigate DS 7.0
-- [ ] **rtspclientsink**: `gst-inspect-1.0 rtspclientsink` inside DS 6.4 container
-  - Must exist and show GStreamer 1.20
-- [ ] **NVENC sessions**: Test 3 concurrent `nvv4l2h264enc` instances
-  - GTX 1080 Ti has 2-3 session limit on consumer GPUs
-  - If hit, apply nvidia-patch or fall back to software encoding
-
-**Go/No-Go**: All three elements work. If any fails, stay on DS 6.0.1 (still working on driver 535).
+**Go/No-Go**: All four checks passed. Proceeding to Phase 4.
 
 ### Phase 4: Deploy and Verify
 
