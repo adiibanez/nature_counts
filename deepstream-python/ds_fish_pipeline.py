@@ -86,13 +86,15 @@ PHOENIX_TOKEN = os.environ.get("DEEPSTREAM_TOKEN", "dev-secret-token")
 #
 # Two-stage approach:
 #   1. Tracker probe (GStreamer thread): extracts metadata per camera, stores it
-#   2. Appsink callback (per-camera, 2fps): receives RGBA frame, crops thumbnails
-#      from stored detections, pushes complete batch to Phoenix
-# This ensures thumbnails always match the frame they're cropped from.
+#   2. Appsink callback (GStreamer thread): copies RGBA frame (fast), dispatches
+#      to worker thread for thumbnail cropping (slow CPU work off the pipeline)
 # ---------------------------------------------------------------------------
 _pending_detections = {}  # cam_id → latest detection dict (no thumbnails yet)
 _det_lock = threading.Lock()
 _det_frame_count = defaultdict(int)
+
+# Worker queue: (frame_copy, det, src_w, src_h, frame_w, frame_h)
+_thumb_queue = queue.Queue(maxsize=10)
 
 
 def _crop_thumbnail(frame, bbox):
@@ -110,47 +112,22 @@ def _crop_thumbnail(frame, bbox):
         scale = min(THUMB_SIZE / max(h, w), 1.0)
         if scale < 1.0:
             crop = cv2.resize(crop, (int(w * scale), int(h * scale)))
-        _, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        _, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return base64.b64encode(jpg.tobytes()).decode("ascii")
     except Exception:
         return None
 
 
-def _make_appsink_callback(cam_id):
-    """Appsink callback: crop thumbnails from fresh RGBA frame + push to Phoenix."""
-    def on_sample(appsink):
-        sample = appsink.emit("pull-sample")
-        if sample is None:
-            return Gst.FlowReturn.OK
+def _thumbnail_worker():
+    """Background thread: crops thumbnails and pushes completed detections."""
+    while True:
+        try:
+            frame, det, src_w, src_h, fw, fh = _thumb_queue.get(timeout=2)
+        except queue.Empty:
+            continue
 
-        # Get the pending detection for this camera
-        with _det_lock:
-            det = _pending_detections.pop(cam_id, None)
-        if det is None:
-            return Gst.FlowReturn.OK
-
-        # Map RGBA frame
-        buf = sample.get_buffer()
-        caps = sample.get_caps()
-        struct = caps.get_structure(0)
-        width = struct.get_value("width")
-        height = struct.get_value("height")
-        success, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not success:
-            # Push without thumbnails
-            try:
-                detection_queue.put_nowait(det)
-            except queue.Full:
-                pass
-            return Gst.FlowReturn.OK
-
-        frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(height, width, 4)
-
-        # Scale bbox coords from source resolution to thumbnail frame resolution
-        src_w = det["resolution"]["width"] or MUXER_WIDTH
-        src_h = det["resolution"]["height"] or MUXER_HEIGHT
-        sx = width / src_w
-        sy = height / src_h
+        sx = fw / src_w if src_w else 1
+        sy = fh / src_h if src_h else 1
 
         for obj in det["objects"]:
             bbox = obj["bbox"]
@@ -164,12 +141,52 @@ def _make_appsink_callback(cam_id):
             if thumb:
                 obj["thumbnail"] = thumb
 
-        buf.unmap(mapinfo)
-
         try:
             detection_queue.put_nowait(det)
         except queue.Full:
             pass
+
+
+def _make_appsink_callback(cam_id):
+    """Appsink callback: copy frame (fast) and dispatch to worker thread."""
+    def on_sample(appsink):
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        with _det_lock:
+            det = _pending_detections.pop(cam_id, None)
+        if det is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        struct = caps.get_structure(0)
+        width = struct.get_value("width")
+        height = struct.get_value("height")
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            try:
+                detection_queue.put_nowait(det)
+            except queue.Full:
+                pass
+            return Gst.FlowReturn.OK
+
+        # Fast copy — release the GStreamer buffer immediately
+        frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(height, width, 4).copy()
+        buf.unmap(mapinfo)
+
+        src_w = det["resolution"]["width"] or MUXER_WIDTH
+        src_h = det["resolution"]["height"] or MUXER_HEIGHT
+
+        try:
+            _thumb_queue.put_nowait((frame, det, src_w, src_h, width, height))
+        except queue.Full:
+            # Worker overloaded — push without thumbnails
+            try:
+                detection_queue.put_nowait(det)
+            except queue.Full:
+                pass
 
         return Gst.FlowReturn.OK
     return on_sample
@@ -553,6 +570,10 @@ def main():
 
     phoenix_thread = threading.Thread(target=phoenix_thread_fn, daemon=True)
     phoenix_thread.start()
+
+    # Thumbnail worker — crops thumbnails off the GStreamer thread
+    thumb_thread = threading.Thread(target=_thumbnail_worker, daemon=True)
+    thumb_thread.start()
 
     # GStreamer runs in the main thread
     run_gstreamer_loop()
