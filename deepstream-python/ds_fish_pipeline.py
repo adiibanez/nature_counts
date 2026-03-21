@@ -73,7 +73,7 @@ NUM_SOURCES = int(os.environ.get("NUM_SOURCES", "1"))
 FILE_LOOP = int(os.environ.get("FILE_LOOP", "0"))
 
 RTSP_BITRATE = int(os.environ.get("RTSP_BITRATE", "4000000"))
-ENABLE_THUMBNAILS = int(os.environ.get("ENABLE_THUMBNAILS", "1")) != 0
+ENABLE_THUMBNAILS = int(os.environ.get("ENABLE_THUMBNAILS", "0")) != 0
 
 # Where to push processed RTSP streams (mediamtx)
 RTSP_OUTPUT_BASE = os.environ.get("RTSP_OUTPUT_BASE", "rtsp://mediamtx:8554/cam")
