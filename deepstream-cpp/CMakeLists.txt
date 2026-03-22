@@ -32,6 +32,7 @@ set(SOURCES
     src/probes.cpp
     src/thumbnail.cpp
     src/phoenix_client.cpp
+    src/tracker_config.cpp
 )
 
 add_executable(ds_fish_pipeline ${SOURCES})

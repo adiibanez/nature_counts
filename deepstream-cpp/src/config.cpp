@@ -20,8 +20,11 @@ Config load_config() {
         (ds_root + "/samples/configs/deepstream-app-fish").c_str());
 
     cfg.infer_config = config_dir + "/config_infer_primary_cfd_yolov12_ds64.txt";
-    cfg.tracker_config = config_dir + "/config_tracker_IOU.yml";
+    cfg.tracker_config = env("TRACKER_CONFIG",
+        (config_dir + "/config_tracker_NvDCF_accuracy.yml").c_str());
     cfg.tracker_lib = ds_root + "/lib/libnvds_nvmultiobjecttracker.so";
+    cfg.tracker_width = env_int("TRACKER_WIDTH", 640);
+    cfg.tracker_height = env_int("TRACKER_HEIGHT", 384);
 
     cfg.num_sources = env_int("NUM_SOURCES", 1);
     cfg.rtsp_base_uri = env("RTSP_BASE_URI", "rtsp://mediamtx:8554/raw-cam");
