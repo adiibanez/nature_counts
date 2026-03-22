@@ -31,8 +31,8 @@ RUN mix compile
 RUN mix assets.deploy
 RUN mix release
 
-# --- Runtime ---
-FROM debian:bookworm-slim
+# --- Runtime (NVIDIA CUDA base for GPU inference) ---
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \

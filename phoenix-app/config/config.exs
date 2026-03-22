@@ -38,7 +38,18 @@ config :pythonx, :uv_init,
     "opencv-python-headless>=4.9",
     "numpy>=1.26",
     "supervision>=0.25",
+    "torch>=2.4",
+    "torchvision>=0.19",
   ]
+
+  [tool.uv.sources]
+  torch = {index = "pytorch-cu121"}
+  torchvision = {index = "pytorch-cu121"}
+
+  [[tool.uv.index]]
+  name = "pytorch-cu121"
+  url = "https://download.pytorch.org/whl/cu121"
+  explicit = true
   """
 
 # Configure the endpoint

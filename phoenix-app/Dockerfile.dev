@@ -1,18 +1,33 @@
-FROM elixir:1.18-otp-27-slim
+# Copy prebuilt Erlang + Elixir from official image
+FROM elixir:1.18-otp-27-slim AS elixir
+
+# Runtime with CUDA
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
     git \
     nodejs \
     npm \
     build-essential \
     pkg-config \
     libsrtp2-dev \
-    ca-certificates \
     libavcodec-dev \
     libavutil-dev \
     inotify-tools \
-    curl \
+    libncurses5 \
+    libssl3 \
+    libsctp1 \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy entire Erlang + Elixir installation
+COPY --from=elixir /usr/local /usr/local
 
 WORKDIR /app
 

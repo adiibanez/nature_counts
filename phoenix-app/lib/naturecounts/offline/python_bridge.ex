@@ -52,9 +52,17 @@ defmodule Naturecounts.Offline.PythonBridge do
           json.dump({"pct": pct, "frame": frame_idx, "total_frames": total_frames,
                       "tracks": num_tracks, "detections": num_detections}, f)
 
+  # Check CUDA availability
+  import torch
+  cuda_available = torch.cuda.is_available()
+  cuda_device = torch.cuda.get_device_name(0) if cuda_available else "none"
+  print(f"[PythonBridge] CUDA available: {cuda_available}, device: {cuda_device}", flush=True)
+
   # Load model
   write_progress(0, 0, 0, 0, 0)
+  device = "cuda:0" if cuda_available else "cpu"
   model = YOLO(model_path, task="detect")
+  model.to(device)
 
   # Open video
   cap = cv2.VideoCapture(video_path)
