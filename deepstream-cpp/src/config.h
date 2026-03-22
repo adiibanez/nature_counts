@@ -7,7 +7,7 @@ struct Config {
     // Muxer
     int muxer_width = 1920;
     int muxer_height = 1080;
-    int muxer_batch_timeout = 4000;
+    int muxer_batch_timeout = 1000;
     int gpu_id = 0;
 
     // Inference

@@ -11,14 +11,11 @@
 std::atomic<bool> g_thumbnails_enabled{true};
 
 static const Config* g_cfg = nullptr;
-static std::unordered_map<int, int> g_frame_count;
+static std::unordered_map<int, int64_t> g_last_push_ms;
 
 static GstPadProbeReturn tracker_src_probe(
     GstPad* /*pad*/, GstPadProbeInfo* info, gpointer /*user_data*/)
 {
-    if (!g_thumbnails_enabled.load(std::memory_order_relaxed))
-        return GST_PAD_PROBE_OK;
-
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!buf) return GST_PAD_PROBE_OK;
 
@@ -32,10 +29,15 @@ static GstPadProbeReturn tracker_src_probe(
         int source_id = frame_meta->source_id;
         guint64 pts = frame_meta->buf_pts;
 
-        // Rate limit: ~2 pushes per second per source
-        int& fc = g_frame_count[source_id];
-        fc++;
-        if (fc % 15 != 0) continue;
+        // Rate limit: ~2 pushes per second per source (time-based)
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int64_t now_ms = static_cast<int64_t>(ts.tv_sec) * 1000
+                       + ts.tv_nsec / 1000000;
+
+        int64_t& last_ms = g_last_push_ms[source_id];
+        if (now_ms - last_ms < 500) continue;
+        last_ms = now_ms;
 
         json objects = json::array();
 
@@ -67,11 +69,6 @@ static GstPadProbeReturn tracker_src_probe(
                 }},
             });
         }
-
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        int64_t now_ms = static_cast<int64_t>(ts.tv_sec) * 1000
-                       + ts.tv_nsec / 1000000;
 
         json det = {
             {"cam_id",     source_id},

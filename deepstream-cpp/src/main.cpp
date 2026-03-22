@@ -7,6 +7,7 @@
 #include <gst/gst.h>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <atomic>
 
@@ -33,11 +34,23 @@ static gboolean bus_callback(GstBus* /*bus*/, GstMessage* msg, gpointer data) {
         GError* err = nullptr;
         gchar* debug = nullptr;
         gst_message_parse_error(msg, &err, &debug);
-        LOG("ERROR from %s: %s\n  %s",
-            GST_MESSAGE_SRC_NAME(msg), err->message, debug ? debug : "");
+
+        const char* src_name = GST_MESSAGE_SRC_NAME(msg);
+        bool is_per_source = strncmp(src_name, "source-", 7) == 0
+                          || strncmp(src_name, "cpu-conv-", 9) == 0
+                          || strncmp(src_name, "gpu-conv-", 9) == 0;
+
+        if (is_per_source) {
+            LOG("ERROR from %s (non-fatal, pipeline continues): %s\n  %s",
+                src_name, err->message, debug ? debug : "");
+        } else {
+            LOG("ERROR from %s: %s\n  %s",
+                src_name, err->message, debug ? debug : "");
+            g_main_loop_quit(loop);
+        }
+
         g_error_free(err);
         g_free(debug);
-        g_main_loop_quit(loop);
         break;
     }
 
@@ -95,7 +108,6 @@ static void phoenix_thread_fn(const Config& cfg) {
             }
         } catch (const std::exception& e) {
             LOG("Phoenix connection error: %s — retrying in 3s", e.what());
-            g_detection_queue.clear();
             for (int i = 0; i < 30 && g_running; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
