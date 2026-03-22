@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "membrane_webrtc_plugin": "file:../deps/membrane_webrtc_plugin"
+  }
+}

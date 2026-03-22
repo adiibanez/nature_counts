@@ -8,10 +8,16 @@ services:
       POSTGRES_USER: naturecounts
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-naturecounts_dev}"
       POSTGRES_DB: naturecounts
+      PGPORT: "5433"
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "5433:5433"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U naturecounts -p 5433"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   mediamtx:
@@ -75,8 +81,10 @@ services:
       - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       - ./videos:/videos
     depends_on:
-      - mediamtx
-      - phoenix
+      mediamtx:
+        condition: service_started
+      phoenix:
+        condition: service_healthy
     restart: unless-stopped
 
   phoenix:
@@ -97,12 +105,20 @@ services:
       # Set to "webrtc" or omit to use MediaMTX WebRTC (default).
       CAMERAS: "${CAMERAS:-webrtc}"
       DEEPSTREAM_RTSP_BASE: "rtsp://deepstream:8554/cam"
-      DATABASE_URL: "ecto://naturecounts:${POSTGRES_PASSWORD:-naturecounts_dev}@postgres/naturecounts"
+      DATABASE_URL: "ecto://naturecounts:${POSTGRES_PASSWORD:-naturecounts_dev}@postgres:5433/naturecounts"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      VLM_MODEL: "${VLM_MODEL:-claude-sonnet-4-6}"
       YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
     volumes:
       - ./videos:/videos
       - ./deepstream-app-fish:/models:ro
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4005/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
     restart: unless-stopped

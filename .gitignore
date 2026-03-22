@@ -24,7 +24,6 @@ os-nvr_docker/
 os-nvr_docker.tar.gz
 
 # Separate git repos (managed independently)
-phoenix-app/
 reefmonitor/
 
 # Google Drive binary

@@ -1,0 +1,26 @@
+services:
+  phoenix:
+    build:
+      context: ./phoenix-app
+      dockerfile: Dockerfile.dev
+    environment:
+      MIX_ENV: dev
+      DATABASE_URL: "ecto://naturecounts:${POSTGRES_PASSWORD:-naturecounts_dev}@postgres:5433/naturecounts"
+      DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
+      NUM_CAMERAS: "3"
+      MEDIAMTX_HOST: "localhost:8889"
+      CAMERAS: "${CAMERAS:-webrtc}"
+      DEEPSTREAM_RTSP_BASE: "rtsp://deepstream:8554/cam"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      VLM_MODEL: "${VLM_MODEL:-claude-sonnet-4-6}"
+      YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
+    volumes:
+      - ./phoenix-app:/app
+      - phoenix_deps:/app/deps
+      - phoenix_build:/app/_build
+      - ./videos:/videos
+      - ./deepstream-app-fish:/models:ro
+
+volumes:
+  phoenix_deps:
+  phoenix_build:
