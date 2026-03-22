@@ -1,4 +1,19 @@
+volumes:
+  pgdata:
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: naturecounts
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-naturecounts_dev}"
+      POSTGRES_DB: naturecounts
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+
   mediamtx:
     build:
       context: .
@@ -82,6 +97,12 @@ services:
       # Set to "webrtc" or omit to use MediaMTX WebRTC (default).
       CAMERAS: "${CAMERAS:-webrtc}"
       DEEPSTREAM_RTSP_BASE: "rtsp://deepstream:8554/cam"
+      DATABASE_URL: "ecto://naturecounts:${POSTGRES_PASSWORD:-naturecounts_dev}@postgres/naturecounts"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
     volumes:
       - ./videos:/videos
+      - ./deepstream-app-fish:/models:ro
+    depends_on:
+      - postgres
     restart: unless-stopped
