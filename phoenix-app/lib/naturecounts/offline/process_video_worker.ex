@@ -17,6 +17,8 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
   def perform(%Oban.Job{args: %{"video_id" => video_id}}) do
     video = Repo.get!(Video, video_id)
     profile = Profiles.get(video.processing_profile)
+    profile = if video.min_bbox_area, do: %{profile | min_bbox_area: video.min_bbox_area}, else: profile
+    profile = if video.vlm_sample_pct, do: Map.put(profile, :vlm_sample_pct, video.vlm_sample_pct), else: profile
 
     Logger.info("[ProcessVideo] Starting #{video.filename} (profile=#{video.processing_profile})")
     update_video(video, "processing", 0, "Initializing...")
@@ -40,6 +42,15 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
           qualifying = Enum.count(tracks, fn t -> t["crop_b64"] != nil and t["best_bbox_area"] >= profile.min_bbox_area end)
           update_video(video, "processing", @vlm_pct_start, "Classifying: 0/#{qualifying} tracks sent to VLM...")
           Logger.info("[ProcessVideo] VLM classification: #{qualifying}/#{length(tracks)} tracks qualify (model=#{profile.vlm_model})")
+
+          # Save VLM stats early
+          video
+          |> Ecto.Changeset.change(%{
+            total_tracks: length(tracks),
+            vlm_qualified: qualifying,
+            min_bbox_area: profile.min_bbox_area
+          })
+          |> Repo.update!()
 
           classified_ref = make_ref()
           classified_count = :counters.new(1, [:atomics])
@@ -66,6 +77,10 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
           Logger.info("[ProcessVideo] Persisting #{length(classified_tracks)} tracks")
           persist_tracks(video, classified_tracks)
 
+          video
+          |> Ecto.Changeset.change(%{vlm_classified_count: vlm_count})
+          |> Repo.update!()
+
           update_video(video, "completed", 100, "Done: #{length(classified_tracks)} tracks, #{vlm_count} identified")
           Logger.info("[ProcessVideo] Finished #{video.filename}: #{length(classified_tracks)} tracks, #{vlm_count} VLM-classified")
           :ok
@@ -86,9 +101,12 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
 
   defp persist_tracks(video, tracks) do
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+    ttl_days = Application.get_env(:naturecounts, :classification_ttl_days, 30)
+    expires_at = NaiveDateTime.add(now, ttl_days * 86400, :second)
 
     entries =
       Enum.map(tracks, fn t ->
+        vlm = t["vlm_classified"] || false
         %{
           video_id: video.id,
           track_id: t["track_id"],
@@ -102,7 +120,9 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
           last_frame: t["last_frame"],
           frame_count: t["frame_count"],
           thumbnail: decode_thumbnail(t["crop_b64"]),
-          vlm_classified: t["vlm_classified"] || false,
+          vlm_classified: vlm,
+          review_status: "pending",
+          expires_at: if(vlm, do: expires_at),
           inserted_at: now,
           updated_at: now
         }

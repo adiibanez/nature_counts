@@ -53,8 +53,6 @@ defmodule NaturecountsWeb.CropsLive do
           <button class="btn btn-error btn-sm" phx-click="delete_all" data-confirm="Delete all crops?">
             Clear All
           </button>
-          <.link navigate={~p"/videos"} class="btn btn-ghost btn-sm">Videos</.link>
-          <.link navigate={~p"/"} class="btn btn-ghost btn-sm">Dashboard</.link>
         </div>
       </div>
 

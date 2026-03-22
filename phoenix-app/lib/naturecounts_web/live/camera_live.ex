@@ -68,7 +68,7 @@ defmodule NaturecountsWeb.CameraLive do
         pipeline_pid: nil,
         retry_count: 0,
         player_generation: 0,
-        tracker_panel_open: false,
+        settings_panel_open: false,
         tracker_preset: "nvdcf_accuracy",
         tracker_params: @tracker_presets["nvdcf_accuracy"].defaults,
         tracker_has_visual: true,
@@ -182,8 +182,8 @@ defmodule NaturecountsWeb.CameraLive do
     {:noreply, assign(socket, video_pct: String.to_integer(pct))}
   end
 
-  def handle_event("toggle_tracker_panel", _params, socket) do
-    {:noreply, assign(socket, tracker_panel_open: !socket.assigns.tracker_panel_open)}
+  def handle_event("toggle_settings_panel", _params, socket) do
+    {:noreply, assign(socket, settings_panel_open: !socket.assigns.settings_panel_open)}
   end
 
   def handle_event("select_tracker_preset", %{"preset" => preset}, socket) do
@@ -288,7 +288,7 @@ defmodule NaturecountsWeb.CameraLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="flex flex-col h-[calc(100vh-4rem)]">
+    <div class="flex flex-col h-full">
       <%!-- Header bar --%>
       <div class="flex items-center justify-between px-2 py-2 shrink-0">
         <div class="flex items-center gap-4">
@@ -309,72 +309,74 @@ defmodule NaturecountsWeb.CameraLive do
             <span class="badge badge-warning badge-sm">MediaMTX</span>
           <% end %>
         </div>
-        <div class="flex items-center gap-4">
-          <form phx-change="set_video_pct" class="flex items-center gap-2">
-            <span class="text-xs text-base-content/60">Video</span>
-            <input
-              type="range"
-              min="30"
-              max="90"
-              value={@video_pct}
-              class="range range-xs range-primary w-24"
-              name="pct"
-            />
-            <span class="text-xs font-mono w-8">{@video_pct}%</span>
-          </form>
-          <div class="flex items-center gap-1">
-            <span class="text-xs text-base-content/60">Cols</span>
-            <div class="join">
-              <button
-                :for={n <- 1..4}
-                class={"join-item btn btn-xs #{if @fish_cols == n, do: "btn-primary", else: "btn-ghost"}"}
-                phx-click="set_fish_cols"
-                phx-value-cols={n}
-              >
-                {n}
-              </button>
-            </div>
-          </div>
-          <label class="label cursor-pointer gap-2">
-            <span class="label-text text-sm">Fish List</span>
-            <input
-              type="checkbox"
-              class="toggle toggle-secondary toggle-sm"
-              checked={@show_fish_list}
-              phx-click="toggle_fish_list"
-            />
-          </label>
-          <label class="label cursor-pointer gap-2">
-            <span class="label-text text-sm">Inference</span>
-            <input
-              type="checkbox"
-              class="toggle toggle-primary toggle-sm"
-              checked={@show_inference}
-              phx-click="toggle_inference"
-            />
-          </label>
-          <.link navigate={~p"/"} class="btn btn-ghost btn-sm">Back</.link>
-        </div>
-      </div>
-
-      <%!-- Tracker settings panel --%>
-      <div class="px-2 shrink-0">
         <button
           class="btn btn-ghost btn-xs gap-1"
-          phx-click="toggle_tracker_panel"
+          phx-click="toggle_settings_panel"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" class={"w-4 h-4 transition-transform #{if @tracker_panel_open, do: "rotate-90"}"} viewBox="0 0 20 20" fill="currentColor">
-            <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd" />
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd" />
           </svg>
-          Tracker Settings
-          <span class="badge badge-xs badge-neutral">{@tracker_presets[@tracker_preset].label}</span>
+          Settings
         </button>
+      </div>
 
-        <%= if @tracker_panel_open do %>
-          <div class="card card-compact bg-base-200 mt-1 mb-2">
-            <div class="card-body p-3">
+      <%!-- Settings tile (camera + tracker settings) --%>
+      <%= if @settings_panel_open do %>
+        <div class="px-2 shrink-0 mb-2">
+          <div class="card card-compact bg-base-200">
+            <div class="card-body p-3 space-y-3">
+              <%!-- Camera settings --%>
               <div class="flex flex-wrap items-end gap-4">
-                <%!-- Preset selector --%>
+                <label class="label cursor-pointer gap-2">
+                  <span class="label-text text-sm">Inference</span>
+                  <input
+                    type="checkbox"
+                    class="toggle toggle-primary toggle-sm"
+                    checked={@show_inference}
+                    phx-click="toggle_inference"
+                  />
+                </label>
+                <label class="label cursor-pointer gap-2">
+                  <span class="label-text text-sm">Fish List</span>
+                  <input
+                    type="checkbox"
+                    class="toggle toggle-secondary toggle-sm"
+                    checked={@show_fish_list}
+                    phx-click="toggle_fish_list"
+                  />
+                </label>
+                <form phx-change="set_video_pct" class="flex items-center gap-2">
+                  <span class="text-xs text-base-content/60">Video</span>
+                  <input
+                    type="range"
+                    min="30"
+                    max="90"
+                    value={@video_pct}
+                    class="range range-xs range-primary w-24"
+                    name="pct"
+                  />
+                  <span class="text-xs font-mono w-8">{@video_pct}%</span>
+                </form>
+                <div class="flex items-center gap-1">
+                  <span class="text-xs text-base-content/60">Cols</span>
+                  <div class="join">
+                    <button
+                      :for={n <- 1..4}
+                      class={"join-item btn btn-xs #{if @fish_cols == n, do: "btn-primary", else: "btn-ghost"}"}
+                      phx-click="set_fish_cols"
+                      phx-value-cols={n}
+                    >
+                      {n}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <%!-- Tracker settings --%>
+              <div class="divider my-0 text-xs">Tracker
+                <span class="badge badge-xs badge-neutral">{@tracker_presets[@tracker_preset].label}</span>
+              </div>
+              <div class="flex flex-wrap items-end gap-4">
                 <div class="form-control">
                   <label class="label py-0"><span class="label-text text-xs">Preset</span></label>
                   <select
@@ -392,7 +394,6 @@ defmodule NaturecountsWeb.CameraLive do
                   </select>
                 </div>
 
-                <%!-- Common parameters --%>
                 <.tracker_slider
                   label="Min Detector Confidence"
                   param="minDetectorConfidence"
@@ -431,7 +432,6 @@ defmodule NaturecountsWeb.CameraLive do
                   </select>
                 </div>
 
-                <%!-- NvDCF-only parameters --%>
                 <%= if @tracker_has_visual do %>
                   <.tracker_slider
                     label="Filter LR"
@@ -460,7 +460,6 @@ defmodule NaturecountsWeb.CameraLive do
                   </div>
                 <% end %>
 
-                <%!-- Apply button --%>
                 <button
                   class={"btn btn-primary btn-xs #{if @pipeline_restarting, do: "btn-disabled loading"}"}
                   phx-click="apply_tracker_config"
@@ -475,8 +474,8 @@ defmodule NaturecountsWeb.CameraLive do
               </div>
             </div>
           </div>
-        <% end %>
-      </div>
+        </div>
+      <% end %>
 
       <%!-- Main content: video left, fish panel right --%>
       <div class="flex gap-3 px-2 min-h-0 flex-1">

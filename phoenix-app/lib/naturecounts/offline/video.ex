@@ -14,6 +14,11 @@ defmodule Naturecounts.Offline.Video do
     field :progress_pct, :integer, default: 0
     field :error_message, :string
     field :status_message, :string
+    field :total_tracks, :integer
+    field :vlm_qualified, :integer
+    field :vlm_classified_count, :integer
+    field :min_bbox_area, :integer
+    field :vlm_sample_pct, :integer
 
     has_many :tracks, Naturecounts.Offline.Track
 
@@ -25,7 +30,9 @@ defmodule Naturecounts.Offline.Video do
     |> cast(attrs, [
       :filename, :path, :duration_seconds, :resolution,
       :recorded_at, :location, :status, :processing_profile,
-      :progress_pct, :error_message, :status_message
+      :progress_pct, :error_message, :status_message,
+      :total_tracks, :vlm_qualified, :vlm_classified_count, :min_bbox_area,
+      :vlm_sample_pct
     ])
     |> validate_required([:filename, :path])
     |> validate_inclusion(:status, ~w(pending processing completed failed))

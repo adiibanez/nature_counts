@@ -52,6 +52,8 @@ defmodule NaturecountsWeb do
     quote do
       use Phoenix.LiveView
 
+      on_mount NaturecountsWeb.NavHook
+
       unquote(html_helpers())
     end
   end

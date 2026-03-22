@@ -15,6 +15,9 @@ defmodule Naturecounts.Offline.Track do
     field :frame_count, :integer
     field :thumbnail, :binary
     field :vlm_classified, :boolean, default: false
+    field :review_status, :string, default: "pending"
+    field :reviewed_at, :naive_datetime
+    field :expires_at, :naive_datetime
 
     belongs_to :video, Naturecounts.Offline.Video
 
@@ -27,7 +30,8 @@ defmodule Naturecounts.Offline.Track do
       :track_id, :species, :scientific_name, :species_confidence,
       :vlm_reasoning, :best_confidence, :best_bbox_area,
       :first_frame, :last_frame, :frame_count, :thumbnail,
-      :vlm_classified, :video_id
+      :vlm_classified, :video_id,
+      :review_status, :reviewed_at, :expires_at
     ])
     |> validate_required([:track_id, :video_id])
     |> unique_constraint([:video_id, :track_id])

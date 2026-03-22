@@ -54,16 +54,29 @@ defmodule Naturecounts.Offline.Classifier do
   end
 
   defp select_crops(tracks, profile) do
+    # First apply percentage sampling
+    sampled = apply_sample_pct(tracks, Map.get(profile, :vlm_sample_pct, 100))
+
     case profile.vlm_crops_per_track do
       :all ->
-        tracks
+        sampled
 
       n when is_integer(n) ->
-        # Group by track, take top N by confidence * area
-        tracks
+        sampled
         |> Enum.sort_by(fn t -> -(t["best_confidence"] * t["best_bbox_area"]) end)
         |> Enum.take(n)
     end
+  end
+
+  defp apply_sample_pct(tracks, pct) when pct >= 100, do: tracks
+  defp apply_sample_pct(_tracks, pct) when pct <= 0, do: []
+  defp apply_sample_pct(tracks, pct) do
+    # Take top pct% ranked by quality (confidence * area)
+    count = max(1, round(length(tracks) * pct / 100))
+
+    tracks
+    |> Enum.sort_by(fn t -> -(t["best_confidence"] * t["best_bbox_area"]) end)
+    |> Enum.take(count)
   end
 
   def classify_crop(track, profile, video) do

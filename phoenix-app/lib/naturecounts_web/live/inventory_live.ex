@@ -18,25 +18,70 @@ defmodule NaturecountsWeb.InventoryLive do
        species_summary: species_summary,
        recent_tracks: recent_tracks,
        stats: stats,
-       filter_species: nil
+       filter_species: nil,
+       filter_review: nil
      )}
   end
 
   @impl true
   def handle_event("filter_species", %{"species" => species}, socket) do
     filter = if species == "", do: nil, else: species
-    tracks = load_recent_tracks(filter)
+    tracks = load_recent_tracks(filter, socket.assigns.filter_review)
     {:noreply, assign(socket, filter_species: filter, recent_tracks: tracks)}
   end
 
+  def handle_event("filter_review", %{"status" => status}, socket) do
+    filter = if status == "", do: nil, else: status
+    tracks = load_recent_tracks(socket.assigns.filter_species, filter)
+    {:noreply, assign(socket, filter_review: filter, recent_tracks: tracks)}
+  end
+
+  def handle_event("keep_track", %{"id" => id}, socket) do
+    set_review_status(id, "kept")
+    reload(socket)
+  end
+
+  def handle_event("discard_track", %{"id" => id}, socket) do
+    set_review_status(id, "discarded")
+    reload(socket)
+  end
+
+  def handle_event("reset_track", %{"id" => id}, socket) do
+    set_review_status(id, "pending")
+    reload(socket)
+  end
+
   def handle_event("export_csv", _params, socket) do
-    # TODO: implement CSV download
     {:noreply, put_flash(socket, :info, "CSV export coming soon")}
+  end
+
+  defp set_review_status(id, status) do
+    track = Repo.get!(Track, id)
+    now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+    changes =
+      case status do
+        "kept" -> %{review_status: "kept", reviewed_at: now, expires_at: nil}
+        "discarded" -> %{review_status: "discarded", reviewed_at: now}
+        "pending" -> %{review_status: "pending", reviewed_at: nil}
+      end
+
+    track
+    |> Ecto.Changeset.change(changes)
+    |> Repo.update!()
+  end
+
+  defp reload(socket) do
+    tracks = load_recent_tracks(socket.assigns.filter_species, socket.assigns.filter_review)
+    stats = compute_stats()
+    species_summary = load_species_summary()
+    {:noreply, assign(socket, recent_tracks: tracks, stats: stats, species_summary: species_summary)}
   end
 
   defp load_species_summary do
     Track
     |> where([t], t.vlm_classified == true and not is_nil(t.species))
+    |> where([t], t.review_status != "discarded")
     |> group_by([t], t.species)
     |> select([t], %{
       species: t.species,
@@ -48,7 +93,7 @@ defmodule NaturecountsWeb.InventoryLive do
     |> Repo.all()
   end
 
-  defp load_recent_tracks(species_filter \\ nil) do
+  defp load_recent_tracks(species_filter \\ nil, review_filter \\ nil) do
     query =
       Track
       |> join(:inner, [t], v in Video, on: t.video_id == v.id)
@@ -66,12 +111,20 @@ defmodule NaturecountsWeb.InventoryLive do
         frame_count: t.frame_count,
         vlm_reasoning: t.vlm_reasoning,
         video_filename: v.filename,
-        has_thumbnail: not is_nil(t.thumbnail)
+        has_thumbnail: not is_nil(t.thumbnail),
+        review_status: t.review_status,
+        reviewed_at: t.reviewed_at,
+        expires_at: t.expires_at
       })
 
     query =
       if species_filter,
         do: where(query, [t], t.species == ^species_filter),
+        else: query
+
+    query =
+      if review_filter,
+        do: where(query, [t], t.review_status == ^review_filter),
         else: query
 
     query
@@ -90,15 +143,20 @@ defmodule NaturecountsWeb.InventoryLive do
     unique_species =
       Repo.one(
         from t in Track,
-          where: t.vlm_classified == true and t.species != "unidentified",
+          where: t.vlm_classified == true and t.species != "unidentified" and t.review_status != "discarded",
           select: count(t.species, :distinct)
       ) || 0
+
+    kept = Repo.one(from t in Track, where: t.review_status == "kept", select: count()) || 0
+    pending_review = Repo.one(from t in Track, where: t.vlm_classified == true and t.review_status == "pending", select: count()) || 0
 
     %{
       total_tracks: total_tracks,
       vlm_classified: vlm_classified,
       total_videos: total_videos,
-      unique_species: unique_species
+      unique_species: unique_species,
+      kept: kept,
+      pending_review: pending_review
     }
   end
 
@@ -108,11 +166,7 @@ defmodule NaturecountsWeb.InventoryLive do
     <div class="p-4 max-w-6xl mx-auto">
       <div class="flex items-center justify-between mb-6">
         <h1 class="text-2xl font-bold">Biodiversity Inventory</h1>
-        <div class="flex gap-2">
-          <.link navigate={~p"/"} class="btn btn-ghost btn-sm">Dashboard</.link>
-          <.link navigate={~p"/videos"} class="btn btn-ghost btn-sm">Videos</.link>
-          <button class="btn btn-outline btn-sm" phx-click="export_csv">Export CSV</button>
-        </div>
+        <button class="btn btn-outline btn-sm" phx-click="export_csv">Export CSV</button>
       </div>
 
       <%!-- Stats --%>
@@ -132,6 +186,14 @@ defmodule NaturecountsWeb.InventoryLive do
         <div class="stat">
           <div class="stat-title">Unique Species</div>
           <div class="stat-value text-accent">{@stats.unique_species}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Kept</div>
+          <div class="stat-value text-success">{@stats.kept}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Pending Review</div>
+          <div class="stat-value text-warning">{@stats.pending_review}</div>
         </div>
       </div>
 
@@ -162,6 +224,30 @@ defmodule NaturecountsWeb.InventoryLive do
                 </button>
               </div>
             <% end %>
+
+            <div class="divider my-1 text-xs">Review filter</div>
+            <div class="join w-full">
+              <button
+                class={"join-item btn btn-xs flex-1 #{if @filter_review == nil, do: "btn-active"}"}
+                phx-click="filter_review"
+                phx-value-status=""
+              >All</button>
+              <button
+                class={"join-item btn btn-xs flex-1 #{if @filter_review == "pending", do: "btn-warning"}"}
+                phx-click="filter_review"
+                phx-value-status="pending"
+              >Pending</button>
+              <button
+                class={"join-item btn btn-xs flex-1 #{if @filter_review == "kept", do: "btn-success"}"}
+                phx-click="filter_review"
+                phx-value-status="kept"
+              >Kept</button>
+              <button
+                class={"join-item btn btn-xs flex-1 #{if @filter_review == "discarded", do: "btn-error"}"}
+                phx-click="filter_review"
+                phx-value-status="discarded"
+              >Discarded</button>
+            </div>
           </div>
         </div>
 
@@ -177,56 +263,98 @@ defmodule NaturecountsWeb.InventoryLive do
             <%= if Enum.empty?(@recent_tracks) do %>
               <p class="text-base-content/50 italic">No classified tracks found.</p>
             <% else %>
-              <div class="overflow-x-auto">
-                <table class="table table-sm">
-                  <thead>
-                    <tr>
-                      <th>Crop</th>
-                      <th>Species</th>
-                      <th>Confidence</th>
-                      <th>Det. Score</th>
-                      <th>Bbox Area</th>
-                      <th>Frames</th>
-                      <th>Video</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr :for={track <- @recent_tracks} class="hover">
-                      <td>
-                        <%= if track.crop_url do %>
-                          <div class="relative group">
-                            <img src={track.crop_url} class="h-12 rounded bg-black object-contain cursor-pointer" />
-                            <div class="hidden group-hover:flex fixed inset-0 z-[100] items-center justify-center bg-black/60 pointer-events-none">
-                              <img src={track.crop_url} class="max-h-[80vh] max-w-[80vw] object-contain rounded-lg shadow-2xl" />
-                            </div>
-                          </div>
-                        <% else %>
-                          <span class="text-xs text-base-content/30">—</span>
-                        <% end %>
-                      </td>
-                      <td>
-                        <div class="font-bold">{track.species || "unidentified"}</div>
+              <div class="space-y-2 overflow-y-auto max-h-[70vh]">
+                <div
+                  :for={track <- @recent_tracks}
+                  class={[
+                    "card card-compact card-side bg-base-100",
+                    track.review_status == "kept" && "ring-1 ring-success",
+                    track.review_status == "discarded" && "opacity-40"
+                  ]}
+                >
+                  <%!-- Crop thumbnail --%>
+                  <figure class="shrink-0 w-24 bg-black">
+                    <%= if track.crop_url do %>
+                      <div class="relative group w-full h-full">
+                        <img src={track.crop_url} class="w-full h-full object-contain cursor-pointer" />
+                        <div class="hidden group-hover:flex fixed inset-0 z-[100] items-center justify-center bg-black/60 pointer-events-none">
+                          <img src={track.crop_url} class="max-h-[80vh] max-w-[80vw] object-contain rounded-lg shadow-2xl" />
+                        </div>
+                      </div>
+                    <% else %>
+                      <div class="flex items-center justify-center w-full h-full text-base-content/20 text-xs">
+                        No crop
+                      </div>
+                    <% end %>
+                  </figure>
+
+                  <div class="card-body p-3">
+                    <%!-- Top row: species + stats --%>
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <div class="flex items-center gap-2">
+                          <span class="font-bold text-sm">{track.species || "unidentified"}</span>
+                          <span class={[
+                            "badge badge-xs",
+                            track.species_confidence == "high" && "badge-success",
+                            track.species_confidence == "medium" && "badge-warning",
+                            track.species_confidence == "low" && "badge-ghost"
+                          ]}>
+                            {track.species_confidence}
+                          </span>
+                        </div>
                         <%= if track.scientific_name do %>
                           <div class="text-xs italic text-base-content/50">{track.scientific_name}</div>
                         <% end %>
-                      </td>
-                      <td>
-                        <span class={[
-                          "badge badge-xs",
-                          track.species_confidence == "high" && "badge-success",
-                          track.species_confidence == "medium" && "badge-warning",
-                          track.species_confidence == "low" && "badge-ghost"
-                        ]}>
-                          {track.species_confidence}
-                        </span>
-                      </td>
-                      <td class="font-mono text-xs">{Float.round(track.best_confidence || 0.0, 2)}</td>
-                      <td class="font-mono text-xs">{track.best_bbox_area} px</td>
-                      <td class="font-mono text-xs">{track.frame_count}</td>
-                      <td class="text-xs text-base-content/60">{track.video_filename}</td>
-                    </tr>
-                  </tbody>
-                </table>
+                      </div>
+                      <div class="flex items-center gap-2 shrink-0 text-xs text-base-content/50 font-mono">
+                        <span>{Float.round(track.best_confidence || 0.0, 2)}</span>
+                        <span>{track.best_bbox_area}px</span>
+                      </div>
+                    </div>
+
+                    <%!-- Reasoning --%>
+                    <%= if track.vlm_reasoning do %>
+                      <p class="text-xs text-base-content/50 line-clamp-2" title={track.vlm_reasoning}>
+                        {track.vlm_reasoning}
+                      </p>
+                    <% end %>
+
+                    <%!-- Bottom row: video name + review actions --%>
+                    <div class="flex items-center justify-between mt-auto">
+                      <span class="text-xs text-base-content/40 truncate max-w-[150px]" title={track.video_filename}>
+                        {track.video_filename}
+                      </span>
+                      <div class="flex items-center gap-1">
+                        <%= case track.review_status do %>
+                          <% "pending" -> %>
+                            <button
+                              class="btn btn-success btn-xs"
+                              phx-click="keep_track"
+                              phx-value-id={track.id}
+                            >Keep</button>
+                            <button
+                              class="btn btn-error btn-xs btn-outline"
+                              phx-click="discard_track"
+                              phx-value-id={track.id}
+                            >Discard</button>
+                          <% "kept" -> %>
+                            <span class="badge badge-success badge-sm">Kept</span>
+                            <button class="btn btn-ghost btn-xs" phx-click="reset_track" phx-value-id={track.id}>Undo</button>
+                          <% "discarded" -> %>
+                            <span class="badge badge-error badge-sm">Discarded</span>
+                            <button class="btn btn-ghost btn-xs" phx-click="reset_track" phx-value-id={track.id}>Undo</button>
+                          <% _ -> %>
+                        <% end %>
+                        <%= if track.expires_at do %>
+                          <span class="text-xs text-base-content/30" title={"Expires #{Calendar.strftime(track.expires_at, "%Y-%m-%d")}"}>
+                            ⏳
+                          </span>
+                        <% end %>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             <% end %>
           </div>

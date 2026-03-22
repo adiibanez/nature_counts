@@ -54,13 +54,9 @@ defmodule NaturecountsWeb.DashboardLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="space-y-6">
+    <div class="p-4 max-w-6xl mx-auto space-y-6">
       <div class="flex items-center justify-between">
-        <h1 class="text-3xl font-bold">NatureCounts Dashboard</h1>
-        <div class="flex items-center gap-2">
-          <.link navigate={~p"/videos"} class="btn btn-outline btn-sm">Videos</.link>
-          <.link navigate={~p"/inventory"} class="btn btn-outline btn-sm">Inventory</.link>
-        </div>
+        <h1 class="text-3xl font-bold">Dashboard</h1>
         <label class="label cursor-pointer gap-2">
           <span class="label-text">Inference overlay</span>
           <input

@@ -9,6 +9,7 @@ defmodule Naturecounts.Offline.Profiles do
       imgsz: 640,
       detection_threshold: 0.25,
       min_bbox_area: 200 * 200,
+      vlm_sample_pct: 10,
       vlm_crops_per_track: 1,
       vlm_concurrency: 3
     },
@@ -19,6 +20,7 @@ defmodule Naturecounts.Offline.Profiles do
       imgsz: 640,
       detection_threshold: 0.15,
       min_bbox_area: 150 * 150,
+      vlm_sample_pct: 50,
       vlm_crops_per_track: 3,
       vlm_concurrency: 5
     },
@@ -29,6 +31,7 @@ defmodule Naturecounts.Offline.Profiles do
       imgsz: 1280,
       detection_threshold: 0.10,
       min_bbox_area: 100 * 100,
+      vlm_sample_pct: 100,
       vlm_crops_per_track: :all,
       vlm_concurrency: 5
     }

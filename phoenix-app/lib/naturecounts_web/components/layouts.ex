@@ -31,45 +31,49 @@ defmodule NaturecountsWeb.Layouts do
     default: nil,
     doc: "the current [scope](https://hexdocs.pm/phoenix/scopes.html)"
 
-  slot :inner_block, required: true
+  attr :current_path, :string, default: "/"
+
+  slot :inner_block
 
   def app(assigns) do
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
-      <div class="flex-1">
-        <a href="/" class="flex-1 flex w-fit items-center gap-2">
-          <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">v{Application.spec(:phoenix, :vsn)}</span>
-        </a>
-      </div>
-      <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <a href="https://phoenixframework.org/" class="btn btn-ghost">Website</a>
-          </li>
-          <li>
-            <a href="https://github.com/phoenixframework/phoenix" class="btn btn-ghost">GitHub</a>
-          </li>
-          <li>
-            <.theme_toggle />
-          </li>
-          <li>
-            <a href="https://hexdocs.pm/phoenix/overview.html" class="btn btn-primary">
-              Get Started <span aria-hidden="true">&rarr;</span>
-            </a>
-          </li>
-        </ul>
-      </div>
-    </header>
+    <div class="flex flex-col h-screen">
+      <header class="navbar bg-base-200 px-4 shrink-0">
+        <div class="flex-1">
+          <.link navigate={~p"/"} class="btn btn-ghost text-lg font-bold normal-case">
+            NatureCounts
+          </.link>
+        </div>
+        <div class="flex-none">
+          <ul class="menu menu-horizontal px-1 gap-1 items-center">
+            <li><.link navigate={~p"/"} class={nav_class(@current_path, "/")}>Dashboard</.link></li>
+            <li><.link navigate={~p"/videos"} class={nav_class(@current_path, "/videos")}>Videos</.link></li>
+            <li><.link navigate={~p"/inventory"} class={nav_class(@current_path, "/inventory")}>Inventory</.link></li>
+            <li><.link navigate={~p"/crops"} class={nav_class(@current_path, "/crops")}>Crops</.link></li>
+            <li><.theme_toggle /></li>
+          </ul>
+        </div>
+      </header>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
-        {render_slot(@inner_block)}
-      </div>
-    </main>
+      <main class="flex-1 min-h-0 overflow-y-auto">
+        {@inner_content}
+      </main>
 
-    <.flash_group flash={@flash} />
+      <.flash_group flash={@flash} />
+    </div>
     """
+  end
+
+  defp nav_class(current_path, path) do
+    active =
+      cond do
+        current_path == path -> true
+        path == "/" and String.starts_with?(current_path, "/camera/") -> true
+        path != "/" and String.starts_with?(current_path, path) -> true
+        true -> false
+      end
+
+    if active, do: "btn btn-ghost btn-sm btn-active", else: "btn btn-ghost btn-sm"
   end
 
   @doc """

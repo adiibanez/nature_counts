@@ -21,14 +21,21 @@ defmodule NaturecountsWeb.Router do
     get "/:filename", CropsController, :show
   end
 
+  # Serve video files for preview playback
+  scope "/serve/videos", NaturecountsWeb do
+    get "/*path", VideoController, :show
+  end
+
   scope "/", NaturecountsWeb do
     pipe_through :browser
 
-    live "/", DashboardLive
-    live "/camera/:id", CameraLive
-    live "/videos", VideosLive
-    live "/inventory", InventoryLive
-    live "/crops", CropsLive
+    live_session :default, layout: {NaturecountsWeb.Layouts, :app} do
+      live "/", DashboardLive
+      live "/camera/:id", CameraLive
+      live "/videos", VideosLive
+      live "/inventory", InventoryLive
+      live "/crops", CropsLive
+    end
   end
 
   # HLS proxy — in production, use nginx/reverse proxy instead.
