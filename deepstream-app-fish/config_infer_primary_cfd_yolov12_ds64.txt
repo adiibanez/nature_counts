@@ -9,7 +9,7 @@ labelfile-path=cfd_labels.txt
 batch-size=3
 network-mode=0
 num-detected-classes=1
-interval=3
+interval=1
 gie-unique-id=1
 process-mode=1
 network-type=0
@@ -25,5 +25,5 @@ custom-lib-path=libnvdsinfer_custom_impl_Yolo_cfd_ds64.so
 
 [class-attrs-all]
 nms-iou-threshold=0.45
-pre-cluster-threshold=0.25
+pre-cluster-threshold=0.15
 topk=300
