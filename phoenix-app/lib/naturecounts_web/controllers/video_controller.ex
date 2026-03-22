@@ -21,7 +21,7 @@ defmodule NaturecountsWeb.VideoController do
             length = range_end - range_start + 1
 
             conn
-            |> put_resp_content_type(mime)
+            |> put_resp_content_type(mime, nil)
             |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-range", "bytes #{range_start}-#{range_end}/#{file_size}")
             |> put_resp_header("content-length", "#{length}")
@@ -29,7 +29,7 @@ defmodule NaturecountsWeb.VideoController do
 
           _ ->
             conn
-            |> put_resp_content_type(mime)
+            |> put_resp_content_type(mime, nil)
             |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-length", "#{file_size}")
             |> send_file(200, full_path)

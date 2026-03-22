@@ -84,7 +84,10 @@ defmodule Naturecounts.MixProject do
       {:castore, "~> 1.0"},
 
       # Embedded Python interpreter
-      {:pythonx, "~> 0.4"}
+      {:pythonx, "~> 0.4"},
+
+      # AI development assistant
+      {:tidewave, "~> 0.1", only: :dev}
     ]
   end
 

@@ -54,18 +54,7 @@ defmodule Naturecounts.Offline.Classifier do
   end
 
   defp select_crops(tracks, profile) do
-    # First apply percentage sampling
-    sampled = apply_sample_pct(tracks, Map.get(profile, :vlm_sample_pct, 100))
-
-    case profile.vlm_crops_per_track do
-      :all ->
-        sampled
-
-      n when is_integer(n) ->
-        sampled
-        |> Enum.sort_by(fn t -> -(t["best_confidence"] * t["best_bbox_area"]) end)
-        |> Enum.take(n)
-    end
+    apply_sample_pct(tracks, Map.get(profile, :vlm_sample_pct, 100))
   end
 
   defp apply_sample_pct(tracks, pct) when pct >= 100, do: tracks

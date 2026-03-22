@@ -25,6 +25,7 @@ import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/naturecounts"
 import topbar from "../vendor/topbar"
 import VideoOverlay from "./hooks/video_overlay"
+import VideoPreview from "./hooks/video_preview"
 import { createPlayerHook } from "membrane_webrtc_plugin"
 
 const iceServers = [{ urls: "stun:stun.l.google.com:19302" }]
@@ -34,7 +35,7 @@ const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, VideoOverlay, Player},
+  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, Player},
 })
 
 // Show progress bar on live navigation and form submits
