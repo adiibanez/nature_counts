@@ -11,7 +11,10 @@ defmodule Naturecounts.Offline.Profiles do
       min_bbox_area: 200 * 200,
       vlm_sample_pct: 10,
       vlm_crops_per_track: 1,
-      vlm_concurrency: 3
+      vlm_concurrency: 3,
+      fishial_enabled: true,
+      fishial_confidence_threshold: 0.5,
+      vlm_enabled: true
     },
     "standard" => %{
       label: "Standard",
@@ -22,7 +25,10 @@ defmodule Naturecounts.Offline.Profiles do
       min_bbox_area: 150 * 150,
       vlm_sample_pct: 50,
       vlm_crops_per_track: 3,
-      vlm_concurrency: 5
+      vlm_concurrency: 5,
+      fishial_enabled: true,
+      fishial_confidence_threshold: 0.5,
+      vlm_enabled: true
     },
     "deep" => %{
       label: "Deep",
@@ -33,7 +39,10 @@ defmodule Naturecounts.Offline.Profiles do
       min_bbox_area: 100 * 100,
       vlm_sample_pct: 100,
       vlm_crops_per_track: :all,
-      vlm_concurrency: 5
+      vlm_concurrency: 5,
+      fishial_enabled: true,
+      fishial_confidence_threshold: 0.4,
+      vlm_enabled: true
     }
   }
 

@@ -97,6 +97,17 @@ static void phoenix_thread_fn(const Config& cfg) {
             bool enabled = payload.value("enabled", true);
             g_thumbnails_enabled.store(enabled, std::memory_order_relaxed);
             LOG("Thumbnails %s via runtime command", enabled ? "enabled" : "disabled");
+        } else if (event == "set_crop_filters") {
+            if (payload.contains("min_crop_area")) {
+                int v = payload["min_crop_area"].get<int>();
+                g_min_crop_area.store(v, std::memory_order_relaxed);
+                LOG("min_crop_area set to %d", v);
+            }
+            if (payload.contains("min_sharpness")) {
+                double v = payload["min_sharpness"].get<double>();
+                g_min_sharpness.store(v, std::memory_order_relaxed);
+                LOG("min_sharpness set to %.1f", v);
+            }
         } else if (event == "set_tracker_config") {
             const std::string out_path = "/tmp/tracker_runtime.yml";
             if (write_tracker_yaml(payload, g_config_dir, out_path)) {

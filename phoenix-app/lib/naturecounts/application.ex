@@ -17,6 +17,16 @@ defmodule Naturecounts.Application do
       end
     end)
 
+    # Download Fishial model if not present (non-blocking)
+    Task.start(fn ->
+      Process.sleep(3_000)
+      try do
+        Naturecounts.Offline.FishialSetup.ensure_model()
+      rescue
+        e -> require Logger; Logger.warning("Fishial setup skipped: #{Exception.message(e)}")
+      end
+    end)
+
     children = [
       NaturecountsWeb.Telemetry,
       Naturecounts.Repo,

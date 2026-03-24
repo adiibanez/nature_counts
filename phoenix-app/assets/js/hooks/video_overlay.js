@@ -1,20 +1,14 @@
 /**
  * VideoOverlay — Phoenix LiveView Hook
  *
- * Plays DeepStream video via MediaMTX WebRTC and renders a frame-accurate
- * fish list below the video.
- *
- * Detection events arrive via Phoenix Channel ~200ms BEFORE the video frame
- * is displayed (WebRTC jitter buffer). We buffer detections and apply them
- * when the video catches up, using requestVideoFrameCallback for sync.
+ * Plays DeepStream video via MediaMTX WebRTC. Buffers detection metadata
+ * for frame-accurate PTS sync (used for overlay rendering).
  *
  * PTS flow: DeepStream GStreamer PTS (ns) → RTP timestamp (90kHz) → WebRTC
  *           → browser mediaTime (seconds). We auto-calibrate the PTS offset
  *           using the median of the first CALIBRATION_SAMPLES pairs, then
  *           refine it with an exponential moving average on every match.
  */
-
-import { Socket } from "phoenix";
 
 /** Convert GStreamer PTS (nanoseconds) to seconds. */
 const ptsToSeconds = (pts) => pts / 1_000_000_000;
@@ -37,14 +31,8 @@ const VideoOverlay = {
     const camId = this.el.dataset.camId;
     const webrtcUrl = this.el.dataset.webrtcUrl;
 
-    // DOM references for the fish list (outside the hook's element)
-    this.fishGrid = document.getElementById(`fish-grid-cam${camId}`);
-    this.fishCount = document.getElementById(`fish-count-cam${camId}`);
-    this.fishEmpty = document.getElementById(`fish-empty-cam${camId}`);
-
     // Initialize sync state
     this._resetCalibration();
-    this._staleTimer = null;
 
     // --- Loading spinner (managed in JS to survive LiveView patches) ---
     this._showSpinner(video);
@@ -52,44 +40,9 @@ const VideoOverlay = {
     // --- WebRTC via MediaMTX's WHEP endpoint ---
     this._startWebRTC(video, webrtcUrl, camId);
 
-    // --- Phoenix Channel for detection events ---
-    const socket = new Socket("/user", {});
-    socket.connect();
-
-    const topic = `detections:${camId}`;
-    const channel = socket.channel(topic, {});
-    channel.join()
-      .receive("ok", () => console.log(`[cam${camId}] Joined ${topic}`))
-      .receive("error", (resp) => console.error(`[cam${camId}] Join error:`, resp));
-
-    channel.on("detection_update", (msg) => {
-      if (this._paused) return; // Tab is hidden — drop incoming detections
-
-      // If resuming after staleness timeout, re-calibrate PTS sync
-      if (this._staleTimer === null && this._currentDetection === null) {
-        this._resetCalibration();
-      }
-
-      this._currentDetection = msg;
-      this._renderFishList(msg);
-
-      // Staleness watchdog: clear display if no detection arrives within 2s
-      clearTimeout(this._staleTimer);
-      this._staleTimer = setTimeout(() => {
-        this._currentDetection = null;
-        this._renderFishList({ objects: [] });
-        this._staleTimer = null;
-      }, 2000);
-    });
-
-    this.channel = channel;
-    this.socket = socket;
     this.video = video;
     this.camId = camId;
     this._currentWebrtcUrl = webrtcUrl;
-
-    // Apply initial column count from data attribute
-    this._syncFishCols();
 
     // --- requestVideoFrameCallback for frame-accurate sync ---
     this._startFrameSync(video);
@@ -116,8 +69,6 @@ const VideoOverlay = {
    * Handles data-fish-cols changes and data-webrtc-url changes (inference toggle).
    */
   updated() {
-    this._syncFishCols();
-
     const newUrl = this.el.dataset.webrtcUrl;
     if (newUrl && newUrl !== this._currentWebrtcUrl) {
       console.log(`[cam${this.camId}] WebRTC URL changed, reconnecting...`);
@@ -128,16 +79,6 @@ const VideoOverlay = {
       }
       this._resetCalibration();
       this._startWebRTC(this.video, newUrl, this.camId);
-    }
-  },
-
-  /**
-   * Read data-fish-cols from the hook element and apply to the fish grid.
-   */
-  _syncFishCols() {
-    const cols = parseInt(this.el.dataset.fishCols, 10) || 1;
-    if (this.fishGrid) {
-      this.fishGrid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
     }
   },
 
@@ -267,16 +208,14 @@ const VideoOverlay = {
           if (delta <= MAX_STALE) {
             this._detectionBuffer.splice(0, bestIdx + 1);
             this._currentDetection = matched.msg;
-            this._renderFishList(matched.msg);
             this._lastMatchDelta = delta;
 
             // --- Running offset EMA refinement (#1) ---
             this._refineOffset(matched.mediaTimePts, targetMediaTime);
           } else {
-            // Detection is too stale — discard it and clear the display
+            // Detection is too stale — discard it
             this._detectionBuffer.splice(0, bestIdx + 1);
             this._currentDetection = null;
-            this._renderFishList({ objects: [] });
             this._lastMatchDelta = null;
           }
         }
@@ -308,79 +247,6 @@ const VideoOverlay = {
 
     this._debugStats.detectionsReceived = 0;
     this._debugStats.lastLogTime = now;
-  },
-
-  /**
-   * Render fish cards into the DOM.
-   */
-  _renderFishList(detection) {
-    if (!this.fishGrid) return;
-
-    const objects = detection.objects || [];
-    // Sort by track_id
-    objects.sort((a, b) => a.track_id - b.track_id);
-
-    // Update count
-    if (this.fishCount) {
-      this.fishCount.textContent = objects.length;
-    }
-    // Toggle empty message
-    if (this.fishEmpty) {
-      this.fishEmpty.style.display = objects.length === 0 ? "" : "none";
-    }
-
-    const cols = parseInt(this.el.dataset.fishCols, 10) || 1;
-
-    // Build card HTML — horizontal row for 1 col, vertical card for multi-col
-    const html = objects.map((obj) => {
-      const left = Math.round(obj.bbox.left);
-      const top = Math.round(obj.bbox.top);
-      const width = Math.round(obj.bbox.width);
-      const height = Math.round(obj.bbox.height);
-      const bboxStr = `${left},${top} ${width}\u00d7${height}`;
-
-      if (cols === 1) {
-        // Horizontal compact row
-        const thumb = obj.thumbnail
-          ? `<img src="data:image/jpeg;base64,${obj.thumbnail}"
-                 alt="Fish ${obj.track_id}"
-                 class="w-14 h-14 rounded object-cover bg-black shrink-0" />`
-          : `<div class="w-14 h-14 rounded bg-base-300 shrink-0"></div>`;
-
-        return `<div class="flex items-center gap-2 p-2 rounded-lg bg-base-200 shadow-sm">
-          ${thumb}
-          <div class="min-w-0 flex-1">
-            <div class="flex items-center justify-between">
-              <span class="font-mono text-sm font-bold">#${obj.track_id}</span>
-              <span class="badge badge-xs badge-accent">${obj.label}</span>
-            </div>
-            <div class="text-xs text-base-content/50 font-mono mt-0.5">${bboxStr}</div>
-          </div>
-        </div>`;
-      } else {
-        // Vertical card for grid
-        const thumb = obj.thumbnail
-          ? `<figure class="bg-black">
-               <img src="data:image/jpeg;base64,${obj.thumbnail}"
-                    alt="Fish ${obj.track_id}"
-                    class="w-full h-20 object-contain" />
-             </figure>`
-          : "";
-
-        return `<div class="card card-compact bg-base-200 shadow-sm">
-          ${thumb}
-          <div class="card-body p-2">
-            <div class="flex items-center justify-between">
-              <span class="font-mono text-xs font-bold">#${obj.track_id}</span>
-              <span class="badge badge-xs badge-accent">${obj.label}</span>
-            </div>
-            <div class="text-xs text-base-content/50 font-mono">${bboxStr}</div>
-          </div>
-        </div>`;
-      }
-    }).join("");
-
-    this.fishGrid.innerHTML = html;
   },
 
   _showSpinner(video) {
@@ -468,15 +334,10 @@ const VideoOverlay = {
       this.pc.close();
       this.pc = null;
     }
-    if (this.channel) this.channel.leave();
-    if (this.socket) this.socket.disconnect();
     if (this._onVisibilityChange) {
       document.removeEventListener("visibilitychange", this._onVisibilityChange);
     }
     this._hideSpinner();
-    if (this._staleTimer) {
-      clearTimeout(this._staleTimer);
-    }
     if (this._debugInterval) {
       clearInterval(this._debugInterval);
     }

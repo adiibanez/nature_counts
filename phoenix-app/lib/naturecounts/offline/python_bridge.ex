@@ -1,7 +1,7 @@
 defmodule Naturecounts.Offline.PythonBridge do
   @moduledoc """
   Runs YOLO detection + ByteTrack tracking via Pythonx (embedded Python).
-  Uses ultralytics for inference — handles ONNX model loading and pre/postprocessing.
+  Also provides Fishial BEiT v2 classification for species identification.
   """
 
   require Logger
@@ -137,8 +137,7 @@ defmodule Naturecounts.Offline.PythonBridge do
                       state["best_bbox_area"] = area
                       state["best_sharpness"] = sharp
                       state["best_bbox"] = [float(x1), float(y1), float(x2), float(y2)]
-                      if area >= min_bbox_area:
-                          state["best_crop"] = crop_and_encode(frame, bbox)
+                      state["best_crop"] = crop_and_encode(frame, bbox)
 
       if total_frames > 0:
           pct = int((frame_idx / total_frames) * 100)
@@ -255,5 +254,156 @@ defmodule Naturecounts.Offline.PythonBridge do
 
   defp default_model_path do
     System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.onnx")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Fishial classification (uses their bundled inference.py EmbeddingClassifier)
+  # ---------------------------------------------------------------------------
+
+  @fishial_code """
+  import sys
+  import numpy as np
+  import cv2
+  import base64
+  import json
+
+  # Pythonx passes Elixir strings as bytes
+  if isinstance(fishial_dir, bytes):
+      fishial_dir = fishial_dir.decode("utf-8")
+  if isinstance(crops_json, bytes):
+      crops_json = crops_json.decode("utf-8")
+
+  # Lazy-load classifier (cached across calls via globals)
+  if "fishial_classifier" not in dir() or fishial_classifier is None:
+      import os
+      import torch
+
+      # Add fishial dir to sys.path so we can import inference.py
+      if fishial_dir not in sys.path:
+          sys.path.insert(0, fishial_dir)
+
+      from inference import EmbeddingClassifier
+
+      cuda_available = torch.cuda.is_available()
+      device = "cuda:0" if cuda_available else "cpu"
+      print(f"[Fishial] Loading model from {fishial_dir}, device={device}", flush=True)
+
+      config = {
+          "log_level": "INFO",
+          "dataset": {"path": os.path.join(fishial_dir, "database.pt")},
+          "model": {
+              "checkpoint_path": os.path.join(fishial_dir, "model.ckpt"),
+              "backbone_model_name": "beitv2_base_patch16_224.in1k_ft_in22k_in1k",
+              "embedding_dim": 512,
+              "num_classes": 775,
+              "arcface_s": 64.0,
+              "arcface_m": 0.2,
+              "pooling_type": "attention",
+              "device": device,
+          },
+          "use_knn": True,
+      }
+
+      fishial_classifier = EmbeddingClassifier(config)
+      fishial_classifier.warmup(num_iterations=3)
+      info = fishial_classifier.get_model_info()
+      print(f"[Fishial] Model ready: {info.get('num_classes', '?')} classes", flush=True)
+
+  # Parse input crops
+  crops_list = json.loads(crops_json)
+
+  results = []
+
+  if len(crops_list) > 0:
+      # Decode crops to numpy arrays
+      images = []
+      valid_indices = []
+      for i, item in enumerate(crops_list):
+          try:
+              crop_bytes = base64.b64decode(item["crop_b64"])
+              nparr = np.frombuffer(crop_bytes, np.uint8)
+              img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+              if img is None:
+                  continue
+              img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+              images.append(img_rgb)
+              valid_indices.append(i)
+          except Exception as e:
+              print(f"[Fishial] Failed to decode crop for track {item.get('track_id')}: {e}", flush=True)
+
+      if len(images) > 0:
+          # Batch inference using Fishial's EmbeddingClassifier
+          batch_results = fishial_classifier(images)
+
+          for j, idx in enumerate(valid_indices):
+              preds = batch_results[j]
+              if preds and len(preds) > 0:
+                  top = preds[0]
+                  results.append({
+                      "track_id": crops_list[idx]["track_id"],
+                      "species": top.name,
+                      "confidence": round(float(top.accuracy), 4),
+                  })
+              else:
+                  results.append({
+                      "track_id": crops_list[idx]["track_id"],
+                      "species": "unidentified",
+                      "confidence": 0.0,
+                  })
+
+  fishial_results_json = json.dumps(results)
+  """
+
+  @doc """
+  Classify a list of crops using the Fishial EmbeddingClassifier.
+  Input: list of %{"track_id" => id, "crop_b64" => base64_jpeg}
+  Returns {:ok, [%{"track_id" => id, "species" => name, "confidence" => float}]} or {:error, reason}
+  """
+  def classify_fishial(crops, opts \\ []) do
+    fishial_dir = Keyword.get(opts, :fishial_dir, fishial_dir())
+
+    unless File.exists?(Path.join(fishial_dir, "model.ckpt")) do
+      {:error, "Fishial model not found in #{fishial_dir}"}
+    else
+      run_fishial_classification(crops, fishial_dir)
+    end
+  end
+
+  defp run_fishial_classification(crops, fishial_dir) do
+    Logger.info("[Fishial] Classifying #{length(crops)} crops")
+    start_time = System.monotonic_time(:millisecond)
+
+    crops_json = Jason.encode!(crops)
+
+    globals = %{
+      "fishial_dir" => fishial_dir,
+      "crops_json" => crops_json
+    }
+
+    try do
+      {_result, updated_globals} = Pythonx.eval(@fishial_code, globals)
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      results_json = Pythonx.decode(updated_globals["fishial_results_json"])
+
+      case Jason.decode(results_json) do
+        {:ok, results} ->
+          Logger.info("[Fishial] Classification complete in #{Float.round(elapsed / 1000, 1)}s: #{length(results)} crops classified")
+          {:ok, results}
+
+        {:error, reason} ->
+          Logger.error("[Fishial] Failed to parse results: #{inspect(reason)}")
+          {:error, "Failed to parse Fishial results"}
+      end
+    rescue
+      e ->
+        elapsed = System.monotonic_time(:millisecond) - start_time
+        Logger.error("[Fishial] Python crashed after #{Float.round(elapsed / 1000, 1)}s: #{Exception.message(e)}")
+        {:error, "Fishial classification failed: #{Exception.message(e)}"}
+    end
+  end
+
+  defp fishial_dir do
+    System.get_env("FISHIAL_MODEL_DIR", "/models/fishial")
   end
 end

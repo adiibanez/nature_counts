@@ -70,7 +70,7 @@ defmodule Naturecounts.Offline.Classifier do
 
   def classify_crop(track, profile, video) do
     crop_b64 = track["crop_b64"]
-    location = Map.get(video, :location, "underwater reef camera")
+    location = Map.get(video, :location) || "underwater camera monitoring fish biodiversity"
     track_id = track["track_id"]
     area = track["best_bbox_area"]
 
@@ -140,7 +140,8 @@ defmodule Naturecounts.Offline.Classifier do
           "scientific_name" => parsed["scientific_name"],
           "species_confidence" => parsed["confidence"],
           "vlm_reasoning" => parsed["reasoning"],
-          "vlm_classified" => true
+          "vlm_classified" => true,
+          "classifier_source" => "vlm"
         }}
 
       _ ->
@@ -149,7 +150,8 @@ defmodule Naturecounts.Offline.Classifier do
           "species" => "unidentified",
           "species_confidence" => "low",
           "vlm_reasoning" => text,
-          "vlm_classified" => true
+          "vlm_classified" => true,
+          "classifier_source" => "vlm"
         }}
     end
   end

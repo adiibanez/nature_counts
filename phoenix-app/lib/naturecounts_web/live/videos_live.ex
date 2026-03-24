@@ -2,7 +2,7 @@ defmodule NaturecountsWeb.VideosLive do
   use NaturecountsWeb, :live_view
 
   alias Naturecounts.Repo
-  alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker}
+  alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker, VlmContexts}
 
   import Ecto.Query
 
@@ -38,7 +38,15 @@ defmodule NaturecountsWeb.VideosLive do
        profiles: Profiles.all(),
        min_bbox_area: default_profile.min_bbox_area,
        vlm_sample_pct: default_profile.vlm_sample_pct,
+       fishial_enabled: default_profile.fishial_enabled,
+       vlm_enabled: default_profile.vlm_enabled,
+       fishial_ready: Naturecounts.Offline.FishialSetup.ready?(),
        classification_ttl_days: Application.get_env(:naturecounts, :classification_ttl_days, 30),
+       vlm_contexts: VlmContexts.list(),
+       selected_context_id: List.first(VlmContexts.list())["id"],
+       vlm_context_prompt: List.first(VlmContexts.list())["prompt"],
+       editing_context: false,
+       context_name: "",
        scanning: scan_running?(),
        scan_progress: nil,
        sort_by: "name",
@@ -229,7 +237,7 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("select_profile", %{"profile" => profile}, socket) do
     p = Profiles.get(profile)
-    {:noreply, assign(socket, selected_profile: profile, min_bbox_area: p.min_bbox_area, vlm_sample_pct: p.vlm_sample_pct)}
+    {:noreply, assign(socket, selected_profile: profile, min_bbox_area: p.min_bbox_area, vlm_sample_pct: p.vlm_sample_pct, fishial_enabled: p.fishial_enabled, vlm_enabled: p.vlm_enabled)}
   end
 
   def handle_event("set_min_bbox_area", %{"area" => area_str}, socket) do
@@ -291,6 +299,96 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply, assign(socket, classification_ttl_days: days)}
   end
 
+  def handle_event("toggle_fishial", _params, socket) do
+    {:noreply, assign(socket, fishial_enabled: !socket.assigns.fishial_enabled)}
+  end
+
+  def handle_event("toggle_vlm", _params, socket) do
+    {:noreply, assign(socket, vlm_enabled: !socket.assigns.vlm_enabled)}
+  end
+
+  def handle_event("select_context", %{"id" => ""}, socket), do: {:noreply, socket}
+
+  def handle_event("select_context", %{"id" => id}, socket) do
+    case VlmContexts.get(id) do
+      nil ->
+        {:noreply, socket}
+
+      ctx ->
+        {:noreply,
+         assign(socket,
+           selected_context_id: id,
+           vlm_context_prompt: ctx["prompt"],
+           editing_context: false
+         )}
+    end
+  end
+
+  def handle_event("edit_context_prompt", %{"prompt" => prompt}, socket) do
+    {:noreply, assign(socket, vlm_context_prompt: prompt)}
+  end
+
+  def handle_event("new_context", _params, socket) do
+    {:noreply, assign(socket, editing_context: true, context_name: "", selected_context_id: nil, vlm_context_prompt: "")}
+  end
+
+  def handle_event("set_context_name", %{"name" => name}, socket) do
+    {:noreply, assign(socket, context_name: name)}
+  end
+
+  def handle_event("save_context", _params, socket) do
+    name = String.trim(socket.assigns.context_name)
+    prompt = String.trim(socket.assigns.vlm_context_prompt)
+
+    if name == "" or prompt == "" do
+      {:noreply, put_flash(socket, :error, "Context name and prompt are required")}
+    else
+      id =
+        case socket.assigns.selected_context_id do
+          nil -> VlmContexts.add(name, prompt)
+          existing_id -> VlmContexts.update(existing_id, name, prompt)
+        end
+
+      {:noreply,
+       assign(socket,
+         vlm_contexts: VlmContexts.list(),
+         selected_context_id: id,
+         editing_context: false
+       )}
+    end
+  end
+
+  def handle_event("edit_context", _params, socket) do
+    ctx = VlmContexts.get(socket.assigns.selected_context_id)
+    name = if ctx, do: ctx["name"], else: ""
+    {:noreply, assign(socket, editing_context: true, context_name: name)}
+  end
+
+  def handle_event("cancel_edit_context", _params, socket) do
+    # Restore prompt from saved context
+    ctx = VlmContexts.get(socket.assigns.selected_context_id)
+    prompt = if ctx, do: ctx["prompt"], else: socket.assigns.vlm_context_prompt
+    {:noreply, assign(socket, editing_context: false, vlm_context_prompt: prompt)}
+  end
+
+  def handle_event("delete_context", _params, socket) do
+    if socket.assigns.selected_context_id do
+      VlmContexts.delete(socket.assigns.selected_context_id)
+      contexts = VlmContexts.list()
+      first = List.first(contexts)
+
+      {:noreply,
+       assign(socket,
+         vlm_contexts: contexts,
+         selected_context_id: first && first["id"],
+         vlm_context_prompt: (first && first["prompt"]) || "",
+         editing_context: false
+       )}
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_event("start_processing", _params, socket) do
     file = socket.assigns.selected_file
     profile = socket.assigns.selected_profile
@@ -303,7 +401,10 @@ defmodule NaturecountsWeb.VideosLive do
           path: file,
           processing_profile: profile,
           min_bbox_area: socket.assigns.min_bbox_area,
-          vlm_sample_pct: socket.assigns.vlm_sample_pct
+          vlm_sample_pct: socket.assigns.vlm_sample_pct,
+          fishial_enabled: socket.assigns.fishial_enabled,
+          vlm_enabled: socket.assigns.vlm_enabled,
+          location: socket.assigns.vlm_context_prompt
         })
         |> Repo.insert!()
 
@@ -779,6 +880,101 @@ defmodule NaturecountsWeb.VideosLive do
               </form>
             </div>
 
+            <div class="flex items-center gap-4 mt-2">
+              <label class="label cursor-pointer gap-2 p-0">
+                <span class="label-text text-xs">Fishial</span>
+                <input
+                  type="checkbox"
+                  class="toggle toggle-sm toggle-info"
+                  checked={@fishial_enabled}
+                  phx-click="toggle_fishial"
+                  disabled={not @fishial_ready}
+                />
+              </label>
+              <label class="label cursor-pointer gap-2 p-0">
+                <span class="label-text text-xs">VLM</span>
+                <input
+                  type="checkbox"
+                  class="toggle toggle-sm toggle-secondary"
+                  checked={@vlm_enabled}
+                  phx-click="toggle_vlm"
+                />
+              </label>
+              <span class="text-xs text-base-content/40">
+                <%= cond do %>
+                  <% not @fishial_ready and @fishial_enabled -> %>
+                    <span class="text-warning">Fishial model not downloaded</span>
+                  <% @fishial_enabled and @vlm_enabled -> %>
+                    Fishial first, VLM fallback
+                  <% @fishial_enabled -> %>
+                    Fishial only
+                  <% @vlm_enabled -> %>
+                    VLM only
+                  <% true -> %>
+                    Detection only (no classification)
+                <% end %>
+              </span>
+            </div>
+
+            <%!-- VLM Context --%>
+            <div class="mt-3">
+              <label class="label py-0"><span class="label-text text-xs">VLM Context</span></label>
+              <div class="flex items-center gap-1 mt-1">
+                <select
+                  class="select select-bordered select-sm flex-1"
+                  phx-change="select_context"
+                  name="id"
+                >
+                  <option
+                    :for={ctx <- @vlm_contexts}
+                    value={ctx["id"]}
+                    selected={ctx["id"] == @selected_context_id}
+                  >
+                    {ctx["name"]}
+                  </option>
+                </select>
+                <button class="btn btn-ghost btn-xs" phx-click="edit_context" title="Edit">Edit</button>
+                <button class="btn btn-ghost btn-xs" phx-click="new_context" title="New">+</button>
+              </div>
+
+              <%= if @editing_context do %>
+                <div class="mt-1 space-y-1">
+                  <input
+                    type="text"
+                    class="input input-bordered input-sm w-full"
+                    placeholder="Context name"
+                    value={@context_name}
+                    phx-blur="set_context_name"
+                    phx-keyup="set_context_name"
+                    phx-value-name=""
+                    name="name"
+                    phx-change="set_context_name"
+                  />
+                  <textarea
+                    class="textarea textarea-bordered textarea-sm w-full"
+                    rows="3"
+                    placeholder="Location and species context for VLM identification..."
+                    phx-blur="edit_context_prompt"
+                    name="prompt"
+                    phx-change="edit_context_prompt"
+                  >{@vlm_context_prompt}</textarea>
+                  <div class="flex gap-1">
+                    <button class="btn btn-primary btn-xs" phx-click="save_context">Save</button>
+                    <button class="btn btn-ghost btn-xs" phx-click="cancel_edit_context">Cancel</button>
+                    <%= if @selected_context_id do %>
+                      <button
+                        class="btn btn-error btn-xs btn-outline ml-auto"
+                        phx-click="delete_context"
+                        data-confirm="Delete this context?"
+                      >Delete</button>
+                    <% end %>
+                  </div>
+                </div>
+              <% else %>
+                <p class="text-xs text-base-content/50 mt-1 line-clamp-2">{@vlm_context_prompt}</p>
+              <% end %>
+            </div>
+
             <button
               class="btn btn-primary mt-2"
               phx-click="start_processing"
@@ -884,6 +1080,15 @@ defmodule NaturecountsWeb.VideosLive do
                             VLM: {job.vlm_classified_count || 0}/{job.vlm_qualified || 0} classified
                             ({job.total_tracks} tracks)
                           </span>
+                        <% end %>
+                        <%= if job.fishial_enabled do %>
+                          <span class="badge badge-info badge-xs">Fishial</span>
+                        <% end %>
+                        <%= if Map.get(job, :vlm_enabled, true) do %>
+                          <span class="badge badge-secondary badge-xs">VLM</span>
+                        <% end %>
+                        <%= if job.location do %>
+                          <span class="truncate max-w-[150px]" title={job.location}>{job.location}</span>
                         <% end %>
                       </div>
                     </div>

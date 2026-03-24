@@ -26,6 +26,12 @@ defmodule NaturecountsWeb.IngestionChannel do
   end
 
   @impl true
+  def handle_info({:set_crop_filters, filters}, socket) do
+    push(socket, "set_crop_filters", filters)
+    {:noreply, socket}
+  end
+
+  @impl true
   def handle_in("detection_batch", %{"cam_id" => cam_id} = payload, socket) do
     event = DetectionEvent.from_map(payload)
 

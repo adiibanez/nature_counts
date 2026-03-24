@@ -33,6 +33,8 @@ Config load_config() {
     cfg.file_loop = env_int("FILE_LOOP", 0) != 0;
     cfg.infer_interval = env_int("INFER_INTERVAL", 3);
     cfg.enable_thumbnails = env_int("ENABLE_THUMBNAILS", 0) != 0;
+    cfg.min_crop_area = env_int("MIN_CROP_AREA", 2500);
+    cfg.min_sharpness = env_int("MIN_SHARPNESS", 0);
 
     cfg.phoenix_url = env("PHOENIX_URL", "ws://phoenix:4005/deepstream/websocket");
     cfg.phoenix_token = env("DEEPSTREAM_TOKEN", "dev-secret-token");

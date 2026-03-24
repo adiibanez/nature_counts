@@ -9,6 +9,8 @@
 
 // Runtime toggle — can be flipped by Phoenix command
 std::atomic<bool> g_thumbnails_enabled{true};
+std::atomic<int> g_min_crop_area{2500};
+std::atomic<double> g_min_sharpness{0.0};
 
 static const Config* g_cfg = nullptr;
 static std::unordered_map<int, int64_t> g_last_push_ms;
@@ -90,6 +92,8 @@ static GstPadProbeReturn tracker_src_probe(
 void install_tracker_probe(GstElement* tracker, const Config& cfg) {
     g_cfg = &cfg;
     g_thumbnails_enabled.store(cfg.enable_thumbnails);
+    g_min_crop_area.store(cfg.min_crop_area);
+    g_min_sharpness.store(cfg.min_sharpness);
     GstPad* src_pad = gst_element_get_static_pad(tracker, "src");
     gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER,
                       tracker_src_probe, nullptr, nullptr);

@@ -45,7 +45,7 @@ defmodule NaturecountsWeb.CropsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="p-4 max-w-6xl mx-auto">
+    <div class="p-4">
       <div class="flex items-center justify-between mb-6">
         <h1 class="text-2xl font-bold">VLM Crops ({length(@crops)})</h1>
         <div class="flex gap-2">

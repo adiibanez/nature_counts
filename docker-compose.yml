@@ -112,9 +112,10 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       VLM_MODEL: "${VLM_MODEL:-claude-sonnet-4-6}"
       YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
+      FISHIAL_MODEL_DIR: "/models/fishial"
     volumes:
       - ./videos:/videos
-      - ./deepstream-app-fish:/models:ro
+      - ./deepstream-app-fish:/models
     depends_on:
       postgres:
         condition: service_healthy

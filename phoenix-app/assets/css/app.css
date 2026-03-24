@@ -103,3 +103,124 @@
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
 /* This file is for your main application CSS */
+
+/* Print mode styles */
+.print-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.75rem;
+}
+
+.print-card {
+  display: flex;
+  gap: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 0.25rem;
+  padding: 0.5rem;
+  break-inside: avoid;
+}
+
+.print-thumb {
+  flex-shrink: 0;
+  width: 100px;
+  height: 80px;
+  background: #f0f0f0;
+  border-radius: 0.25rem;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.print-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.print-no-thumb {
+  font-size: 0.625rem;
+  color: #999;
+}
+
+.print-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.print-reasoning {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media print {
+  /* Hide nav, topbar, flash messages, and no-print elements */
+  nav, .no-print, [data-phx-flash], header, .topbar, .navbar, .flash-group {
+    display: none !important;
+  }
+
+  /* Reset page margins for PDF */
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+
+  body {
+    font-size: 10pt;
+    color: #000 !important;
+    background: #fff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /*
+   * The app layout uses h-screen + overflow-y-auto which creates a
+   * fixed-height scroll container. Browsers only print the visible
+   * viewport of scroll containers. Nuke every height/overflow
+   * constraint on all ancestors of the print content.
+   */
+  * {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  /* Restore explicit heights only where needed */
+  .print-thumb {
+    height: 80px !important;
+  }
+
+  /* Keep grid layout for print cards */
+  .print-grid {
+    display: grid !important;
+  }
+
+  .print-card {
+    display: flex !important;
+  }
+
+  /* Ensure images print */
+  .print-thumb img {
+    max-width: 100px;
+    max-height: 80px;
+  }
+
+  /* Tighter grid for print */
+  .print-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.5rem;
+  }
+
+  .print-card {
+    border: 0.5pt solid #ccc;
+    padding: 0.35rem;
+    page-break-inside: avoid;
+  }
+
+  /* Remove shadows and backgrounds */
+  .table, .print-header {
+    box-shadow: none;
+  }
+}

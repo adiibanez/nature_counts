@@ -2,15 +2,16 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
   use Oban.Worker, queue: :video_processing, max_attempts: 3
 
   alias Naturecounts.Repo
-  alias Naturecounts.Offline.{Video, Track, Profiles, PythonBridge, Classifier}
+  alias Naturecounts.Offline.{Video, Track, Profiles, PythonBridge, Classifier, FishialClassifier}
 
   import Ecto.Query
 
   require Logger
 
-  # Detection uses 0-59%, VLM classification 60-89%, persist 90-100%
+  # Detection uses 0-59%, Fishial 60-79%, VLM fallback 80-89%, persist 90-100%
   @detection_pct_range {0, 59}
-  @vlm_pct_start 60
+  @fishial_pct_start 60
+  @vlm_pct_start 80
   @persist_pct_start 90
 
   @impl true
@@ -19,6 +20,8 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
     profile = Profiles.get(video.processing_profile)
     profile = if video.min_bbox_area, do: %{profile | min_bbox_area: video.min_bbox_area}, else: profile
     profile = if video.vlm_sample_pct, do: Map.put(profile, :vlm_sample_pct, video.vlm_sample_pct), else: profile
+    profile = if is_boolean(video.fishial_enabled), do: Map.put(profile, :fishial_enabled, video.fishial_enabled), else: profile
+    profile = if is_boolean(video.vlm_enabled), do: Map.put(profile, :vlm_enabled, video.vlm_enabled), else: profile
 
     Logger.info("[ProcessVideo] Starting #{video.filename} (profile=#{video.processing_profile})")
     update_video(video, "processing", 0, "Initializing...")
@@ -38,12 +41,10 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
         {:ok, tracks} ->
           Logger.info("[ProcessVideo] Detection complete: #{length(tracks)} tracks")
 
-          # Stage 2: VLM classification (60-89%)
+          # Stage 2: Classification (60-89%)
           qualifying = Enum.count(tracks, fn t -> t["crop_b64"] != nil and t["best_bbox_area"] >= profile.min_bbox_area end)
-          update_video(video, "processing", @vlm_pct_start, "Classifying: 0/#{qualifying} tracks sent to VLM...")
-          Logger.info("[ProcessVideo] VLM classification: #{qualifying}/#{length(tracks)} tracks qualify (model=#{profile.vlm_model})")
 
-          # Save VLM stats early
+          # Save stats early
           video
           |> Ecto.Changeset.change(%{
             total_tracks: length(tracks),
@@ -52,25 +53,105 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
           })
           |> Repo.update!()
 
-          classified_ref = make_ref()
-          classified_count = :counters.new(1, [:atomics])
-
-          vlm_progress_callback = fn ->
-            done = :counters.get(classified_count, 1)
-            pct = @vlm_pct_start + div(done * (@persist_pct_start - @vlm_pct_start), max(qualifying, 1))
-            update_video(video, "processing", pct, "Classifying: #{done}/#{qualifying} tracks identified")
-          end
+          fishial? = Map.get(profile, :fishial_enabled, false)
+          vlm? = Map.get(profile, :vlm_enabled, true)
 
           classified_tracks =
-            Classifier.classify_tracks(tracks, profile, video,
-              on_track_done: fn ->
-                :counters.add(classified_count, 1, 1)
-                vlm_progress_callback.()
-              end
-            )
+            cond do
+              fishial? ->
+                # Stage 2a: Fishial batch classification (60-79%)
+                update_video(video, "processing", @fishial_pct_start, "Fishial: classifying #{qualifying} tracks...")
+                Logger.info("[ProcessVideo] Fishial classification: #{qualifying}/#{length(tracks)} tracks qualify")
+
+                fishial_tracks = FishialClassifier.classify_tracks(tracks, profile, video)
+
+                fishial_count = Enum.count(fishial_tracks, & &1["classifier_source"] == "fishial")
+                Logger.info("[ProcessVideo] Fishial complete: #{fishial_count}/#{length(fishial_tracks)} classified")
+
+                # Stage 2b: VLM fallback for low-confidence Fishial results (80-89%)
+                if vlm? do
+                  threshold = Map.get(profile, :fishial_confidence_threshold, 0.5)
+
+                  needs_vlm =
+                    fishial_tracks
+                    |> Enum.filter(fn t ->
+                      t["crop_b64"] != nil and
+                        t["best_bbox_area"] >= profile.min_bbox_area and
+                        FishialClassifier.needs_vlm_fallback?(t, threshold)
+                    end)
+
+                  if length(needs_vlm) > 0 do
+                    vlm_qualifying = length(needs_vlm)
+                    update_video(video, "processing", @vlm_pct_start, "VLM fallback: 0/#{vlm_qualifying} low-confidence tracks...")
+                    Logger.info("[ProcessVideo] VLM fallback: #{vlm_qualifying} tracks below threshold #{threshold}")
+
+                    vlm_count = :counters.new(1, [:atomics])
+
+                    vlm_progress_callback = fn ->
+                      done = :counters.get(vlm_count, 1)
+                      pct = @vlm_pct_start + div(done * (@persist_pct_start - @vlm_pct_start), max(vlm_qualifying, 1))
+                      update_video(video, "processing", pct, "VLM fallback: #{done}/#{vlm_qualifying} tracks identified")
+                    end
+
+                    vlm_results =
+                      Classifier.classify_tracks(needs_vlm, profile, video,
+                        on_track_done: fn ->
+                          :counters.add(vlm_count, 1, 1)
+                          vlm_progress_callback.()
+                        end
+                      )
+
+                    vlm_map =
+                      vlm_results
+                      |> Enum.filter(& &1["vlm_classified"])
+                      |> Enum.map(fn t -> {t["track_id"], Map.put(t, "classifier_source", "vlm")} end)
+                      |> Map.new()
+
+                    Enum.map(fishial_tracks, fn t ->
+                      case Map.get(vlm_map, t["track_id"]) do
+                        nil -> t
+                        vlm_t -> Map.merge(t, vlm_t)
+                      end
+                    end)
+                  else
+                    update_video(video, "processing", @vlm_pct_start, "Fishial classified all #{fishial_count} tracks (no VLM needed)")
+                    fishial_tracks
+                  end
+                else
+                  update_video(video, "processing", @vlm_pct_start, "Fishial only: #{fishial_count} classified (VLM disabled)")
+                  fishial_tracks
+                end
+
+              vlm? ->
+                # VLM only
+                update_video(video, "processing", @fishial_pct_start, "Classifying: 0/#{qualifying} tracks sent to VLM...")
+                Logger.info("[ProcessVideo] VLM classification: #{qualifying}/#{length(tracks)} tracks qualify (model=#{profile.vlm_model})")
+
+                vlm_count = :counters.new(1, [:atomics])
+
+                vlm_progress_callback = fn ->
+                  done = :counters.get(vlm_count, 1)
+                  pct = @fishial_pct_start + div(done * (@persist_pct_start - @fishial_pct_start), max(qualifying, 1))
+                  update_video(video, "processing", pct, "Classifying: #{done}/#{qualifying} tracks identified")
+                end
+
+                Classifier.classify_tracks(tracks, profile, video,
+                  on_track_done: fn ->
+                    :counters.add(vlm_count, 1, 1)
+                    vlm_progress_callback.()
+                  end
+                )
+
+              true ->
+                # No classification — detection only
+                update_video(video, "processing", @vlm_pct_start, "Detection only (no classifiers enabled)")
+                Logger.info("[ProcessVideo] Skipping classification (both Fishial and VLM disabled)")
+                tracks
+            end
 
           vlm_count = Enum.count(classified_tracks, & &1["vlm_classified"])
-          Logger.info("[ProcessVideo] VLM complete: #{vlm_count}/#{length(classified_tracks)} classified")
+          fishial_count = Enum.count(classified_tracks, & &1["classifier_source"] == "fishial")
+          Logger.info("[ProcessVideo] Classification complete: #{fishial_count} Fishial, #{vlm_count - fishial_count} VLM")
 
           # Stage 3: Persist (90-100%)
           update_video(video, "processing", @persist_pct_start, "Saving #{length(classified_tracks)} tracks to database...")
@@ -121,6 +202,7 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
           frame_count: t["frame_count"],
           thumbnail: decode_thumbnail(t["crop_b64"]),
           vlm_classified: vlm,
+          classifier_source: t["classifier_source"],
           review_status: "pending",
           expires_at: if(vlm, do: expires_at),
           inserted_at: now,

@@ -49,8 +49,14 @@ public:
 
 private:
     void run();
-    std::string crop_thumbnail(const uint8_t* frame, int fw, int fh,
-                               double left, double top, double width, double height);
+
+    struct CropResult {
+        std::string thumbnail;  // base64 JPEG (empty if skipped)
+        double sharpness = 0.0; // Laplacian variance
+    };
+
+    CropResult crop_thumbnail(const uint8_t* frame, int fw, int fh,
+                              double left, double top, double width, double height);
 
     DetectionQueue& output_queue_;
     int thumb_size_;

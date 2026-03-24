@@ -1,4 +1,5 @@
 #include "thumbnail.h"
+#include "probes.h"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -100,6 +101,8 @@ void ThumbnailWorker::run() {
         double sy = (job.source_height > 0)
             ? static_cast<double>(job.frame_height) / job.source_height : 1.0;
 
+        int min_area = g_min_crop_area.load(std::memory_order_relaxed);
+
         auto& objects = job.detection["objects"];
         for (auto& obj : objects) {
             auto& bbox = obj["bbox"];
@@ -108,26 +111,34 @@ void ThumbnailWorker::run() {
             double width = bbox["width"].get<double>() * sx;
             double height = bbox["height"].get<double>() * sy;
 
-            std::string thumb = crop_thumbnail(
+            // Skip thumbnail for crops below minimum area
+            if (static_cast<int>(width * height) < min_area)
+                continue;
+
+            auto result = crop_thumbnail(
                 job.rgba_frame.data(), job.frame_width, job.frame_height,
                 left, top, width, height);
-            if (!thumb.empty())
-                obj["thumbnail"] = thumb;
+
+            obj["sharpness"] = result.sharpness;
+            if (!result.thumbnail.empty())
+                obj["thumbnail"] = result.thumbnail;
         }
 
         output_queue_.push(std::move(job.detection));
     }
 }
 
-std::string ThumbnailWorker::crop_thumbnail(
+ThumbnailWorker::CropResult ThumbnailWorker::crop_thumbnail(
     const uint8_t* frame, int fw, int fh,
     double left, double top, double width, double height)
 {
+    CropResult result;
+
     int x1 = std::max(0, static_cast<int>(left));
     int y1 = std::max(0, static_cast<int>(top));
     int x2 = std::min(fw, static_cast<int>(left + width));
     int y2 = std::min(fh, static_cast<int>(top + height));
-    if (x2 <= x1 || y2 <= y1) return {};
+    if (x2 <= x1 || y2 <= y1) return result;
 
     // Wrap full RGBA frame (no copy — we own the data in the job)
     cv::Mat rgba(fh, fw, CV_8UC4, const_cast<uint8_t*>(frame));
@@ -135,6 +146,19 @@ std::string ThumbnailWorker::crop_thumbnail(
 
     cv::Mat bgr;
     cv::cvtColor(crop, bgr, cv::COLOR_RGBA2BGR);
+
+    // Compute sharpness (Laplacian variance on grayscale)
+    cv::Mat gray, laplacian;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Scalar mu, sigma;
+    cv::meanStdDev(laplacian, mu, sigma);
+    result.sharpness = sigma.val[0] * sigma.val[0];  // variance
+
+    // Skip thumbnail encoding if below sharpness threshold
+    double min_sharp = g_min_sharpness.load(std::memory_order_relaxed);
+    if (min_sharp > 0.0 && result.sharpness < min_sharp)
+        return result;
 
     int h = bgr.rows, w = bgr.cols;
     double scale = std::min(static_cast<double>(thumb_size_) / std::max(h, w), 1.0);
@@ -144,7 +168,8 @@ std::string ThumbnailWorker::crop_thumbnail(
 
     std::vector<uint8_t> jpg;
     std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 60};
-    if (!cv::imencode(".jpg", bgr, jpg, params)) return {};
+    if (!cv::imencode(".jpg", bgr, jpg, params)) return result;
 
-    return base64_encode(jpg.data(), jpg.size());
+    result.thumbnail = base64_encode(jpg.data(), jpg.size());
+    return result;
 }

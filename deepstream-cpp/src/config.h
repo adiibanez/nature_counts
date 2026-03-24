@@ -41,6 +41,10 @@ struct Config {
     int thumb_width = 480;
     int thumb_height = 270;
 
+    // Crop quality filters (runtime-configurable via Phoenix)
+    int min_crop_area = 2500;       // min bbox area in pixels (e.g. 50x50)
+    double min_sharpness = 0.0;     // min Laplacian variance (0 = disabled)
+
     // Labels
     std::vector<std::string> labels = {"fish"};
 };

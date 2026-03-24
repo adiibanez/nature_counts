@@ -54,7 +54,7 @@ defmodule NaturecountsWeb.DashboardLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="p-4 max-w-6xl mx-auto space-y-6">
+    <div class="p-4 space-y-6">
       <div class="flex items-center justify-between">
         <h1 class="text-3xl font-bold">Dashboard</h1>
         <label class="label cursor-pointer gap-2">

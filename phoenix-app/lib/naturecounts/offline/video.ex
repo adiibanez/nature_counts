@@ -19,6 +19,8 @@ defmodule Naturecounts.Offline.Video do
     field :vlm_classified_count, :integer
     field :min_bbox_area, :integer
     field :vlm_sample_pct, :integer
+    field :fishial_enabled, :boolean
+    field :vlm_enabled, :boolean, default: true
 
     has_many :tracks, Naturecounts.Offline.Track
 
@@ -32,7 +34,7 @@ defmodule Naturecounts.Offline.Video do
       :recorded_at, :location, :status, :processing_profile,
       :progress_pct, :error_message, :status_message,
       :total_tracks, :vlm_qualified, :vlm_classified_count, :min_bbox_area,
-      :vlm_sample_pct
+      :vlm_sample_pct, :fishial_enabled, :vlm_enabled
     ])
     |> validate_required([:filename, :path])
     |> validate_inclusion(:status, ~w(pending processing completed failed))

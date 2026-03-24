@@ -40,6 +40,11 @@ config :pythonx, :uv_init,
     "supervision>=0.25",
     "torch>=2.4",
     "torchvision>=0.19",
+    "timm>=1.0",
+    "faiss-cpu>=1.7",
+    "scipy>=1.10",
+    "albumentations>=2.0",
+    "scikit-learn>=1.3",
   ]
 
   [tool.uv.sources]

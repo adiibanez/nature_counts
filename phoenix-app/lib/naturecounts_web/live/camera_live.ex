@@ -3,6 +3,7 @@ defmodule NaturecountsWeb.CameraLive do
 
   alias Naturecounts.Detection.TrackerState
   alias Naturecounts.Pipeline.PipelineManager
+  alias Naturecounts.CameraSettings
   alias Membrane.WebRTC.Live.Player
 
   @stats_interval 1000
@@ -50,30 +51,43 @@ defmodule NaturecountsWeb.CameraLive do
     mediamtx_host = Application.get_env(:naturecounts, :mediamtx_host, "localhost:8889")
     has_membrane = match?({:ok, _}, PipelineManager.get_source(camera_key))
 
+    saved = CameraSettings.get(camera_key)
+    preset_key = saved["tracker_preset"] || "nvdcf_accuracy"
+    preset_info = Map.get(@tracker_presets, preset_key, @tracker_presets["nvdcf_accuracy"])
+
+    # Merge saved param overrides on top of preset defaults
+    tracker_params =
+      case saved["tracker_params"] do
+        overrides when is_map(overrides) -> Map.merge(preset_info.defaults, overrides)
+        _ -> preset_info.defaults
+      end
+
     socket =
       socket
       |> assign(
         cam_id: cam_id,
         camera_key: camera_key,
         mediamtx_host: mediamtx_host,
-        show_inference: true,
-        show_fish_list: false,
+        show_inference: saved["show_inference"],
+        show_fish_list: saved["show_fish_list"],
         active_tracks: 0,
         total_tracks: 0,
-        fish_cols: 1,
-        video_pct: 65,
+        fish_cols: saved["fish_cols"],
+        video_pct: saved["video_pct"],
         page_title: "Camera #{cam_id}",
         use_membrane: has_membrane,
         membrane_error: nil,
         pipeline_pid: nil,
         retry_count: 0,
         player_generation: 0,
-        settings_panel_open: false,
-        tracker_preset: "nvdcf_accuracy",
-        tracker_params: @tracker_presets["nvdcf_accuracy"].defaults,
-        tracker_has_visual: true,
+        settings_panel_open: saved["settings_panel_open"],
+        tracker_preset: preset_key,
+        tracker_params: tracker_params,
+        tracker_has_visual: preset_info.has_visual,
         tracker_presets: @tracker_presets,
-        pipeline_restarting: false
+        pipeline_restarting: false,
+        min_crop_area: saved["min_crop_area"],
+        min_sharpness: saved["min_sharpness"]
       )
 
     socket =
@@ -165,25 +179,34 @@ defmodule NaturecountsWeb.CameraLive do
 
   @impl true
   def handle_event("toggle_inference", _params, socket) do
-    {:noreply, assign(socket, show_inference: !socket.assigns.show_inference)}
+    val = !socket.assigns.show_inference
+    save_setting(socket, %{"show_inference" => val})
+    {:noreply, assign(socket, show_inference: val)}
   end
 
   def handle_event("toggle_fish_list", _params, socket) do
-    new_val = !socket.assigns.show_fish_list
-    Phoenix.PubSub.broadcast(Naturecounts.PubSub, "pipeline:control", {:set_thumbnails, new_val})
-    {:noreply, assign(socket, show_fish_list: new_val)}
+    val = !socket.assigns.show_fish_list
+    Phoenix.PubSub.broadcast(Naturecounts.PubSub, "pipeline:control", {:set_thumbnails, val})
+    save_setting(socket, %{"show_fish_list" => val})
+    {:noreply, assign(socket, show_fish_list: val)}
   end
 
   def handle_event("set_fish_cols", %{"cols" => cols}, socket) do
-    {:noreply, assign(socket, fish_cols: String.to_integer(cols))}
+    val = String.to_integer(cols)
+    save_setting(socket, %{"fish_cols" => val})
+    {:noreply, assign(socket, fish_cols: val)}
   end
 
   def handle_event("set_video_pct", %{"pct" => pct}, socket) do
-    {:noreply, assign(socket, video_pct: String.to_integer(pct))}
+    val = String.to_integer(pct)
+    save_setting(socket, %{"video_pct" => val})
+    {:noreply, assign(socket, video_pct: val)}
   end
 
   def handle_event("toggle_settings_panel", _params, socket) do
-    {:noreply, assign(socket, settings_panel_open: !socket.assigns.settings_panel_open)}
+    val = !socket.assigns.settings_panel_open
+    save_setting(socket, %{"settings_panel_open" => val})
+    {:noreply, assign(socket, settings_panel_open: val)}
   end
 
   def handle_event("select_tracker_preset", %{"preset" => preset}, socket) do
@@ -192,6 +215,11 @@ defmodule NaturecountsWeb.CameraLive do
         {:noreply, socket}
 
       info ->
+        save_setting(socket, %{
+          "tracker_preset" => preset,
+          "tracker_params" => info.defaults
+        })
+
         {:noreply,
          assign(socket,
            tracker_preset: preset,
@@ -213,7 +241,22 @@ defmodule NaturecountsWeb.CameraLive do
       end
 
     params = Map.put(socket.assigns.tracker_params, key, parsed)
+    save_setting(socket, %{"tracker_params" => params})
     {:noreply, assign(socket, tracker_params: params)}
+  end
+
+  def handle_event("set_min_crop_area", %{"value" => val_str}, socket) do
+    val = String.to_integer(val_str)
+    save_setting(socket, %{"min_crop_area" => val})
+    broadcast_crop_filters(val, socket.assigns.min_sharpness)
+    {:noreply, assign(socket, min_crop_area: val)}
+  end
+
+  def handle_event("set_min_sharpness", %{"value" => val_str}, socket) do
+    {val, _} = Float.parse(val_str)
+    save_setting(socket, %{"min_sharpness" => val})
+    broadcast_crop_filters(socket.assigns.min_crop_area, val)
+    {:noreply, assign(socket, min_sharpness: val)}
   end
 
   def handle_event("apply_tracker_config", _params, socket) do
@@ -229,6 +272,18 @@ defmodule NaturecountsWeb.CameraLive do
     )
 
     {:noreply, assign(socket, pipeline_restarting: true)}
+  end
+
+  defp save_setting(socket, updates) do
+    CameraSettings.put(socket.assigns.camera_key, updates)
+  end
+
+  defp broadcast_crop_filters(min_crop_area, min_sharpness) do
+    Phoenix.PubSub.broadcast(
+      Naturecounts.PubSub,
+      "pipeline:control",
+      {:set_crop_filters, %{min_crop_area: min_crop_area, min_sharpness: min_sharpness}}
+    )
   end
 
   defp schedule_stats_update do
@@ -372,6 +427,47 @@ defmodule NaturecountsWeb.CameraLive do
                 </div>
               </div>
 
+              <%!-- Crop quality filters --%>
+              <div class="divider my-0 text-xs">Crop Quality</div>
+              <div class="flex flex-wrap items-end gap-4">
+                <form phx-change="set_min_crop_area" class="form-control">
+                  <label class="label py-0"><span class="label-text text-xs">Min crop area (px)</span></label>
+                  <div class="flex items-center gap-1">
+                    <input
+                      type="range"
+                      class="range range-xs range-accent w-28"
+                      min="500" max="50000" step="500"
+                      value={@min_crop_area}
+                      name="value"
+                    />
+                    <span class="text-xs font-mono w-14">{@min_crop_area}</span>
+                  </div>
+                  <label class="label py-0">
+                    <span class="label-text-alt text-base-content/40">
+                      ~{round(:math.sqrt(@min_crop_area))}x{round(:math.sqrt(@min_crop_area))} px
+                    </span>
+                  </label>
+                </form>
+                <form phx-change="set_min_sharpness" class="form-control">
+                  <label class="label py-0"><span class="label-text text-xs">Min sharpness</span></label>
+                  <div class="flex items-center gap-1">
+                    <input
+                      type="range"
+                      class="range range-xs range-accent w-28"
+                      min="0" max="500" step="10"
+                      value={@min_sharpness}
+                      name="value"
+                    />
+                    <span class="text-xs font-mono w-10">{@min_sharpness}</span>
+                  </div>
+                  <label class="label py-0">
+                    <span class="label-text-alt text-base-content/40">
+                      0 = off, ~100 = moderate, ~300 = sharp only
+                    </span>
+                  </label>
+                </form>
+              </div>
+
               <%!-- Tracker settings --%>
               <div class="divider my-0 text-xs">Tracker
                 <span class="badge badge-xs badge-neutral">{@tracker_presets[@tracker_preset].label}</span>
@@ -500,7 +596,6 @@ defmodule NaturecountsWeb.CameraLive do
               id={"video-player-cam#{@cam_id}"}
               phx-hook="VideoOverlay"
               data-cam-id={@cam_id}
-              data-fish-cols={@fish_cols}
               data-webrtc-url={
                 if @show_inference,
                   do: "http://#{@mediamtx_host}/cam#{@cam_id + 1}/whep",
@@ -526,6 +621,9 @@ defmodule NaturecountsWeb.CameraLive do
         <%!-- Fish panel --%>
         <div
           id={"fish-panel-cam#{@cam_id}"}
+          phx-hook="FishList"
+          data-cam-id={@cam_id}
+          data-fish-cols={@fish_cols}
           class={"flex-1 flex flex-col min-h-0 min-w-0 #{unless @show_fish_list, do: "hidden"}"}
         >
           <h2 class="text-sm font-semibold mb-2 shrink-0">
