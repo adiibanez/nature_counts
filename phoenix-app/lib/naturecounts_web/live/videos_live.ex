@@ -49,14 +49,38 @@ defmodule NaturecountsWeb.VideosLive do
        context_name: "",
        scanning: scan_running?(),
        scan_progress: nil,
+       scan_force: false,
        sort_by: "name",
-       sort_dir: "asc"
+       sort_dir: "asc",
+       metric_filters: %{},
+       show_metrics: false,
+       metrics_view: "heatmap",
+       scatter_x: "brightness",
+       scatter_y: "det",
+       temporal_y: "det",
+       metrics_limit: 50
      )}
   end
 
   @impl true
   def handle_info({:scan_progress, _directory, progress}, socket) do
     {:noreply, assign(socket, scanning: true, scan_progress: progress)}
+  end
+
+  def handle_info({:scan_batch_complete, _directory, _batch_id, _result}, socket) do
+    # Reload entries to pick up new metrics from this batch
+    processed_files = load_processed_files()
+    entries =
+      list_dir(socket.assigns.current_dir, processed_files)
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    # Check if any scan jobs are still running
+    still_scanning = scan_running?()
+
+    socket = assign(socket, entries: entries, processed_files: processed_files, scanning: still_scanning)
+    socket = if not still_scanning, do: assign(socket, scan_progress: nil), else: socket
+
+    {:noreply, socket}
   end
 
   def handle_info({:scan_complete, _directory}, socket) do
@@ -150,7 +174,10 @@ defmodule NaturecountsWeb.VideosLive do
     Enum.each(selected, fn path ->
       safe = safe_resolve(path)
       if File.regular?(safe), do: File.rm(safe)
+      delete_video_by_path(safe)
     end)
+
+    Naturecounts.Cache.invalidate_all()
 
     processed_files = load_processed_files()
     entries =
@@ -174,9 +201,10 @@ defmodule NaturecountsWeb.VideosLive do
        processed_files: processed_files,
        selected_files: MapSet.new(),
        selected_file: selected_file,
-       preview_url: preview_url
+       preview_url: preview_url,
+       jobs: list_jobs()
      )
-     |> put_flash(:info, "Deleted #{count} file(s)")}
+     |> put_flash(:info, "Deleted #{count} file(s) and associated data")}
   end
 
   def handle_event("clear_selection", _params, socket) do
@@ -209,30 +237,32 @@ defmodule NaturecountsWeb.VideosLive do
 
     if File.regular?(safe) do
       File.rm(safe)
-
-      processed_files = load_processed_files()
-      entries =
-        list_dir(socket.assigns.current_dir, processed_files)
-        |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
-
-      {selected_file, preview_url} =
-        if socket.assigns.selected_file == file,
-          do: {nil, nil},
-          else: {socket.assigns.selected_file, socket.assigns.preview_url}
-
-      {:noreply,
-       socket
-       |> assign(
-         entries: entries,
-         processed_files: processed_files,
-         selected_files: MapSet.delete(socket.assigns.selected_files, file),
-         selected_file: selected_file,
-         preview_url: preview_url
-       )
-       |> put_flash(:info, "Deleted #{Path.basename(file)}")}
-    else
-      {:noreply, put_flash(socket, :error, "File not found")}
     end
+
+    delete_video_by_path(safe)
+    Naturecounts.Cache.invalidate_all()
+
+    processed_files = load_processed_files()
+    entries =
+      list_dir(socket.assigns.current_dir, processed_files)
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    {selected_file, preview_url} =
+      if socket.assigns.selected_file == file,
+        do: {nil, nil},
+        else: {socket.assigns.selected_file, socket.assigns.preview_url}
+
+    {:noreply,
+     socket
+     |> assign(
+       entries: entries,
+       processed_files: processed_files,
+       selected_files: MapSet.delete(socket.assigns.selected_files, file),
+       selected_file: selected_file,
+       preview_url: preview_url,
+       jobs: list_jobs()
+     )
+     |> put_flash(:info, "Deleted #{Path.basename(file)}")}
   end
 
   def handle_event("select_profile", %{"profile" => profile}, socket) do
@@ -258,11 +288,20 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_event("scan_metrics", _params, socket) do
-    %{"directory" => socket.assigns.current_dir}
+    %{
+      "directory" => socket.assigns.current_dir,
+      "force" => socket.assigns.scan_force,
+      "sample_frames" => 20,
+      "parallel" => true
+    }
     |> ScanMetricsWorker.new()
     |> Oban.insert!()
 
     {:noreply, assign(socket, scanning: true)}
+  end
+
+  def handle_event("toggle_scan_force", _params, socket) do
+    {:noreply, assign(socket, scan_force: !socket.assigns.scan_force)}
   end
 
   def handle_event("cancel_scan", _params, socket) do
@@ -460,11 +499,129 @@ defmodule NaturecountsWeb.VideosLive do
     |> Repo.all()
     |> Enum.each(&Oban.cancel_job(&1.id))
 
+    # Optionally delete the file from disk too
+    if video.path && File.exists?(video.path), do: File.rm(video.path)
+
     Repo.delete!(video)
-    {:noreply, assign(socket, jobs: list_jobs())}
+    Naturecounts.Cache.invalidate_all()
+
+    processed_files = load_processed_files()
+    entries =
+      list_dir(socket.assigns.current_dir, processed_files)
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    {:noreply, assign(socket, jobs: list_jobs(), entries: entries, processed_files: processed_files)}
+  end
+
+  def handle_event("clean_orphans", _params, socket) do
+    orphans =
+      Video
+      |> Repo.all()
+      |> Enum.filter(fn v -> not File.exists?(v.path) end)
+
+    Enum.each(orphans, &Repo.delete/1)
+    Naturecounts.Cache.invalidate_all()
+
+    processed_files = load_processed_files()
+    entries =
+      list_dir(socket.assigns.current_dir, processed_files)
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    {:noreply,
+     socket
+     |> assign(jobs: list_jobs(), entries: entries, processed_files: processed_files)
+     |> put_flash(:info, "Removed #{length(orphans)} orphaned record(s)")}
+  end
+
+  def handle_event("toggle_metrics", _params, socket) do
+    {:noreply, assign(socket, show_metrics: !socket.assigns.show_metrics)}
+  end
+
+  def handle_event("set_metrics_view", %{"view" => view}, socket) do
+    {:noreply, assign(socket, metrics_view: view, metrics_limit: 50)}
+  end
+
+  def handle_event("set_scatter_axis", %{"axis" => axis, "value" => value}, socket) do
+    case axis do
+      "x" -> {:noreply, assign(socket, scatter_x: value)}
+      "y" -> {:noreply, assign(socket, scatter_y: value)}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("set_temporal_y", %{"value" => value}, socket) do
+    {:noreply, assign(socket, temporal_y: value)}
+  end
+
+  def handle_event("seek_sample", %{"file" => file, "time" => time_str}, socket) do
+    time = String.to_float(time_str)
+
+    socket =
+      if socket.assigns.selected_file != file do
+        # Select the file first, then seek
+        socket
+        |> assign(selected_file: file)
+        |> push_event("preview", %{url: "/serve/videos/#{Path.relative_to(file, @videos_root)}", filename: Path.basename(file)})
+        |> push_event("seek", %{time: time})
+      else
+        push_event(socket, "seek", %{time: time})
+      end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("load_more_metrics", _params, socket) do
+    {:noreply, assign(socket, metrics_limit: socket.assigns.metrics_limit + 50)}
+  end
+
+  def handle_event("set_metric_filter", %{"field" => field, "min" => min_str, "max" => max_str}, socket) do
+    filters = socket.assigns.metric_filters
+
+    min_val = parse_number(min_str)
+    max_val = parse_number(max_str)
+
+    filters =
+      if min_val == nil and max_val == nil do
+        Map.delete(filters, field)
+      else
+        Map.put(filters, field, {min_val, max_val})
+      end
+
+    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50)}
+  end
+
+  def handle_event("quick_filter", %{"preset" => preset}, socket) do
+    filters =
+      case preset do
+        "clear" -> %{}
+        "has_detections" -> %{"avg_detections_per_frame" => {0.1, nil}}
+        "no_detections" -> %{"avg_detections_per_frame" => {nil, 0.0}}
+        "dark" -> %{"avg_brightness" => {nil, 15.0}}
+        "short" -> %{"duration_s" => {nil, 30.0}}
+        "high_motion" -> %{"motion_score" => {5.0, nil}}
+        "large_bbox" -> %{"bbox_mean" => {20000, nil}}
+        _ -> socket.assigns.metric_filters
+      end
+
+    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50)}
+  end
+
+  defp parse_number(""), do: nil
+  defp parse_number(str) do
+    case Float.parse(str) do
+      {val, _} -> val
+      :error -> nil
+    end
   end
 
   # --- Helpers ---
+
+  defp delete_video_by_path(path) do
+    Video
+    |> where([v], v.path == ^path)
+    |> Repo.all()
+    |> Enum.each(&Repo.delete/1)
+  end
 
   defp safe_resolve(path) do
     expanded = Path.expand(path)
@@ -492,27 +649,68 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   defp read_scan_progress do
-    progress_file = Path.join(System.tmp_dir!(), "scan_progress.json")
+    tmp = System.tmp_dir!()
 
-    case File.read(progress_file) do
-      {:ok, data} ->
-        case Jason.decode(data) do
-          {:ok, progress} -> progress
-          _ -> nil
+    # Read all batch progress files and aggregate
+    progress_files =
+      case File.ls(tmp) do
+        {:ok, names} ->
+          names
+          |> Enum.filter(&String.starts_with?(&1, "scan_progress_"))
+          |> Enum.map(&Path.join(tmp, &1))
+
+        _ -> []
+      end
+
+    # Also check legacy single-worker file
+    legacy = Path.join(tmp, "scan_progress.json")
+    progress_files = if File.exists?(legacy), do: [legacy | progress_files], else: progress_files
+
+    if progress_files == [] do
+      nil
+    else
+      results = Enum.flat_map(progress_files, fn f ->
+        case File.read(f) do
+          {:ok, data} ->
+            case Jason.decode(data) do
+              {:ok, p} -> [p]
+              _ -> []
+            end
+          _ -> []
         end
+      end)
 
-      _ ->
+      if results == [] do
         nil
+      else
+        total_done = Enum.reduce(results, 0, fn p, acc -> acc + (p["done"] || 0) end)
+        total_total = Enum.reduce(results, 0, fn p, acc -> acc + (p["total"] || 0) end)
+        current = results |> Enum.max_by(fn p -> p["done"] || 0 end) |> Map.get("current", "")
+        %{"done" => total_done, "total" => total_total, "current" => current}
+      end
     end
   end
 
   defp scan_running? do
     import Ecto.Query
 
-    Oban.Job
-    |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
-    |> where([j], j.state in ["available", "executing", "scheduled"])
-    |> Repo.exists?()
+    Naturecounts.Cache.get_or_compute(:scan_running, fn ->
+      Oban.Job
+      |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
+      |> where([j], j.state in ["available", "executing", "scheduled"])
+      |> Repo.exists?()
+    end, ttl: 2_000, group: :videos)
+  end
+
+  defp scan_active_count do
+    import Ecto.Query
+
+    Naturecounts.Cache.get_or_compute(:scan_active_count, fn ->
+      Oban.Job
+      |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
+      |> where([j], j.state in ["available", "executing"])
+      |> Repo.aggregate(:count)
+    end, ttl: 2_000, group: :videos)
   end
 
   defp load_metrics_index(dir) do
@@ -531,11 +729,13 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   defp load_processed_files do
-    Video
-    |> where([v], v.status in ["completed", "processing", "pending"])
-    |> select([v], {v.path, %{status: v.status, profile: v.processing_profile}})
-    |> Repo.all()
-    |> Map.new()
+    Naturecounts.Cache.get_or_compute(:processed_files, fn ->
+      Video
+      |> where([v], v.status in ["completed", "processing", "pending"])
+      |> select([v], {v.path, %{status: v.status, profile: v.processing_profile}})
+      |> Repo.all()
+      |> Map.new()
+    end, ttl: 3_000, group: :videos)
   end
 
   defp list_dir(dir, processed_files) do
@@ -590,27 +790,210 @@ defmodule NaturecountsWeb.VideosLive do
 
     sorted_files =
       case sort_by do
-        "name" ->
-          Enum.sort_by(files, & &1.name)
-
-        "size" ->
-          Enum.sort_by(files, & &1.size_mb)
-
-        "det" ->
-          Enum.sort_by(files, fn f ->
-            case f.metrics do
-              %{"avg_detections_per_frame" => v} when is_number(v) -> v
-              _ -> -1
-            end
-          end)
-
-        _ ->
-          files
+        "name" -> Enum.sort_by(files, & &1.name)
+        "size" -> Enum.sort_by(files, & &1.size_mb)
+        col -> Enum.sort_by(files, &metric_val(&1, col))
       end
 
     sorted_files = if sort_dir == "desc", do: Enum.reverse(sorted_files), else: sorted_files
 
     dirs ++ sorted_files
+  end
+
+  defp metric_val(%{metrics: nil}, _col), do: -1
+  defp metric_val(%{metrics: m}, "det"), do: m["avg_detections_per_frame"] || -1
+  defp metric_val(%{metrics: m}, "duration"), do: m["duration_s"] || -1
+  defp metric_val(%{metrics: m}, "brightness"), do: m["avg_brightness"] || -1
+  defp metric_val(%{metrics: m}, "contrast"), do: m["contrast"] || -1
+  defp metric_val(%{metrics: m}, "motion"), do: m["motion_score"] || -1
+  defp metric_val(%{metrics: m}, "bbox_count"), do: get_in(m, ["bbox_areas", "count"]) || -1
+  defp metric_val(%{metrics: m}, "bbox_mean"), do: get_in(m, ["bbox_areas", "mean"]) || -1
+  defp metric_val(%{metrics: m}, "fps"), do: m["fps"] || -1
+  defp metric_val(_, _), do: -1
+
+  defp filtered_entries(entries, metric_filters) when map_size(metric_filters) == 0, do: entries
+  defp filtered_entries(entries, metric_filters) do
+    Enum.filter(entries, fn entry ->
+      entry.type == :dir or passes_filters?(entry, metric_filters)
+    end)
+  end
+
+  defp passes_filters?(%{metrics: nil}, _filters), do: false
+  defp passes_filters?(%{metrics: m}, filters) do
+    Enum.all?(filters, fn {field, {min_val, max_val}} ->
+      val = case field do
+        "bbox_mean" -> get_in(m, ["bbox_areas", "mean"])
+        "bbox_count" -> get_in(m, ["bbox_areas", "count"])
+        key -> m[key]
+      end
+
+      val = val || 0
+      (min_val == nil or val >= min_val) and (max_val == nil or val <= max_val)
+    end)
+  end
+
+  defp compute_metrics_summary(entries) do
+    scanned = Enum.filter(entries, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
+    count = length(scanned)
+
+    if count == 0 do
+      nil
+    else
+      metrics_list = Enum.map(scanned, & &1.metrics)
+
+      %{
+        count: count,
+        total_duration: Enum.reduce(metrics_list, 0, &((&1["duration_s"] || 0) + &2)) |> Float.round(1),
+        avg_det: (Enum.reduce(metrics_list, 0, &((&1["avg_detections_per_frame"] || 0) + &2)) / count) |> Float.round(1),
+        avg_brightness: (Enum.reduce(metrics_list, 0, &((&1["avg_brightness"] || 0) + &2)) / count) |> Float.round(1),
+        avg_contrast: (Enum.reduce(metrics_list, 0, &((&1["contrast"] || 0) + &2)) / count) |> Float.round(1),
+        avg_motion: (Enum.reduce(metrics_list, 0, &((&1["motion_score"] || 0) + &2)) / count) |> Float.round(2),
+        total_bbox: Enum.reduce(metrics_list, 0, &((get_in(&1, ["bbox_areas", "count"]) || 0) + &2))
+      }
+    end
+  end
+
+  defp bar_pct(_val, max) when max == 0 or max == nil, do: 0
+  defp bar_pct(nil, _max), do: 0
+  defp bar_pct(val, max), do: min(round(val / max * 100), 100)
+
+  # Heatmap: returns an rgba background color string for a value in [0, max]
+  defp heatmap_bg(_val, max, _hue) when max == 0 or max == nil, do: "background: transparent"
+  defp heatmap_bg(nil, _max, _hue), do: "background: transparent"
+  defp heatmap_bg(val, max, hue) do
+    intensity = min(val / max, 1.0)
+    alpha = Float.round(intensity * 0.6 + 0.05, 2)
+    "background: hsla(#{hue}, 70%, 50%, #{alpha})"
+  end
+
+  # Radar chart: generates SVG points for a radar/spider chart
+  defp radar_points(entry, maxes) do
+    axes = [
+      {metric_val(entry, "det"), maxes.det},
+      {metric_val(entry, "brightness"), 255},
+      {metric_val(entry, "contrast"), maxes.contrast},
+      {metric_val(entry, "motion"), maxes.motion},
+      {safe_bbox_mean(entry), maxes.bbox_mean}
+    ]
+
+    n = length(axes)
+
+    axes
+    |> Enum.with_index()
+    |> Enum.map(fn {{val, max_v}, i} ->
+      r = if max_v > 0 and val >= 0, do: min(val / max_v, 1.0) * 18, else: 0
+      angle = 2 * :math.pi() * i / n - :math.pi() / 2
+      x = 22 + r * :math.cos(angle)
+      y = 22 + r * :math.sin(angle)
+      "#{Float.round(x, 1)},#{Float.round(y, 1)}"
+    end)
+    |> Enum.join(" ")
+  end
+
+  defp radar_grid_points(ring, n) do
+    Enum.map(0..(n - 1), fn i ->
+      angle = 2 * :math.pi() * i / n - :math.pi() / 2
+      x = 22 + ring * :math.cos(angle)
+      y = 22 + ring * :math.sin(angle)
+      "#{Float.round(x, 1)},#{Float.round(y, 1)}"
+    end)
+    |> Enum.join(" ")
+  end
+
+  defp safe_bbox_mean(%{metrics: nil}), do: 0
+  defp safe_bbox_mean(%{metrics: m}), do: get_in(m, ["bbox_areas", "mean"]) || 0
+  defp safe_bbox_mean(_), do: 0
+
+  # Scatter: get normalized value for a metric key
+  defp scatter_val(entry, key) do
+    case key do
+      "det" -> metric_val(entry, "det")
+      "brightness" -> metric_val(entry, "brightness")
+      "contrast" -> metric_val(entry, "contrast")
+      "motion" -> metric_val(entry, "motion")
+      "duration" -> metric_val(entry, "duration")
+      "bbox_mean" -> safe_bbox_mean(entry)
+      "size" -> entry.size_mb
+      _ -> 0
+    end
+  end
+
+  defp scatter_max(files, key) do
+    Enum.reduce(files, 0.001, fn f, acc -> max(acc, scatter_val(f, key)) end)
+  end
+
+  defp scatter_label(key) do
+    case key do
+      "det" -> "Detections/frame"
+      "brightness" -> "Brightness"
+      "contrast" -> "Contrast"
+      "motion" -> "Motion"
+      "duration" -> "Duration (s)"
+      "bbox_mean" -> "Bbox mean area"
+      "size" -> "File size (MB)"
+      _ -> key
+    end
+  end
+
+  # Distribution strip: compute percentiles for a column
+  # Temporal helpers: get samples from entry, with fallback for old data
+  defp get_samples(%{metrics: %{"samples" => samples}}) when is_list(samples), do: samples
+  defp get_samples(_), do: []
+
+  defp has_samples?(entry), do: get_samples(entry) != []
+
+  # Generate SVG sparkline path for a metric within samples
+  defp sparkline_path(samples, key, width, height, max_val) do
+    n = length(samples)
+    if n < 2 or max_val == 0 do
+      ""
+    else
+      samples
+      |> Enum.with_index()
+      |> Enum.map(fn {s, i} ->
+        x = Float.round(i / max(n - 1, 1) * width, 1)
+        val = Map.get(s, key, 0) || 0
+        y = Float.round(height - val / max_val * height, 1)
+        cmd = if i == 0, do: "M", else: "L"
+        "#{cmd}#{x},#{y}"
+      end)
+      |> Enum.join(" ")
+    end
+  end
+
+  # Max value for a sample key across all files' samples
+  defp samples_max(files, key) do
+    files
+    |> Enum.flat_map(&get_samples/1)
+    |> Enum.reduce(0.001, fn s, acc -> max(acc, Map.get(s, key, 0) || 0) end)
+  end
+
+  # Generate a deterministic color for a file index
+  defp file_color(index) do
+    hues = [0, 142, 200, 45, 280, 30, 320, 100, 170, 60]
+    hue = Enum.at(hues, rem(index, length(hues)))
+    "hsl(#{hue}, 70%, 55%)"
+  end
+
+  defp distribution_data(files, key) do
+    vals =
+      files
+      |> Enum.map(&scatter_val(&1, key))
+      |> Enum.filter(&(&1 >= 0))
+      |> Enum.sort()
+
+    case vals do
+      [] -> nil
+      _ ->
+        n = length(vals)
+        %{
+          min: List.first(vals),
+          q1: Enum.at(vals, div(n, 4)),
+          median: Enum.at(vals, div(n, 2)),
+          q3: Enum.at(vals, div(3 * n, 4)),
+          max: List.last(vals)
+        }
+    end
   end
 
   defp profile_bg("light"), do: "bg-success/10"
@@ -624,10 +1007,12 @@ defmodule NaturecountsWeb.VideosLive do
   defp profile_dot(_), do: "bg-base-content/30"
 
   defp list_jobs do
-    Video
-    |> order_by(desc: :inserted_at)
-    |> limit(20)
-    |> Repo.all()
+    Naturecounts.Cache.get_or_compute(:video_jobs, fn ->
+      Video
+      |> order_by(desc: :inserted_at)
+      |> limit(20)
+      |> Repo.all()
+    end, ttl: 2_000, group: :videos)
   end
 
   defp schedule_refresh do
@@ -636,9 +1021,792 @@ defmodule NaturecountsWeb.VideosLive do
 
   @impl true
   def render(assigns) do
+    visible = filtered_entries(assigns.entries, assigns.metric_filters)
+    summary = compute_metrics_summary(visible)
+
+    # Compute max values for bar scaling
+    scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
+    maxes = %{
+      det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
+      brightness: 255,
+      contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
+      motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
+      bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
+      duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
+    }
+
+    scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
+
+    # Paginate visible entries for metrics views
+    visible_files = Enum.filter(visible, &(&1.type == :file))
+    total_visible = length(visible_files)
+    metrics_page = Enum.take(visible, assigns.metrics_limit)
+    has_more = total_visible > assigns.metrics_limit
+
+    assigns = assign(assigns,
+      visible: visible,
+      metrics_page: metrics_page,
+      total_visible: total_visible,
+      has_more_metrics: has_more,
+      summary: summary,
+      maxes: maxes,
+      scanned_only: Enum.take(scanned_only, assigns.metrics_limit)
+    )
+
     ~H"""
-    <div class="p-4">
-      <h1 class="text-2xl font-bold mb-6">Video Processing</h1>
+    <div class="p-4 space-y-4">
+      <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold">Video Processing</h1>
+        <div class="flex items-center gap-1">
+          <%= if @show_metrics do %>
+            <div class="flex flex-col items-end gap-0.5 mr-2">
+              <div class="join">
+                <button :for={v <- [{"heatmap", "Heatmap"}, {"cards", "Cards"}, {"scatter", "Scatter"}, {"grouped", "Grouped"}, {"radar", "Radar"}]}
+                  class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+                  phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
+                >
+                  {elem(v, 1)}
+                </button>
+              </div>
+              <div class="join">
+                <button :for={v <- [{"timeline", "Timeline"}, {"temporal_scatter", "T-Scatter"}, {"temporal_heatmap", "T-Heatmap"}]}
+                  class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+                  phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
+                >
+                  {elem(v, 1)}
+                </button>
+              </div>
+            </div>
+          <% end %>
+          <button
+            class={"btn btn-sm #{if @show_metrics, do: "btn-primary", else: "btn-ghost"}"}
+            phx-click="toggle_metrics"
+          >
+            Metrics
+          </button>
+        </div>
+      </div>
+
+      <%!-- Metrics dashboard --%>
+      <%= if @show_metrics do %>
+        <div class="card bg-base-200">
+          <div class="card-body p-4">
+            <%!-- Summary stats --%>
+            <%= if @summary do %>
+              <div class="stats stats-horizontal shadow-sm mb-3 text-sm">
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Scanned</div>
+                  <div class="stat-value text-lg">{@summary.count}</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Total Duration</div>
+                  <div class="stat-value text-lg">{Float.round(@summary.total_duration / 60, 1)}m</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Avg Det/frame</div>
+                  <div class="stat-value text-lg">{@summary.avg_det}</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Avg Brightness</div>
+                  <div class="stat-value text-lg">{@summary.avg_brightness}</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Avg Contrast</div>
+                  <div class="stat-value text-lg">{@summary.avg_contrast}</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Avg Motion</div>
+                  <div class="stat-value text-lg">{@summary.avg_motion}</div>
+                </div>
+                <div class="stat py-2 px-4">
+                  <div class="stat-title text-xs">Total Bboxes</div>
+                  <div class="stat-value text-lg">{@summary.total_bbox}</div>
+                </div>
+              </div>
+            <% end %>
+
+            <%!-- Quick filters --%>
+            <div class="flex flex-wrap items-center gap-1 mb-3">
+              <span class="text-xs font-semibold text-base-content/60 mr-1">Quick:</span>
+              <button class={"btn btn-xs #{if map_size(@metric_filters) == 0, do: "btn-active"}"} phx-click="quick_filter" phx-value-preset="clear">All</button>
+              <button class={"btn btn-xs #{if @metric_filters["avg_detections_per_frame"] == {0.1, nil}, do: "btn-success"}"} phx-click="quick_filter" phx-value-preset="has_detections">Has detections</button>
+              <button class={"btn btn-xs #{if @metric_filters["avg_detections_per_frame"] == {nil, 0.0}, do: "btn-warning"}"} phx-click="quick_filter" phx-value-preset="no_detections">No detections</button>
+              <button class={"btn btn-xs #{if @metric_filters["avg_brightness"] == {nil, 15.0}, do: "btn-neutral"}"} phx-click="quick_filter" phx-value-preset="dark">Dark</button>
+              <button class={"btn btn-xs #{if @metric_filters["duration_s"] == {nil, 30.0}, do: "btn-info"}"} phx-click="quick_filter" phx-value-preset="short">Short (&lt;30s)</button>
+              <button class={"btn btn-xs #{if @metric_filters["motion_score"] == {5.0, nil}, do: "btn-secondary"}"} phx-click="quick_filter" phx-value-preset="high_motion">High motion</button>
+              <button class={"btn btn-xs #{if @metric_filters["bbox_mean"] == {20000, nil}, do: "btn-accent"}"} phx-click="quick_filter" phx-value-preset="large_bbox">Large bbox</button>
+
+              <%= if map_size(@metric_filters) > 0 do %>
+                <span class="text-xs text-base-content/50 ml-2">
+                  {@total_visible} / {length(Enum.filter(@entries, &(&1.type == :file)))} files
+                </span>
+              <% end %>
+            </div>
+
+            <%!-- Range filters --%>
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2 mb-3">
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Detections/frame</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="avg_detections_per_frame" />
+                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["avg_detections_per_frame"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["avg_detections_per_frame"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Brightness (0-255)</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="avg_brightness" />
+                  <input type="number" step="1" min="0" max="255" placeholder="min" name="min" value={elem(@metric_filters["avg_brightness"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="1" min="0" max="255" placeholder="max" name="max" value={elem(@metric_filters["avg_brightness"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Duration (s)</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="duration_s" />
+                  <input type="number" step="1" min="0" placeholder="min" name="min" value={elem(@metric_filters["duration_s"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="1" min="0" placeholder="max" name="max" value={elem(@metric_filters["duration_s"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Contrast</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="contrast" />
+                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["contrast"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["contrast"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Motion</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="motion_score" />
+                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["motion_score"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["motion_score"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+              <form phx-change="set_metric_filter" class="form-control">
+                <label class="label py-0"><span class="label-text text-xs">Bbox mean area</span></label>
+                <div class="flex gap-1">
+                  <input type="hidden" name="field" value="bbox_mean" />
+                  <input type="number" step="1000" min="0" placeholder="min" name="min" value={elem(@metric_filters["bbox_mean"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
+                  <input type="number" step="1000" min="0" placeholder="max" name="max" value={elem(@metric_filters["bbox_mean"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
+                </div>
+              </form>
+            </div>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 1: HEATMAP TABLE                  --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "heatmap" do %>
+              <div class="overflow-x-auto">
+                <table class="table table-xs">
+                  <thead>
+                    <tr class="text-xs">
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">Size {sort_indicator(@sort_by, @sort_dir, "size")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="duration">Dur {sort_indicator(@sort_by, @sort_dir, "duration")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det">Det/f {sort_indicator(@sort_by, @sort_dir, "det")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="brightness">Bright {sort_indicator(@sort_by, @sort_dir, "brightness")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="contrast">Contrast {sort_indicator(@sort_by, @sort_dir, "contrast")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="motion">Motion {sort_indicator(@sort_by, @sort_dir, "motion")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="bbox_count">Bboxes {sort_indicator(@sort_by, @sort_dir, "bbox_count")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="bbox_mean">Bbox avg {sort_indicator(@sort_by, @sort_dir, "bbox_mean")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <%= for entry <- @metrics_page, entry.type == :file do %>
+                      <tr
+                        class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
+                        phx-click="select_file" phx-value-file={entry.path}
+                      >
+                        <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
+                          <span class="flex items-center gap-1">
+                            <%= if entry.processed do %>
+                              <span class={["w-2 h-2 rounded-full shrink-0",
+                                entry.processed.status == "completed" && profile_dot(entry.processed.profile),
+                                entry.processed.status == "processing" && "bg-info animate-pulse",
+                                entry.processed.status == "pending" && "bg-base-content/30"
+                              ]} />
+                            <% end %>
+                            {entry.name}
+                          </span>
+                        </td>
+                        <td class="text-xs text-base-content/60">{entry.size_mb}MB</td>
+                        <%= if entry.metrics && !entry.metrics["error"] do %>
+                          <td class="text-xs font-mono">{entry.metrics["duration_s"]}s</td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["avg_detections_per_frame"], @maxes.det, 142)}>
+                            {entry.metrics["avg_detections_per_frame"]}
+                          </td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["avg_brightness"], 255, 45)}>
+                            {entry.metrics["avg_brightness"] || "-"}
+                          </td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["contrast"], @maxes.contrast, 200)}>
+                            {entry.metrics["contrast"] || "-"}
+                          </td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["motion_score"], @maxes.motion, 280)}>
+                            {entry.metrics["motion_score"] || "-"}
+                          </td>
+                          <td class="text-xs font-mono text-center">{get_in(entry.metrics, ["bbox_areas", "count"]) || 0}</td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(get_in(entry.metrics, ["bbox_areas", "mean"]), @maxes.bbox_mean, 30)}>
+                            {get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}
+                          </td>
+                        <% else %>
+                          <td colspan="7" class="text-xs text-base-content/30 italic">Not scanned</td>
+                        <% end %>
+                      </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 2: CARD GRID                      --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "cards" do %>
+              <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2 max-h-[500px] overflow-y-auto">
+                <%= for entry <- @metrics_page, entry.type == :file do %>
+                  <div
+                    class={["card card-compact bg-base-100 cursor-pointer hover:shadow-md transition-shadow",
+                      @selected_file == entry.path && "ring-2 ring-primary"]}
+                    phx-click="select_file" phx-value-file={entry.path}
+                  >
+                    <div class="card-body p-3">
+                      <div class="flex items-center gap-1 mb-1">
+                        <%= if entry.processed do %>
+                          <span class={["w-2 h-2 rounded-full shrink-0",
+                            entry.processed.status == "completed" && profile_dot(entry.processed.profile),
+                            entry.processed.status == "processing" && "bg-info animate-pulse",
+                            entry.processed.status == "pending" && "bg-base-content/30"
+                          ]} />
+                        <% end %>
+                        <span class="font-mono text-xs truncate" title={entry.name}>{entry.name}</span>
+                      </div>
+                      <div class="text-[10px] text-base-content/50">{entry.size_mb}MB</div>
+
+                      <%= if entry.metrics && !entry.metrics["error"] do %>
+                        <%!-- Micro bar chart fingerprint --%>
+                        <div class="flex items-end gap-px h-8 mt-1">
+                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["avg_detections_per_frame"], @maxes.det)}%; background: hsl(142, 70%, 50%); min-height: 2px"} title={"Det: #{entry.metrics["avg_detections_per_frame"]}"} />
+                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["avg_brightness"], 255)}%; background: hsl(45, 70%, 50%); min-height: 2px"} title={"Bright: #{entry.metrics["avg_brightness"]}"} />
+                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["contrast"], @maxes.contrast)}%; background: hsl(200, 70%, 50%); min-height: 2px"} title={"Contrast: #{entry.metrics["contrast"]}"} />
+                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["motion_score"], @maxes.motion)}%; background: hsl(280, 70%, 50%); min-height: 2px"} title={"Motion: #{entry.metrics["motion_score"]}"} />
+                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(get_in(entry.metrics, ["bbox_areas", "mean"]), @maxes.bbox_mean)}%; background: hsl(30, 70%, 50%); min-height: 2px"} title={"Bbox: #{get_in(entry.metrics, ["bbox_areas", "mean"])}"} />
+                        </div>
+                        <div class="flex justify-between text-[9px] text-base-content/40 mt-0.5">
+                          <span>Det</span><span>Bri</span><span>Con</span><span>Mot</span><span>Bbx</span>
+                        </div>
+                        <div class="flex gap-2 text-[10px] text-base-content/60 mt-1">
+                          <span>{entry.metrics["duration_s"]}s</span>
+                          <span>{entry.metrics["avg_detections_per_frame"]} det</span>
+                        </div>
+                      <% else %>
+                        <div class="h-8 flex items-center justify-center">
+                          <span class="text-[10px] text-base-content/30 italic">Not scanned</span>
+                        </div>
+                      <% end %>
+                    </div>
+                  </div>
+                <% end %>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 3: SCATTER PLOT                   --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "scatter" do %>
+              <div>
+                <div class="flex items-center gap-4 mb-2">
+                  <div class="flex items-center gap-1">
+                    <span class="text-xs text-base-content/60">X:</span>
+                    <select class="select select-bordered select-xs" phx-change="set_scatter_axis" name="value">
+                      <input type="hidden" name="axis" value="x" />
+                      <option :for={k <- ["brightness", "det", "contrast", "motion", "duration", "bbox_mean", "size"]}
+                        value={k} selected={@scatter_x == k}>{scatter_label(k)}</option>
+                    </select>
+                  </div>
+                  <div class="flex items-center gap-1">
+                    <span class="text-xs text-base-content/60">Y:</span>
+                    <select class="select select-bordered select-xs" phx-change="set_scatter_axis" name="value">
+                      <input type="hidden" name="axis" value="y" />
+                      <option :for={k <- ["det", "brightness", "contrast", "motion", "duration", "bbox_mean", "size"]}
+                        value={k} selected={@scatter_y == k}>{scatter_label(k)}</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="bg-base-100 rounded-lg p-4">
+                  <svg viewBox="0 0 520 320" class="w-full max-h-[350px]">
+                    <%!-- Grid --%>
+                    <line x1="50" y1="10" x2="50" y2="280" stroke="currentColor" opacity="0.15" />
+                    <line x1="50" y1="280" x2="510" y2="280" stroke="currentColor" opacity="0.15" />
+                    <line :for={i <- 1..4} x1="50" y1={280 - i * 54} x2="510" y2={280 - i * 54} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line :for={i <- 1..4} x1={50 + i * 92} y1="10" x2={50 + i * 92} y2="280" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+
+                    <%!-- Axis labels --%>
+                    <text x="280" y="305" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">{scatter_label(@scatter_x)}</text>
+                    <text x="15" y="145" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11" transform="rotate(-90, 15, 145)">{scatter_label(@scatter_y)}</text>
+
+                    <%!-- Data points --%>
+                    <% x_max = scatter_max(@scanned_only, @scatter_x) %>
+                    <% y_max = scatter_max(@scanned_only, @scatter_y) %>
+                    <%= for entry <- @scanned_only do %>
+                      <% cx = 50 + scatter_val(entry, @scatter_x) / x_max * 460 %>
+                      <% cy = 280 - scatter_val(entry, @scatter_y) / y_max * 270 %>
+                      <circle
+                        cx={Float.round(cx, 1)} cy={Float.round(cy, 1)} r={if @selected_file == entry.path, do: "6", else: "4"}
+                        fill={if @selected_file == entry.path, do: "hsl(var(--p))", else: "hsl(var(--s))"}
+                        opacity={if @selected_file == entry.path, do: "1", else: "0.6"}
+                        class="cursor-pointer hover:opacity-100 transition-opacity"
+                        phx-click="select_file" phx-value-file={entry.path}
+                      >
+                        <title>{entry.name} — {scatter_label(@scatter_x)}: {scatter_val(entry, @scatter_x)}, {scatter_label(@scatter_y)}: {scatter_val(entry, @scatter_y)}</title>
+                      </circle>
+                    <% end %>
+                  </svg>
+                </div>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 4: GROUPED TABLE + DISTRIBUTIONS  --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "grouped" do %>
+              <div class="overflow-x-auto">
+                <table class="table table-xs">
+                  <thead>
+                    <tr class="text-xs">
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
+                      <th :for={{col, label} <- [{"det", "Det/f"}, {"brightness", "Bright"}, {"contrast", "Contrast"}, {"motion", "Motion"}, {"bbox_mean", "Bbox avg"}]}
+                        class="cursor-pointer select-none" phx-click="sort_files" phx-value-col={col}
+                      >
+                        <div class="flex flex-col gap-1">
+                          <span>{label} {sort_indicator(@sort_by, @sort_dir, col)}</span>
+                          <%!-- Distribution strip --%>
+                          <% dist = distribution_data(@scanned_only, col) %>
+                          <%= if dist do %>
+                            <% col_max = case col do
+                              "brightness" -> 255
+                              "det" -> @maxes.det
+                              "contrast" -> @maxes.contrast
+                              "motion" -> @maxes.motion
+                              "bbox_mean" -> @maxes.bbox_mean
+                              _ -> dist.max
+                            end %>
+                            <% col_max = if col_max == 0, do: 1, else: col_max %>
+                            <svg viewBox="0 0 60 8" class="w-full h-2">
+                              <rect x="0" y="3" width="60" height="2" rx="1" fill="currentColor" opacity="0.1" />
+                              <rect
+                                x={Float.round(dist.q1 / col_max * 60, 1)}
+                                y="1" rx="1"
+                                width={Float.round(max((dist.q3 - dist.q1) / col_max * 60, 1), 1)}
+                                height="6"
+                                fill="currentColor" opacity="0.2"
+                              />
+                              <line
+                                x1={Float.round(dist.median / col_max * 60, 1)} y1="0"
+                                x2={Float.round(dist.median / col_max * 60, 1)} y2="8"
+                                stroke="currentColor" opacity="0.6" stroke-width="1.5"
+                              />
+                            </svg>
+                          <% end %>
+                        </div>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <%!-- Group: processed files --%>
+                    <% {processed, unprocessed} = Enum.split_with(
+                      Enum.filter(@metrics_page, &(&1.type == :file)),
+                      &(&1.processed && &1.processed.status == "completed")
+                    ) %>
+                    <%= if length(processed) > 0 do %>
+                      <tr><td colspan="6" class="text-xs font-bold text-success/80 bg-success/5 py-1">Processed ({length(processed)})</td></tr>
+                      <%= for entry <- processed do %>
+                        <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
+                          phx-click="select_file" phx-value-file={entry.path}>
+                          <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
+                            <span class="flex items-center gap-1">
+                              <span class={["w-2 h-2 rounded-full shrink-0", profile_dot(entry.processed.profile)]} />
+                              {entry.name}
+                            </span>
+                          </td>
+                          <%= if entry.metrics && !entry.metrics["error"] do %>
+                            <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
+                            <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
+                            <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
+                            <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
+                            <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
+                          <% else %>
+                            <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
+                          <% end %>
+                        </tr>
+                      <% end %>
+                    <% end %>
+                    <%= if length(unprocessed) > 0 do %>
+                      <tr><td colspan="6" class="text-xs font-bold text-base-content/50 bg-base-300/30 py-1">Unprocessed ({length(unprocessed)})</td></tr>
+                      <%= for entry <- unprocessed do %>
+                        <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
+                          phx-click="select_file" phx-value-file={entry.path}>
+                          <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
+                            <span class="flex items-center gap-1">
+                              <%= if entry.processed do %>
+                                <span class={["w-2 h-2 rounded-full shrink-0",
+                                  entry.processed.status == "processing" && "bg-info animate-pulse",
+                                  entry.processed.status == "pending" && "bg-base-content/30"
+                                ]} />
+                              <% end %>
+                              {entry.name}
+                            </span>
+                          </td>
+                          <%= if entry.metrics && !entry.metrics["error"] do %>
+                            <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
+                            <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
+                            <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
+                            <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
+                            <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
+                          <% else %>
+                            <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
+                          <% end %>
+                        </tr>
+                      <% end %>
+                    <% end %>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 5: RADAR / SPIDER THUMBNAILS      --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "radar" do %>
+              <div class="overflow-x-auto">
+                <%!-- Legend --%>
+                <div class="flex gap-3 text-[10px] text-base-content/50 mb-2">
+                  <span :for={{label, color} <- [{"Det", "hsl(142, 70%, 50%)"}, {"Bright", "hsl(45, 70%, 50%)"}, {"Contrast", "hsl(200, 70%, 50%)"}, {"Motion", "hsl(280, 70%, 50%)"}, {"Bbox", "hsl(30, 70%, 50%)"}]}>
+                    <span class="inline-block w-2 h-2 rounded-full mr-0.5" style={"background: #{color}"} />{label}
+                  </span>
+                </div>
+                <table class="table table-xs">
+                  <thead>
+                    <tr class="text-xs">
+                      <th class="w-12">Shape</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">Size {sort_indicator(@sort_by, @sort_dir, "size")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det">Det/f {sort_indicator(@sort_by, @sort_dir, "det")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="brightness">Bright {sort_indicator(@sort_by, @sort_dir, "brightness")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="contrast">Contrast {sort_indicator(@sort_by, @sort_dir, "contrast")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="motion">Motion {sort_indicator(@sort_by, @sort_dir, "motion")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="bbox_mean">Bbox avg {sort_indicator(@sort_by, @sort_dir, "bbox_mean")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <%= for entry <- @metrics_page, entry.type == :file do %>
+                      <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
+                        phx-click="select_file" phx-value-file={entry.path}>
+                        <td class="p-1">
+                          <%= if entry.metrics && !entry.metrics["error"] do %>
+                            <svg viewBox="0 0 44 44" class="w-10 h-10">
+                              <%!-- Grid rings --%>
+                              <polygon points={radar_grid_points(18, 5)} fill="none" stroke="currentColor" opacity="0.08" />
+                              <polygon points={radar_grid_points(12, 5)} fill="none" stroke="currentColor" opacity="0.06" />
+                              <polygon points={radar_grid_points(6, 5)} fill="none" stroke="currentColor" opacity="0.04" />
+                              <%!-- Axes --%>
+                              <line :for={i <- 0..4}
+                                x1="22" y1="22"
+                                x2={Float.round(22 + 18 * :math.cos(2 * :math.pi() * i / 5 - :math.pi() / 2), 1)}
+                                y2={Float.round(22 + 18 * :math.sin(2 * :math.pi() * i / 5 - :math.pi() / 2), 1)}
+                                stroke="currentColor" opacity="0.1"
+                              />
+                              <%!-- Data polygon --%>
+                              <polygon
+                                points={radar_points(entry, @maxes)}
+                                fill="hsl(var(--s))" fill-opacity="0.3"
+                                stroke="hsl(var(--s))" stroke-width="1.5"
+                              />
+                            </svg>
+                          <% else %>
+                            <div class="w-10 h-10 flex items-center justify-center text-base-content/20 text-lg">?</div>
+                          <% end %>
+                        </td>
+                        <td class="font-mono text-xs truncate max-w-[160px]" title={entry.name}>
+                          <span class="flex items-center gap-1">
+                            <%= if entry.processed do %>
+                              <span class={["w-2 h-2 rounded-full shrink-0",
+                                entry.processed.status == "completed" && profile_dot(entry.processed.profile),
+                                entry.processed.status == "processing" && "bg-info animate-pulse",
+                                entry.processed.status == "pending" && "bg-base-content/30"
+                              ]} />
+                            <% end %>
+                            {entry.name}
+                          </span>
+                        </td>
+                        <td class="text-xs text-base-content/60">{entry.size_mb}MB</td>
+                        <%= if entry.metrics && !entry.metrics["error"] do %>
+                          <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
+                          <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
+                          <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
+                          <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
+                          <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
+                        <% else %>
+                          <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
+                        <% end %>
+                      </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 6: TIMELINE SPARKLINES            --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "timeline" do %>
+              <div class="overflow-x-auto">
+                <% det_max = samples_max(@scanned_only, "det") %>
+                <% bright_max = samples_max(@scanned_only, "bright") %>
+                <% motion_max = samples_max(@scanned_only, "motion") %>
+                <div class="flex items-center gap-3 text-[10px] text-base-content/50 mb-2">
+                  <span class="mr-1 text-base-content/40">Sort:</span>
+                  <button class={"flex items-center gap-1 hover:text-success cursor-pointer #{if @sort_by == "det", do: "text-success font-bold"}"} phx-click="sort_files" phx-value-col="det">
+                    <span class="inline-block w-3 h-0.5 rounded bg-success" />Detections {sort_indicator(@sort_by, @sort_dir, "det")}
+                  </button>
+                  <button class={"flex items-center gap-1 hover:text-warning cursor-pointer #{if @sort_by == "brightness", do: "text-warning font-bold"}"} phx-click="sort_files" phx-value-col="brightness">
+                    <span class="inline-block w-3 h-0.5 rounded bg-warning" />Brightness {sort_indicator(@sort_by, @sort_dir, "brightness")}
+                  </button>
+                  <button class={"flex items-center gap-1 hover:text-secondary cursor-pointer #{if @sort_by == "motion", do: "text-secondary font-bold"}"} phx-click="sort_files" phx-value-col="motion">
+                    <span class="inline-block w-3 h-0.5 rounded bg-secondary" />Motion {sort_indicator(@sort_by, @sort_dir, "motion")}
+                  </button>
+                  <button class={"flex items-center gap-1 hover:text-base-content cursor-pointer #{if @sort_by == "name", do: "font-bold"}"} phx-click="sort_files" phx-value-col="name">
+                    Name {sort_indicator(@sort_by, @sort_dir, "name")}
+                  </button>
+                </div>
+                <div class="space-y-1">
+                  <%= for entry <- @metrics_page, entry.type == :file do %>
+                    <div
+                      class={["flex items-center gap-2 p-1 rounded hover:bg-base-300/50 cursor-pointer",
+                        @selected_file == entry.path && "ring-1 ring-primary bg-primary/10"]}
+                      phx-click="select_file" phx-value-file={entry.path}
+                    >
+                      <div class="w-[140px] shrink-0">
+                        <span class="flex items-center gap-1">
+                          <%= if entry.processed do %>
+                            <span class={["w-2 h-2 rounded-full shrink-0",
+                              entry.processed.status == "completed" && profile_dot(entry.processed.profile),
+                              entry.processed.status == "processing" && "bg-info animate-pulse",
+                              entry.processed.status == "pending" && "bg-base-content/30"
+                            ]} />
+                          <% end %>
+                          <span class="font-mono text-xs truncate" title={entry.name}>{entry.name}</span>
+                        </span>
+                        <div class="text-[10px] text-base-content/40">
+                          {entry.size_mb}MB
+                          <%= if entry.metrics do %>
+                            &middot; {entry.metrics["duration_s"]}s
+                          <% end %>
+                        </div>
+                      </div>
+                      <div class="flex-1 min-w-[200px]">
+                        <%= if has_samples?(entry) do %>
+                          <% samples = get_samples(entry) %>
+                          <% n = length(samples) %>
+                          <svg viewBox="0 0 200 30" class="w-full h-8" preserveAspectRatio="none">
+                            <rect x="0" y="0" width="200" height="30" fill="currentColor" opacity="0.03" rx="2" />
+                            <%!-- Detection bars (clickable) --%>
+                            <%= for {s, i} <- Enum.with_index(samples) do %>
+                              <% bar_w = max(200 / max(n, 1) - 1, 2) %>
+                              <% bar_h = if det_max > 0, do: (s["det"] || 0) / det_max * 28, else: 0 %>
+                              <rect
+                                x={Float.round(i / max(n, 1) * 200, 1)}
+                                y="0" width={Float.round(bar_w, 1)} height="30"
+                                fill="transparent" class="cursor-pointer"
+                                phx-click="seek_sample"
+                                phx-value-file={entry.path}
+                                phx-value-time={"#{s["t"] / 1}"}
+                              >
+                                <title>t={s["t"]}s det={s["det"]} — click to play</title>
+                              </rect>
+                              <rect
+                                x={Float.round(i / max(n, 1) * 200, 1)}
+                                y={Float.round(30 - bar_h, 1)}
+                                width={Float.round(bar_w, 1)}
+                                height={Float.round(max(bar_h, 0), 1)}
+                                fill="hsl(142, 70%, 50%)" opacity="0.5" rx="1"
+                                class="pointer-events-none"
+                              />
+                            <% end %>
+                            <%!-- Brightness line --%>
+                            <path d={sparkline_path(samples, "bright", 200, 30, bright_max)} fill="none" stroke="hsl(45, 80%, 55%)" stroke-width="1.5" opacity="0.7" class="pointer-events-none" />
+                            <%!-- Motion line --%>
+                            <path d={sparkline_path(samples, "motion", 200, 30, motion_max)} fill="none" stroke="hsl(280, 70%, 55%)" stroke-width="1" opacity="0.6" stroke-dasharray="3,2" class="pointer-events-none" />
+                          </svg>
+                        <% else %>
+                          <div class="h-8 flex items-center justify-center">
+                            <span class="text-[10px] text-base-content/20 italic">No temporal data</span>
+                          </div>
+                        <% end %>
+                      </div>
+                      <div class="w-16 text-right text-xs font-mono text-base-content/50 shrink-0">
+                        <%= if entry.metrics && !entry.metrics["error"] do %>
+                          {entry.metrics["avg_detections_per_frame"]} det
+                        <% end %>
+                      </div>
+                    </div>
+                  <% end %>
+                </div>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 7: TEMPORAL SCATTER               --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "temporal_scatter" do %>
+              <div>
+                <div class="flex items-center gap-4 mb-2">
+                  <div class="flex items-center gap-1">
+                    <span class="text-xs text-base-content/60">Y axis:</span>
+                    <select class="select select-bordered select-xs" phx-change="set_temporal_y" name="value">
+                      <option :for={k <- ["det", "bright", "contrast", "motion"]}
+                        value={k} selected={@temporal_y == k}>
+                        {case k do; "det" -> "Detections"; "bright" -> "Brightness"; "contrast" -> "Contrast"; "motion" -> "Motion"; _ -> k; end}
+                      </option>
+                    </select>
+                  </div>
+                  <span class="text-[10px] text-base-content/40">X = time position in video (s). Each color = one file.</span>
+                </div>
+                <div class="bg-base-100 rounded-lg p-4">
+                  <% temporal_files = Enum.filter(@scanned_only, &has_samples?/1) |> Enum.with_index() %>
+                  <% y_max = samples_max(@scanned_only, @temporal_y) %>
+                  <% x_max = Enum.reduce(@scanned_only, 0.001, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end) %>
+                  <svg viewBox="0 0 520 300" class="w-full max-h-[350px]">
+                    <%!-- Grid --%>
+                    <line x1="50" y1="10" x2="50" y2="260" stroke="currentColor" opacity="0.15" />
+                    <line x1="50" y1="260" x2="510" y2="260" stroke="currentColor" opacity="0.15" />
+                    <line :for={i <- 1..4} x1="50" y1={260 - i * 50} x2="510" y2={260 - i * 50} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line :for={i <- 1..4} x1={50 + i * 92} y1="10" x2={50 + i * 92} y2="260" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+
+                    <%!-- Axis labels --%>
+                    <text x="280" y="285" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">Time (s)</text>
+                    <text x="15" y="135" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11" transform="rotate(-90, 15, 135)">
+                      {case @temporal_y do; "det" -> "Detections"; "bright" -> "Brightness"; "contrast" -> "Contrast"; "motion" -> "Motion"; _ -> @temporal_y; end}
+                    </text>
+
+                    <%!-- Data points per file --%>
+                    <%= for {entry, fi} <- temporal_files do %>
+                      <% color = file_color(fi) %>
+                      <% samples = get_samples(entry) %>
+                      <%= for s <- samples do %>
+                        <% cx = 50 + (s["t"] || 0) / x_max * 460 %>
+                        <% val = s[@temporal_y] || 0 %>
+                        <% cy = 260 - val / y_max * 250 %>
+                        <circle
+                          cx={Float.round(cx, 1)} cy={Float.round(cy, 1)}
+                          r={if @selected_file == entry.path, do: "5", else: "3.5"}
+                          fill={color}
+                          opacity={if @selected_file == entry.path, do: "0.9", else: "0.5"}
+                          class="cursor-pointer hover:opacity-100"
+                          phx-click="seek_sample"
+                          phx-value-file={entry.path}
+                          phx-value-time={"#{s["t"] / 1}"}
+                        >
+                          <title>{entry.name} — t={s["t"]}s, {@temporal_y}={s[@temporal_y]} — click to play</title>
+                        </circle>
+                      <% end %>
+                    <% end %>
+
+                    <%!-- Legend --%>
+                    <%= for {entry, fi} <- Enum.take(temporal_files, 10) do %>
+                      <circle cx={60 + rem(fi, 5) * 92} cy={270 + div(fi, 5) * 12} r="3" fill={file_color(fi)} />
+                      <text x={67 + rem(fi, 5) * 92} y={273 + div(fi, 5) * 12} fill="currentColor" opacity="0.5" font-size="8">
+                        {String.slice(entry.name, 0, 12)}
+                      </text>
+                    <% end %>
+                  </svg>
+                </div>
+              </div>
+            <% end %>
+
+            <%!-- ═══════════════════════════════════════ --%>
+            <%!-- VIEW 8: TEMPORAL HEATMAP               --%>
+            <%!-- ═══════════════════════════════════════ --%>
+            <%= if @metrics_view == "temporal_heatmap" do %>
+              <div class="overflow-x-auto">
+                <div class="flex items-center gap-4 mb-2">
+                  <span class="text-xs text-base-content/60">Rows = files, columns = sample time points, color intensity = detection count</span>
+                  <div class="flex items-center gap-1 text-[10px] text-base-content/40">
+                    <span class="inline-block w-3 h-3 rounded" style="background: hsla(142, 70%, 50%, 0.05)" /> 0
+                    <span class="inline-block w-3 h-3 rounded" style="background: hsla(142, 70%, 50%, 0.3)" /> low
+                    <span class="inline-block w-3 h-3 rounded" style="background: hsla(142, 70%, 50%, 0.6)" /> high
+                  </div>
+                </div>
+                <% det_max_h = samples_max(@scanned_only, "det") %>
+                <% max_samples = Enum.reduce(@scanned_only, 0, fn f, acc -> max(acc, length(get_samples(f))) end) %>
+                <% max_samples = max(max_samples, 1) %>
+                <div class="space-y-px">
+                  <%= for entry <- @metrics_page, entry.type == :file do %>
+                    <div
+                      class={["flex items-center gap-1 cursor-pointer hover:bg-base-300/30 rounded",
+                        @selected_file == entry.path && "ring-1 ring-primary"]}
+                      phx-click="select_file" phx-value-file={entry.path}
+                    >
+                      <div class="w-[130px] shrink-0 pr-1">
+                        <span class="font-mono text-[10px] truncate block" title={entry.name}>{entry.name}</span>
+                      </div>
+                      <div class="flex-1 flex items-center gap-px h-5">
+                        <%= if has_samples?(entry) do %>
+                          <% samples = get_samples(entry) %>
+                          <%= for s <- samples do %>
+                            <% det = s["det"] || 0 %>
+                            <% alpha = if det_max_h > 0, do: Float.round(det / det_max_h * 0.7 + 0.05, 2), else: 0.05 %>
+                            <div
+                              class="h-full rounded-sm flex-1 cursor-pointer hover:ring-1 hover:ring-primary"
+                              style={"background: hsla(142, 70%, 50%, #{alpha}); min-width: 4px"}
+                              title={"t=#{s["t"]}s det=#{det} — click to play"}
+                              phx-click="seek_sample"
+                              phx-value-file={entry.path}
+                              phx-value-time={"#{s["t"] / 1}"}
+                            />
+                          <% end %>
+                          <%!-- Pad if fewer samples than max --%>
+                          <%= if length(samples) < max_samples do %>
+                            <div :for={_ <- 1..(max_samples - length(samples))} class="h-full flex-1" style="min-width: 4px" />
+                          <% end %>
+                        <% else %>
+                          <div class="h-full flex-1 flex items-center justify-center">
+                            <span class="text-[9px] text-base-content/20 italic">no data</span>
+                          </div>
+                        <% end %>
+                      </div>
+                      <div class="w-12 text-right text-[10px] font-mono text-base-content/40 shrink-0">
+                        <%= if entry.metrics do %>
+                          {entry.metrics["duration_s"]}s
+                        <% end %>
+                      </div>
+                    </div>
+                  <% end %>
+                </div>
+              </div>
+            <% end %>
+
+            <%!-- Load more --%>
+            <%= if @has_more_metrics do %>
+              <div class="flex items-center justify-center gap-2 py-2">
+                <span class="text-xs text-base-content/40">
+                  Showing {@metrics_limit} of {@total_visible} files
+                </span>
+                <button class="btn btn-ghost btn-xs" phx-click="load_more_metrics">Load more</button>
+              </div>
+            <% else %>
+              <%= if @total_visible > 0 do %>
+                <div class="text-center text-xs text-base-content/30 py-1">
+                  All {@total_visible} files shown
+                </div>
+              <% end %>
+            <% end %>
+
+          </div>
+        </div>
+      <% end %>
 
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <%!-- File browser --%>
@@ -664,6 +1832,7 @@ defmodule NaturecountsWeb.VideosLive do
               </div>
               <div class="flex items-center gap-1">
                 <%= if @scanning do %>
+                  <span class="text-xs text-base-content/50">{scan_active_count()} workers</span>
                   <button
                     class="btn btn-error btn-xs gap-1"
                     phx-click="cancel_scan"
@@ -672,13 +1841,22 @@ defmodule NaturecountsWeb.VideosLive do
                     Cancel
                   </button>
                 <% else %>
+                  <label class="label cursor-pointer gap-1 p-0">
+                    <span class="label-text text-[10px] text-base-content/50">Force</span>
+                    <input
+                      type="checkbox"
+                      class="checkbox checkbox-xs"
+                      checked={@scan_force}
+                      phx-click="toggle_scan_force"
+                    />
+                  </label>
                   <button class="btn btn-ghost btn-xs" phx-click="scan_metrics">Scan</button>
                   <button
                     class="btn btn-ghost btn-xs"
                     phx-click="select_black_videos"
-                    title="Select videos with avg brightness < 15 (night recordings)"
+                    title="Select videos with 0 detections"
                   >
-                    Select dark
+                    Select empty
                   </button>
                 <% end %>
               </div>
@@ -722,8 +1900,8 @@ defmodule NaturecountsWeb.VideosLive do
 
             <%!-- File listing --%>
             <div class="overflow-y-auto max-h-80">
-              <%= if Enum.empty?(@entries) do %>
-                <p class="text-base-content/50 italic text-sm">No video files in this directory.</p>
+              <%= if Enum.empty?(@visible) do %>
+                <p class="text-base-content/50 italic text-sm">No video files match filters.</p>
               <% else %>
                 <table class="table table-sm">
                   <thead>
@@ -741,7 +1919,7 @@ defmodule NaturecountsWeb.VideosLive do
                     </tr>
                   </thead>
                   <tbody>
-                    <%= for entry <- @entries do %>
+                    <%= for entry <- @visible do %>
                       <%= if entry.type == :dir do %>
                         <tr
                           class="hover cursor-pointer"
@@ -795,7 +1973,7 @@ defmodule NaturecountsWeb.VideosLive do
                           <td class="text-sm text-base-content/60 whitespace-nowrap">{entry.size_mb} MB</td>
                           <td class="text-xs font-mono text-base-content/50">
                             <%= if entry.metrics && !entry.metrics["error"] do %>
-                              <span class="flex items-center gap-1" title={"brightness: #{entry.metrics["avg_brightness"] || "?"}/255, #{entry.metrics["bbox_areas"]["count"]} bboxes, #{entry.metrics["duration_s"]}s"}>
+                              <span class="flex items-center gap-1" title={"brightness: #{entry.metrics["avg_brightness"] || "?"}/255, #{get_in(entry.metrics, ["bbox_areas", "count"]) || 0} bboxes, #{entry.metrics["duration_s"]}s"}>
                                 <%= if is_number(entry.metrics["avg_brightness"]) and entry.metrics["avg_brightness"] < 15 do %>
                                   <span class="w-2 h-2 rounded-full bg-black border border-base-content/20 shrink-0" title="Dark video" />
                                 <% end %>
@@ -1004,7 +2182,14 @@ defmodule NaturecountsWeb.VideosLive do
         <%!-- Job queue --%>
         <div class="card bg-base-200">
           <div class="card-body">
-            <h2 class="card-title text-lg">Processing Queue</h2>
+            <div class="flex items-center justify-between">
+              <h2 class="card-title text-lg">Processing Queue</h2>
+              <button
+                class="btn btn-ghost btn-xs text-warning"
+                phx-click="clean_orphans"
+                data-confirm="Remove all video records whose files no longer exist on disk?"
+              >Clean orphans</button>
+            </div>
             <div class="overflow-y-auto max-h-96">
               <%= if Enum.empty?(@jobs) do %>
                 <p class="text-base-content/50 italic">No videos processed yet.</p>

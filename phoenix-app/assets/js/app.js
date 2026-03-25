@@ -34,11 +34,26 @@ import { createPlayerHook } from "membrane_webrtc_plugin"
 const iceServers = [{ urls: "stun:stun.l.google.com:19302" }]
 const Player = createPlayerHook(iceServers)
 
+const InfiniteScroll = {
+  mounted() {
+    this.observer = new IntersectionObserver((entries) => {
+      const entry = entries[0]
+      if (entry.isIntersecting) {
+        this.pushEvent("load_more_metrics", {})
+      }
+    }, { rootMargin: "200px" })
+    this.observer.observe(this.el)
+  },
+  destroyed() {
+    this.observer.disconnect()
+  }
+}
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, Player},
+  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, Player, InfiniteScroll},
 })
 
 // Show progress bar on live navigation and form submits

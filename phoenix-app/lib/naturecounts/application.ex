@@ -30,6 +30,7 @@ defmodule Naturecounts.Application do
     children = [
       NaturecountsWeb.Telemetry,
       Naturecounts.Repo,
+      Naturecounts.Cache,
       {DNSCluster, query: Application.get_env(:naturecounts, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Naturecounts.PubSub},
       NaturecountsWeb.Presence,

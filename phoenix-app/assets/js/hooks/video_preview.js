@@ -41,6 +41,13 @@ const VideoPreview = {
       this._label.title = filename;
       this._label.textContent = filename;
     });
+
+    this.handleEvent("seek", ({ time }) => {
+      if (this._video) {
+        this._video.currentTime = time;
+        this._video.play();
+      }
+    });
   },
 
   _clear() {

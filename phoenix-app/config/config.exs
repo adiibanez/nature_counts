@@ -25,7 +25,7 @@ config :naturecounts, Naturecounts.Repo,
 
 config :naturecounts, Oban,
   repo: Naturecounts.Repo,
-  queues: [video_processing: 1]
+  queues: [video_processing: 1, scanning: 8]
 
 config :pythonx, :uv_init,
   pyproject_toml: """

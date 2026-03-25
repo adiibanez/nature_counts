@@ -231,6 +231,8 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
     })
     |> Repo.update!()
 
+    Naturecounts.Cache.invalidate_all()
+
     Phoenix.PubSub.broadcast(
       Naturecounts.PubSub,
       "video:#{video.id}",

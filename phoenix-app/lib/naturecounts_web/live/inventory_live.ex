@@ -100,7 +100,7 @@ defmodule NaturecountsWeb.InventoryLive do
   end
 
   def handle_event("print_mode", _params, socket) do
-    tracks = load_recent_tracks(filters(socket), sort: :species, include_thumbnail: true, limit: nil)
+    tracks = load_recent_tracks(filters(socket), sort: :species, limit: nil)
     {:noreply, assign(socket, print_mode: true, recent_tracks: tracks)}
   end
 
@@ -123,6 +123,8 @@ defmodule NaturecountsWeb.InventoryLive do
     track
     |> Ecto.Changeset.change(changes)
     |> Repo.update!()
+
+    Naturecounts.Cache.invalidate_group(:inventory)
   end
 
   defp reload(socket) do
@@ -137,17 +139,19 @@ defmodule NaturecountsWeb.InventoryLive do
   defp format_confidence(f) when is_float(f), do: Float.round(f, 2) |> to_string()
 
   defp load_species_summary do
-    Track
-    |> where([t], (t.vlm_classified == true or not is_nil(t.classifier_source)) and not is_nil(t.species) and t.species != "unidentified")
-    |> group_by([t], t.species)
-    |> select([t], %{
-      species: t.species,
-      count: count(t.id),
-      avg_confidence: avg(t.best_confidence),
-      total_frames: sum(t.frame_count)
-    })
-    |> order_by([t], desc: count(t.id))
-    |> Repo.all()
+    Naturecounts.Cache.get_or_compute(:species_summary, fn ->
+      Track
+      |> where([t], (t.vlm_classified == true or not is_nil(t.classifier_source)) and not is_nil(t.species) and t.species != "unidentified")
+      |> group_by([t], t.species)
+      |> select([t], %{
+        species: t.species,
+        count: count(t.id),
+        avg_confidence: avg(t.best_confidence),
+        total_frames: sum(t.frame_count)
+      })
+      |> order_by([t], desc: count(t.id))
+      |> Repo.all()
+    end, ttl: 30_000, group: :inventory)
   end
 
   defp load_recent_tracks(filter_map \\ %{}, opts \\ []) do
@@ -159,12 +163,21 @@ defmodule NaturecountsWeb.InventoryLive do
 
     max_rows = Keyword.get(opts, :limit, @default_limit)
     sort = Keyword.get(opts, :sort, :recent)
-    include_thumbnail = Keyword.get(opts, :include_thumbnail, false)
 
     query =
       Track
       |> join(:inner, [t], v in Video, on: t.video_id == v.id)
       |> where([t], t.vlm_classified == true or not is_nil(t.classifier_source))
+      |> select([t, v], %{
+        id: t.id, track_id: t.track_id, species: t.species,
+        scientific_name: t.scientific_name, species_confidence: t.species_confidence,
+        best_confidence: t.best_confidence, best_bbox_area: t.best_bbox_area,
+        frame_count: t.frame_count, vlm_reasoning: t.vlm_reasoning,
+        video_filename: v.filename, has_thumbnail: not is_nil(t.thumbnail),
+        thumbnail: t.thumbnail, review_status: t.review_status,
+        reviewed_at: t.reviewed_at, expires_at: t.expires_at,
+        classifier_source: t.classifier_source, inserted_at: t.inserted_at
+      })
 
     query =
       case sort do
@@ -173,33 +186,6 @@ defmodule NaturecountsWeb.InventoryLive do
       end
 
     query = if max_rows, do: limit(query, ^max_rows), else: query
-
-    query =
-      if include_thumbnail do
-        query
-        |> select([t, v], %{
-          id: t.id, track_id: t.track_id, species: t.species,
-          scientific_name: t.scientific_name, species_confidence: t.species_confidence,
-          best_confidence: t.best_confidence, best_bbox_area: t.best_bbox_area,
-          frame_count: t.frame_count, vlm_reasoning: t.vlm_reasoning,
-          video_filename: v.filename, has_thumbnail: not is_nil(t.thumbnail),
-          thumbnail: t.thumbnail, review_status: t.review_status,
-          reviewed_at: t.reviewed_at, expires_at: t.expires_at,
-          classifier_source: t.classifier_source, inserted_at: t.inserted_at
-        })
-      else
-        query
-        |> select([t, v], %{
-          id: t.id, track_id: t.track_id, species: t.species,
-          scientific_name: t.scientific_name, species_confidence: t.species_confidence,
-          best_confidence: t.best_confidence, best_bbox_area: t.best_bbox_area,
-          frame_count: t.frame_count, vlm_reasoning: t.vlm_reasoning,
-          video_filename: v.filename, has_thumbnail: not is_nil(t.thumbnail),
-          review_status: t.review_status, reviewed_at: t.reviewed_at,
-          expires_at: t.expires_at, classifier_source: t.classifier_source,
-          inserted_at: t.inserted_at
-        })
-      end
 
     query = if species_filter, do: where(query, [t], t.species == ^species_filter), else: query
     query = if review_filter, do: where(query, [t], t.review_status == ^review_filter), else: query
@@ -233,7 +219,7 @@ defmodule NaturecountsWeb.InventoryLive do
       image_url =
         cond do
           crop_url -> crop_url
-          include_thumbnail && track.thumbnail -> "data:image/jpeg;base64,#{Base.encode64(track.thumbnail)}"
+          track.thumbnail -> "data:image/jpeg;base64,#{Base.encode64(track.thumbnail)}"
           true -> nil
         end
 
@@ -250,33 +236,37 @@ defmodule NaturecountsWeb.InventoryLive do
   defp age_cutoff(_), do: nil
 
   defp load_video_files do
-    Video
-    |> where([v], v.status == "completed")
-    |> select([v], v.filename)
-    |> order_by([v], desc: v.inserted_at)
-    |> Repo.all()
+    Naturecounts.Cache.get_or_compute(:video_files, fn ->
+      Video
+      |> where([v], v.status == "completed")
+      |> select([v], v.filename)
+      |> order_by([v], desc: v.inserted_at)
+      |> Repo.all()
+    end, ttl: 30_000, group: :inventory)
   end
 
   defp compute_stats do
-    track_stats =
-      Repo.one(
-        from t in Track,
-          select: %{
-            total_tracks: count(t.id),
-            vlm_classified: count(fragment("CASE WHEN ? = true OR ? IS NOT NULL THEN 1 END", t.vlm_classified, t.classifier_source)),
-            fishial_classified: count(fragment("CASE WHEN ? = 'fishial' THEN 1 END", t.classifier_source)),
-            unique_species: fragment(
-              "COUNT(DISTINCT CASE WHEN (? = true OR ? IS NOT NULL) AND ? != 'unidentified' AND ? != 'discarded' THEN ? END)",
-              t.vlm_classified, t.classifier_source, t.species, t.review_status, t.species
-            ),
-            kept: count(fragment("CASE WHEN ? = 'kept' THEN 1 END", t.review_status)),
-            pending_review: count(fragment("CASE WHEN (? = true OR ? IS NOT NULL) AND ? = 'pending' THEN 1 END", t.vlm_classified, t.classifier_source, t.review_status))
-          }
-      )
+    Naturecounts.Cache.get_or_compute(:inventory_stats, fn ->
+      track_stats =
+        Repo.one(
+          from t in Track,
+            select: %{
+              total_tracks: count(t.id),
+              vlm_classified: count(fragment("CASE WHEN ? = true OR ? IS NOT NULL THEN 1 END", t.vlm_classified, t.classifier_source)),
+              fishial_classified: count(fragment("CASE WHEN ? = 'fishial' THEN 1 END", t.classifier_source)),
+              unique_species: fragment(
+                "COUNT(DISTINCT CASE WHEN (? = true OR ? IS NOT NULL) AND ? != 'unidentified' AND ? != 'discarded' THEN ? END)",
+                t.vlm_classified, t.classifier_source, t.species, t.review_status, t.species
+              ),
+              kept: count(fragment("CASE WHEN ? = 'kept' THEN 1 END", t.review_status)),
+              pending_review: count(fragment("CASE WHEN (? = true OR ? IS NOT NULL) AND ? = 'pending' THEN 1 END", t.vlm_classified, t.classifier_source, t.review_status))
+            }
+        )
 
-    total_videos = Repo.one(from v in Video, where: v.status == "completed", select: count()) || 0
+      total_videos = Repo.one(from v in Video, where: v.status == "completed", select: count()) || 0
 
-    Map.put(track_stats, :total_videos, total_videos)
+      Map.put(track_stats, :total_videos, total_videos)
+    end, ttl: 30_000, group: :inventory)
   end
 
   @impl true
