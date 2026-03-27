@@ -358,11 +358,6 @@ defmodule NaturecountsWeb.CameraLive do
               <div class="stat-value text-secondary text-lg">{@total_tracks}</div>
             </div>
           </div>
-          <%= if @use_membrane do %>
-            <span class="badge badge-success badge-sm">Membrane</span>
-          <% else %>
-            <span class="badge badge-warning badge-sm">MediaMTX</span>
-          <% end %>
         </div>
         <button
           class="btn btn-ghost btn-xs gap-1"
@@ -473,11 +468,10 @@ defmodule NaturecountsWeb.CameraLive do
                 <span class="badge badge-xs badge-neutral">{@tracker_presets[@tracker_preset].label}</span>
               </div>
               <div class="flex flex-wrap items-end gap-4">
-                <div class="form-control">
+                <form class="form-control" phx-change="select_tracker_preset">
                   <label class="label py-0"><span class="label-text text-xs">Preset</span></label>
                   <select
                     class="select select-bordered select-xs w-56"
-                    phx-change="select_tracker_preset"
                     name="preset"
                   >
                     <option
@@ -488,7 +482,7 @@ defmodule NaturecountsWeb.CameraLive do
                       {info.label}
                     </option>
                   </select>
-                </div>
+                </form>
 
                 <.tracker_slider
                   label="Min Detector Confidence"
@@ -514,19 +508,17 @@ defmodule NaturecountsWeb.CameraLive do
                   value={@tracker_params["minTrackerConfidence"]}
                   min="0" max="1" step="0.05"
                 />
-                <div class="form-control">
+                <form class="form-control" phx-change="update_tracker_param">
                   <label class="label py-0"><span class="label-text text-xs">Matcher</span></label>
+                  <input type="hidden" name="param" value="associationMatcherType" />
                   <select
                     class="select select-bordered select-xs w-28"
-                    phx-change="update_tracker_param"
                     name="value"
-                    data-param="associationMatcherType"
-                    phx-value-param="associationMatcherType"
                   >
                     <option value="0" selected={@tracker_params["associationMatcherType"] == 0}>Greedy</option>
                     <option value="1" selected={@tracker_params["associationMatcherType"] == 1}>Global</option>
                   </select>
-                </div>
+                </form>
 
                 <%= if @tracker_has_visual do %>
                   <.tracker_slider
@@ -541,19 +533,18 @@ defmodule NaturecountsWeb.CameraLive do
                     value={@tracker_params["processNoiseVar4Vel"]}
                     min="0.01" max="1.0" step="0.01"
                   />
-                  <div class="form-control">
+                  <form class="form-control" phx-change="update_tracker_param">
                     <label class="label py-0"><span class="label-text text-xs">Feature Size</span></label>
+                    <input type="hidden" name="param" value="featureImgSizeLevel" />
                     <select
                       class="select select-bordered select-xs w-20"
-                      phx-change="update_tracker_param"
                       name="value"
-                      phx-value-param="featureImgSizeLevel"
                     >
                       <option :for={n <- 1..5} value={n} selected={@tracker_params["featureImgSizeLevel"] == n}>
                         {n}
                       </option>
                     </select>
-                  </div>
+                  </form>
                 <% end %>
 
                 <button

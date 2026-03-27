@@ -213,7 +213,7 @@ defmodule Naturecounts.Offline.MetricsScanner do
     force = Keyword.get(opts, :force, false)
     batch_files = Keyword.get(opts, :batch_files, [])
     batch_id = Keyword.get(opts, :batch_id, "0")
-    progress_callback = Keyword.get(opts, :progress_callback)
+    _progress_callback = Keyword.get(opts, :progress_callback)
 
     # Get filenames already fully processed in DB — skip these
     processed_filenames =

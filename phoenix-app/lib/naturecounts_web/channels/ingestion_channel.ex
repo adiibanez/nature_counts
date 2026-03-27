@@ -10,7 +10,15 @@ defmodule NaturecountsWeb.IngestionChannel do
   def join("ingestion:lobby", _params, socket) do
     Logger.info("DeepStream pipeline joined ingestion:lobby")
     Phoenix.PubSub.subscribe(Naturecounts.PubSub, "pipeline:control")
+    Phoenix.PubSub.broadcast(Naturecounts.PubSub, "deepstream:connection", {:deepstream_connected, true})
     {:ok, socket}
+  end
+
+  @impl true
+  def terminate(_reason, _socket) do
+    Logger.info("DeepStream pipeline left ingestion:lobby")
+    Phoenix.PubSub.broadcast(Naturecounts.PubSub, "deepstream:connection", {:deepstream_connected, false})
+    :ok
   end
 
   @impl true

@@ -3,8 +3,7 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
 
   alias Naturecounts.Repo
   alias Naturecounts.Offline.{Video, Track, Profiles, PythonBridge, Classifier, FishialClassifier}
-
-  import Ecto.Query
+  alias Naturecounts.Storage.{GCSBuckets, GCSCache}
 
   require Logger
 
@@ -27,6 +26,30 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
     update_video(video, "processing", 0, "Initializing...")
 
     try do
+      # Stage 0: Ensure video is local (download from GCS if needed)
+      local_path =
+        if Video.gcs?(video) do
+          update_video(video, "processing", 0, "Downloading from GCS...")
+          bucket_config = GCSBuckets.get(video.gcs_bucket)
+
+          if bucket_config == nil do
+            raise "GCS bucket config '#{video.gcs_bucket}' not found"
+          end
+
+          Logger.info("[ProcessVideo] Downloading GCS video: #{bucket_config["bucket"]}/#{video.path}")
+
+          case GCSCache.ensure_local(bucket_config, video.path) do
+            {:ok, path} ->
+              Logger.info("[ProcessVideo] GCS download complete: #{path}")
+              path
+
+            {:error, reason} ->
+              raise "GCS download failed: #{reason}"
+          end
+        else
+          video.path
+        end
+
       # Stage 1: Detection + tracking (0-59%)
       update_video(video, "processing", 0, "Loading YOLO model...")
 
@@ -37,7 +60,7 @@ defmodule Naturecounts.Offline.ProcessVideoWorker do
         update_video(video, "processing", scaled_pct, msg)
       end
 
-      case PythonBridge.run(video.path, profile, progress_callback: progress_callback) do
+      case PythonBridge.run(local_path, profile, progress_callback: progress_callback) do
         {:ok, tracks} ->
           Logger.info("[ProcessVideo] Detection complete: #{length(tracks)} tracks")
 

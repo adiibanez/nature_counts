@@ -3,38 +3,50 @@ const CropZoom = {
     const img = this.el.querySelector("img")
     if (!img) return
 
-    let zoomed = null
+    this.el.addEventListener("click", () => {
+      // Create modal overlay
+      const overlay = document.createElement("div")
+      Object.assign(overlay.style, {
+        position: "fixed",
+        inset: "0",
+        zIndex: "1000",
+        backgroundColor: "rgba(0,0,0,0.8)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        opacity: "0",
+        transition: "opacity 150ms ease-out",
+      })
 
-    this.el.addEventListener("mouseenter", () => {
-      const rect = img.getBoundingClientRect()
-
-      zoomed = img.cloneNode(true)
+      const zoomed = img.cloneNode(true)
       zoomed.className = ""
       Object.assign(zoomed.style, {
-        position: "fixed",
-        left: `${rect.left + rect.width / 2}px`,
-        top: `${rect.top + rect.height / 2}px`,
-        transform: "translate(-50%, -50%)",
-        width: `${rect.width * 3}px`,
-        height: `${rect.height * 3}px`,
+        maxWidth: "90vw",
+        maxHeight: "90vh",
         objectFit: "contain",
-        zIndex: "100",
-        pointerEvents: "none",
         borderRadius: "0.5rem",
         boxShadow: "0 25px 50px -12px rgba(0,0,0,0.5)",
-        transition: "opacity 150ms ease-out",
-        opacity: "0",
       })
-      document.body.appendChild(zoomed)
-      // trigger transition
-      requestAnimationFrame(() => { if (zoomed) zoomed.style.opacity = "1" })
-    })
 
-    this.el.addEventListener("mouseleave", () => {
-      if (zoomed) {
-        zoomed.remove()
-        zoomed = null
+      overlay.appendChild(zoomed)
+      document.body.appendChild(overlay)
+
+      // Close on click or Escape
+      const close = () => {
+        overlay.style.opacity = "0"
+        setTimeout(() => overlay.remove(), 150)
       }
+      overlay.addEventListener("click", close)
+      const onKey = (e) => {
+        if (e.key === "Escape") {
+          close()
+          document.removeEventListener("keydown", onKey)
+        }
+      }
+      document.addEventListener("keydown", onKey)
+
+      requestAnimationFrame(() => { overlay.style.opacity = "1" })
     })
   },
 }

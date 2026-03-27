@@ -40,6 +40,31 @@ defmodule NaturecountsWeb.VideoController do
     end
   end
 
+  def show_gcs(conn, %{"path" => path_segments}) do
+    object_path = Path.join(path_segments)
+    bucket_id = conn.params["bucket_id"] || ""
+
+    if bucket_id == "" do
+      send_resp(conn, 400, "Missing bucket_id parameter")
+    else
+      case Naturecounts.Storage.GCSBuckets.get(bucket_id) do
+        nil ->
+          send_resp(conn, 404, "Bucket config not found")
+
+        bucket_config ->
+          case Naturecounts.Storage.GCS.signed_url(bucket_config, object_path) do
+            {:ok, url} ->
+              conn
+              |> put_resp_header("cache-control", "private, max-age=3500")
+              |> redirect(external: url)
+
+            {:error, reason} ->
+              send_resp(conn, 502, "GCS error: #{reason}")
+          end
+      end
+    end
+  end
+
   defp parse_range(spec, file_size) do
     case String.split(spec, "-", parts: 2) do
       [start_str, ""] ->

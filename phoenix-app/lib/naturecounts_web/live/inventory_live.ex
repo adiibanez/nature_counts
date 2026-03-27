@@ -154,7 +154,7 @@ defmodule NaturecountsWeb.InventoryLive do
     end, ttl: 30_000, group: :inventory)
   end
 
-  defp load_recent_tracks(filter_map \\ %{}, opts \\ []) do
+  defp load_recent_tracks(filter_map, opts) do
     species_filter = filter_map[:filter_species]
     review_filter = filter_map[:filter_review]
     file_filter = filter_map[:filter_file]
@@ -560,7 +560,7 @@ defmodule NaturecountsWeb.InventoryLive do
                       <div class="relative group w-full h-full" phx-hook="CropZoom" id={"crop-#{track.id}"}>
                         <img
                           src={track.crop_url}
-                          class="w-full h-full object-contain cursor-zoom-in"
+                          class="w-full h-full object-contain cursor-pointer"
                         />
                       </div>
                     <% else %>

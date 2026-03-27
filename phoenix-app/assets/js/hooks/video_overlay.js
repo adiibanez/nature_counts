@@ -268,7 +268,7 @@ const VideoOverlay = {
   async _startWebRTC(video, webrtcUrl, camId) {
     try {
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        iceServers: [],
       });
 
       pc.addTransceiver("video", { direction: "recvonly" });
@@ -294,18 +294,8 @@ const VideoOverlay = {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering to complete
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === "complete") {
-          resolve();
-        } else {
-          pc.onicegatheringstatechange = () => {
-            if (pc.iceGatheringState === "complete") resolve();
-          };
-          setTimeout(resolve, 3000);
-        }
-      });
-
+      // Send the offer immediately — no need to wait for ICE gathering on local networks.
+      // MediaMTX handles candidates in the SDP just fine with what's available.
       const response = await fetch(webrtcUrl, {
         method: "POST",
         headers: { "Content-Type": "application/sdp" },

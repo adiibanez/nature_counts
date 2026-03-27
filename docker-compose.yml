@@ -113,9 +113,11 @@ services:
       VLM_MODEL: "${VLM_MODEL:-claude-sonnet-4-6}"
       YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
       FISHIAL_MODEL_DIR: "/models/fishial"
+      DEEPSTREAM_CONTAINER_NAME: "2022_naturecounts-deepstream-1"
     volumes:
       - ./videos:/videos
       - ./deepstream-app-fish:/models
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy

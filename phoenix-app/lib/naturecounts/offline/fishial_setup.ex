@@ -6,14 +6,11 @@ defmodule Naturecounts.Offline.FishialSetup do
   require Logger
 
   @model_dir "/models/fishial"
-  @labels_file "labels.json"
 
   @model_zip_url "https://storage.googleapis.com/fishial-ml-resources/classification_model_v0.10.zip"
-  @labels_url "https://raw.githubusercontent.com/fishial/fish-identification/main/labels.json"
 
   def ensure_model do
     model_dir = model_dir()
-    labels_path = Path.join(model_dir, @labels_file)
 
     # Try to create dir — may fail on read-only volumes
     case File.mkdir_p(model_dir) do
@@ -60,21 +57,6 @@ defmodule Naturecounts.Offline.FishialSetup do
       File.exists?(Path.join(model_dir, "inference.py"))
   end
 
-  defp download_labels(dest) do
-    Logger.info("[FishialSetup] Downloading labels.json...")
-
-    case Req.get(@labels_url, receive_timeout: 30_000) do
-      {:ok, %{status: 200, body: body}} ->
-        File.write!(dest, body)
-        Logger.info("[FishialSetup] Labels saved to #{dest}")
-
-      {:ok, %{status: status}} ->
-        Logger.warning("[FishialSetup] Failed to download labels (HTTP #{status})")
-
-      {:error, reason} ->
-        Logger.warning("[FishialSetup] Failed to download labels: #{inspect(reason)}")
-    end
-  end
 
   defp download_model(model_dir) do
     Logger.info("[FishialSetup] Downloading model from #{@model_zip_url}...")

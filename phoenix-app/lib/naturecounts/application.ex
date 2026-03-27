@@ -27,18 +27,20 @@ defmodule Naturecounts.Application do
       end
     end)
 
-    children = [
-      NaturecountsWeb.Telemetry,
-      Naturecounts.Repo,
-      Naturecounts.Cache,
-      {DNSCluster, query: Application.get_env(:naturecounts, :dns_cluster_query) || :ignore},
-      {Phoenix.PubSub, name: Naturecounts.PubSub},
-      NaturecountsWeb.Presence,
-      Naturecounts.Detection.TrackerState,
-      Naturecounts.Pipeline.PipelineManager,
-      {Oban, Application.fetch_env!(:naturecounts, Oban)},
-      NaturecountsWeb.Endpoint
-    ]
+    children =
+      [
+        NaturecountsWeb.Telemetry,
+        Naturecounts.Repo,
+        Naturecounts.Cache,
+        {DNSCluster, query: Application.get_env(:naturecounts, :dns_cluster_query) || :ignore},
+        {Phoenix.PubSub, name: Naturecounts.PubSub},
+        NaturecountsWeb.Presence,
+        Naturecounts.Detection.TrackerState,
+        Naturecounts.Pipeline.PipelineManager,
+        Naturecounts.Pipeline.DeepstreamControl,
+        {Oban, Application.fetch_env!(:naturecounts, Oban)},
+        NaturecountsWeb.Endpoint
+      ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -46,8 +48,6 @@ defmodule Naturecounts.Application do
     Supervisor.start_link(children, opts)
   end
 
-  # Tell Phoenix to update the endpoint configuration
-  # whenever the application is updated.
   @impl true
   def config_change(changed, _new, removed) do
     NaturecountsWeb.Endpoint.config_change(changed, removed)

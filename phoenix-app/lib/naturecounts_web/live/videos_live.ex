@@ -3,6 +3,7 @@ defmodule NaturecountsWeb.VideosLive do
 
   alias Naturecounts.Repo
   alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker, VlmContexts}
+  alias Naturecounts.Storage.{GCS, GCSBuckets}
 
   import Ecto.Query
 
@@ -17,9 +18,9 @@ defmodule NaturecountsWeb.VideosLive do
       Phoenix.PubSub.subscribe(Naturecounts.PubSub, "scan:progress")
     end
 
+    if connected?(socket), do: send(self(), {:load_dir, @videos_root})
+
     jobs = list_jobs()
-    processed_files = load_processed_files()
-    entries = list_dir(@videos_root, processed_files)
 
     default_profile = Profiles.get("standard")
 
@@ -28,8 +29,8 @@ defmodule NaturecountsWeb.VideosLive do
        page_title: "Video Processing",
        current_dir: @videos_root,
        breadcrumbs: [],
-       entries: entries,
-       processed_files: processed_files,
+       entries: :loading,
+       processed_files: %{},
        jobs: jobs,
        selected_file: nil,
        preview_url: nil,
@@ -58,17 +59,52 @@ defmodule NaturecountsWeb.VideosLive do
        scatter_x: "brightness",
        scatter_y: "det",
        temporal_y: "det",
-       metrics_limit: 50
+       metrics_limit: 50,
+       source: "local",
+       gcs_buckets: GCSBuckets.list_safe(),
+       selected_bucket: nil,
+       gcs_prefix: "",
+       adding_bucket: false,
+       editing_bucket: nil,
+       new_bucket_name: "",
+       new_bucket_id: "",
+       new_bucket_prefix: "",
+       new_bucket_creds: "",
+       bucket_test_result: nil
      )}
   end
 
   @impl true
+  def handle_info({:load_dir, dir}, socket) do
+    processed_files = load_processed_files()
+
+    entries =
+      case socket.assigns.source do
+        "gcs" -> list_dir_gcs(socket.assigns.selected_bucket, socket.assigns.gcs_prefix, processed_files)
+        _ -> list_dir(dir, processed_files)
+      end
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    {:noreply, assign(socket, entries: entries, processed_files: processed_files)}
+  end
+
+  def handle_info({:load_gcs, bucket_id, prefix}, socket) do
+    processed_files = load_processed_files()
+
+    entries =
+      list_dir_gcs(bucket_id, prefix, processed_files)
+      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+
+    {:noreply, assign(socket, entries: entries, processed_files: processed_files)}
+  end
+
   def handle_info({:scan_progress, _directory, progress}, socket) do
     {:noreply, assign(socket, scanning: true, scan_progress: progress)}
   end
 
   def handle_info({:scan_batch_complete, _directory, _batch_id, _result}, socket) do
     # Reload entries to pick up new metrics from this batch
+    Naturecounts.Cache.invalidate_group(:file_browser)
     processed_files = load_processed_files()
     entries =
       list_dir(socket.assigns.current_dir, processed_files)
@@ -84,6 +120,7 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_info({:scan_complete, _directory}, socket) do
+    Naturecounts.Cache.invalidate_group(:file_browser)
     processed_files = load_processed_files()
     entries =
       list_dir(socket.assigns.current_dir, processed_files)
@@ -106,6 +143,7 @@ defmodule NaturecountsWeb.VideosLive do
     cond do
       # Scan just finished — reload entries to pick up new metrics
       was_scanning and not scanning ->
+        Naturecounts.Cache.invalidate_group(:file_browser)
         processed_files = load_processed_files()
         entries =
           list_dir(socket.assigns.current_dir, processed_files)
@@ -127,33 +165,272 @@ defmodule NaturecountsWeb.VideosLive do
 
   @impl true
   def handle_event("navigate_dir", %{"path" => path}, socket) do
-    safe_path = safe_resolve(path)
-    entries =
-      list_dir(safe_path, socket.assigns.processed_files)
-      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
-    breadcrumbs = build_breadcrumbs(safe_path)
+    case socket.assigns.source do
+      "gcs" ->
+        prefix = path
+        send(self(), {:load_gcs, socket.assigns.selected_bucket, prefix})
+
+        {:noreply,
+         socket
+         |> assign(
+           gcs_prefix: prefix,
+           entries: :loading,
+           selected_file: nil,
+           preview_url: nil,
+           selected_files: MapSet.new()
+         )
+         |> push_event("preview", %{url: nil, filename: nil})}
+
+      _ ->
+        safe_path = safe_resolve(path)
+        breadcrumbs = build_breadcrumbs(safe_path)
+        send(self(), {:load_dir, safe_path})
+
+        {:noreply,
+         socket
+         |> assign(
+           current_dir: safe_path,
+           breadcrumbs: breadcrumbs,
+           entries: :loading,
+           selected_file: nil,
+           preview_url: nil,
+           selected_files: MapSet.new()
+         )
+         |> push_event("preview", %{url: nil, filename: nil})}
+    end
+  end
+
+  def handle_event("switch_source", %{"source" => "gcs"}, socket) do
+    buckets = GCSBuckets.list_safe()
+    first = List.first(buckets)
+
+    if first do
+      send(self(), {:load_gcs, first["id"], first["prefix"] || ""})
+
+      {:noreply,
+       assign(socket,
+         source: "gcs",
+         selected_bucket: first["id"],
+         gcs_prefix: first["prefix"] || "",
+         entries: :loading,
+         selected_file: nil,
+         preview_url: nil,
+         selected_files: MapSet.new(),
+         gcs_buckets: buckets
+       )}
+    else
+      {:noreply, assign(socket, source: "gcs", adding_bucket: true, gcs_buckets: buckets)}
+    end
+  end
+
+  def handle_event("switch_source", %{"source" => "local"}, socket) do
+    send(self(), {:load_dir, @videos_root})
 
     {:noreply,
-     socket
-     |> assign(
-       current_dir: safe_path,
-       breadcrumbs: breadcrumbs,
-       entries: entries,
+     assign(socket,
+       source: "local",
+       current_dir: @videos_root,
+       breadcrumbs: [],
+       entries: :loading,
        selected_file: nil,
        preview_url: nil,
        selected_files: MapSet.new()
-     )
-     |> push_event("preview", %{url: nil, filename: nil})}
+     )}
+  end
+
+  def handle_event("select_bucket", %{"id" => id}, socket) do
+    case GCSBuckets.get(id) do
+      nil ->
+        {:noreply, socket}
+
+      bucket ->
+        prefix = bucket["prefix"] || ""
+        send(self(), {:load_gcs, id, prefix})
+
+        {:noreply,
+         assign(socket,
+           selected_bucket: id,
+           gcs_prefix: prefix,
+           entries: :loading,
+           selected_file: nil,
+           preview_url: nil,
+           selected_files: MapSet.new()
+         )}
+    end
+  end
+
+  def handle_event("toggle_add_bucket", _params, socket) do
+    {:noreply,
+     assign(socket,
+       adding_bucket: !socket.assigns.adding_bucket,
+       editing_bucket: nil,
+       new_bucket_name: "",
+       new_bucket_id: "",
+       new_bucket_prefix: "",
+       new_bucket_creds: "",
+       bucket_test_result: nil
+     )}
+  end
+
+  def handle_event("edit_bucket", %{"id" => id}, socket) do
+    case GCSBuckets.get_safe(id) do
+      nil ->
+        {:noreply, socket}
+
+      b ->
+        {:noreply,
+         assign(socket,
+           adding_bucket: true,
+           editing_bucket: id,
+           new_bucket_name: b["name"],
+           new_bucket_id: b["bucket"],
+           new_bucket_prefix: b["prefix"] || "",
+           new_bucket_creds: "",
+           bucket_test_result: nil
+         )}
+    end
+  end
+
+
+  def handle_event("save_bucket", %{"action" => "test"} = params, socket) do
+    bucket = params["bucket"] || ""
+    creds_json = params["credentials"] || ""
+
+    cond do
+      bucket == "" ->
+        {:noreply, assign(socket, bucket_test_result: {:error, "Bucket ID is required"})}
+
+      creds_json == "" and socket.assigns.editing_bucket != nil ->
+        bucket_config = GCSBuckets.get(socket.assigns.editing_bucket)
+
+        if bucket_config do
+          test_config = Map.put(bucket_config, "bucket", bucket)
+          result = GCS.test_connection(test_config)
+          {:noreply, assign(socket, bucket_test_result: result)}
+        else
+          {:noreply, assign(socket, bucket_test_result: {:error, "No existing credentials"})}
+        end
+
+      creds_json == "" ->
+        {:noreply, assign(socket, bucket_test_result: {:error, "Paste service account JSON first"})}
+
+      true ->
+        case Jason.decode(creds_json) do
+          {:ok, creds} ->
+            test_config = %{"bucket" => bucket, "credentials" => creds}
+            result = GCS.test_connection(test_config)
+            {:noreply, assign(socket, bucket_test_result: result)}
+
+          {:error, _} ->
+            {:noreply, assign(socket, bucket_test_result: {:error, "Invalid JSON"})}
+        end
+    end
+  end
+
+  def handle_event("save_bucket", params, socket) do
+    name = params["name"] || ""
+    bucket = params["bucket"] || ""
+    prefix = params["prefix"] || ""
+    creds_json = params["credentials"] || ""
+
+    if name != "" and bucket != "" do
+      case socket.assigns.editing_bucket do
+        nil ->
+          if creds_json == "" do
+            {:noreply, put_flash(socket, :error, "Service account JSON is required")}
+          else
+            GCSBuckets.add(name, bucket, prefix, creds_json)
+            buckets = GCSBuckets.list_safe()
+            added = List.last(buckets)
+
+            send(self(), {:load_gcs, added["id"], added["prefix"] || ""})
+
+            {:noreply,
+             assign(socket,
+               gcs_buckets: buckets,
+               selected_bucket: added["id"],
+               gcs_prefix: added["prefix"] || "",
+               adding_bucket: false,
+               entries: :loading,
+               new_bucket_name: "",
+               new_bucket_id: "",
+               new_bucket_prefix: "",
+               new_bucket_creds: "",
+               bucket_test_result: nil
+             )}
+          end
+
+        id ->
+          GCSBuckets.update(id, %{
+            "name" => name,
+            "bucket" => bucket,
+            "prefix" => prefix,
+            "credentials_json" => creds_json
+          })
+
+          buckets = GCSBuckets.list_safe()
+
+          {:noreply,
+           assign(socket,
+             gcs_buckets: buckets,
+             editing_bucket: nil,
+             adding_bucket: false,
+             new_bucket_name: "",
+             new_bucket_id: "",
+             new_bucket_prefix: "",
+             new_bucket_creds: "",
+             bucket_test_result: nil
+           )}
+      end
+    else
+      {:noreply, put_flash(socket, :error, "Name and bucket ID are required")}
+    end
+  end
+
+  def handle_event("delete_bucket", %{"id" => id}, socket) do
+    GCSBuckets.delete(id)
+    buckets = GCSBuckets.list_safe()
+    first = List.first(buckets)
+
+    socket = assign(socket, gcs_buckets: buckets)
+
+    if first do
+      send(self(), {:load_gcs, first["id"], first["prefix"] || ""})
+      {:noreply, assign(socket, selected_bucket: first["id"], gcs_prefix: first["prefix"] || "", entries: :loading)}
+    else
+      {:noreply, assign(socket, selected_bucket: nil, entries: [], source: "gcs")}
+    end
   end
 
   def handle_event("select_file", %{"file" => file}, socket) do
-    relative = Path.relative_to(file, @videos_root)
-    preview_url = "/serve/videos/#{relative}"
+    case socket.assigns.source do
+      "gcs" ->
+        bucket_config = GCSBuckets.get(socket.assigns.selected_bucket)
 
-    {:noreply,
-     socket
-     |> assign(selected_file: file, preview_url: preview_url)
-     |> push_event("preview", %{url: preview_url, filename: Path.basename(file)})}
+        if bucket_config do
+          case GCS.signed_url(bucket_config, file) do
+            {:ok, url} ->
+              {:noreply,
+               socket
+               |> assign(selected_file: file, preview_url: url)
+               |> push_event("preview", %{url: url, filename: Path.basename(file)})}
+
+            {:error, reason} ->
+              {:noreply, put_flash(socket, :error, "GCS signed URL error: #{reason}")}
+          end
+        else
+          {:noreply, put_flash(socket, :error, "No bucket selected")}
+        end
+
+      _ ->
+        relative = Path.relative_to(file, @videos_root)
+        preview_url = "/serve/videos/#{relative}"
+
+        {:noreply,
+         socket
+         |> assign(selected_file: file, preview_url: preview_url)
+         |> push_event("preview", %{url: preview_url, filename: Path.basename(file)})}
+    end
   end
 
   def handle_event("toggle_select", %{"file" => file}, socket) do
@@ -209,6 +486,10 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("clear_selection", _params, socket) do
     {:noreply, assign(socket, selected_files: MapSet.new())}
+  end
+
+  def handle_event("select_black_videos", _params, %{assigns: %{entries: :loading}} = socket) do
+    {:noreply, socket}
   end
 
   def handle_event("select_black_videos", _params, socket) do
@@ -275,6 +556,10 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply, assign(socket, min_bbox_area: area)}
   end
 
+  def handle_event("sort_files", %{"col" => col}, %{assigns: %{entries: :loading}} = socket) do
+    {:noreply, assign(socket, sort_by: col, sort_dir: "asc")}
+  end
+
   def handle_event("sort_files", %{"col" => col}, socket) do
     {sort_by, sort_dir} =
       if socket.assigns.sort_by == col do
@@ -318,6 +603,7 @@ defmodule NaturecountsWeb.VideosLive do
     |> Enum.each(&Oban.cancel_job(&1.id))
 
     # Reload entries to show whatever was scanned so far
+    Naturecounts.Cache.invalidate_group(:file_browser)
     processed_files = load_processed_files()
     entries =
       list_dir(socket.assigns.current_dir, processed_files)
@@ -433,18 +719,29 @@ defmodule NaturecountsWeb.VideosLive do
     profile = socket.assigns.selected_profile
 
     if file do
+      gcs_attrs =
+        case socket.assigns.source do
+          "gcs" ->
+            %{storage_backend: "gcs", gcs_bucket: socket.assigns.selected_bucket}
+
+          _ ->
+            %{storage_backend: "local"}
+        end
+
       video =
         %Video{}
-        |> Video.changeset(%{
-          filename: Path.basename(file),
-          path: file,
-          processing_profile: profile,
-          min_bbox_area: socket.assigns.min_bbox_area,
-          vlm_sample_pct: socket.assigns.vlm_sample_pct,
-          fishial_enabled: socket.assigns.fishial_enabled,
-          vlm_enabled: socket.assigns.vlm_enabled,
-          location: socket.assigns.vlm_context_prompt
-        })
+        |> Video.changeset(
+          Map.merge(gcs_attrs, %{
+            filename: Path.basename(file),
+            path: file,
+            processing_profile: profile,
+            min_bbox_area: socket.assigns.min_bbox_area,
+            vlm_sample_pct: socket.assigns.vlm_sample_pct,
+            fishial_enabled: socket.assigns.fishial_enabled,
+            vlm_enabled: socket.assigns.vlm_enabled,
+            location: socket.assigns.vlm_context_prompt
+          })
+        )
         |> Repo.insert!()
 
       %{video_id: video.id}
@@ -554,7 +851,11 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_event("seek_sample", %{"file" => file, "time" => time_str}, socket) do
-    time = String.to_float(time_str)
+    time =
+      case Float.parse(time_str) do
+        {f, _} -> f
+        :error -> 0.0
+      end
 
     socket =
       if socket.assigns.selected_file != file do
@@ -739,6 +1040,21 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   defp list_dir(dir, processed_files) do
+    base =
+      Naturecounts.Cache.get_or_compute({:file_browser, dir}, fn ->
+        list_dir_from_fs(dir)
+      end, ttl: 10_000, group: :file_browser)
+
+    Enum.map(base, fn
+      %{type: :file, path: path} = entry ->
+        %{entry | processed: Map.get(processed_files, path)}
+
+      dir_entry ->
+        dir_entry
+    end)
+  end
+
+  defp list_dir_from_fs(dir) do
     metrics = load_metrics_index(dir)
 
     case File.ls(dir) do
@@ -757,9 +1073,8 @@ defmodule NaturecountsWeb.VideosLive do
             video_file?(name) ->
               stat = File.stat!(path)
               size_mb = Float.round(stat.size / 1_048_576, 1)
-              proc = Map.get(processed_files, path)
               m = Map.get(metrics, name)
-              {dirs, files ++ [%{type: :file, name: name, path: path, size_mb: size_mb, processed: proc, metrics: m}]}
+              {dirs, files ++ [%{type: :file, name: name, path: path, size_mb: size_mb, processed: nil, metrics: m}]}
 
             true ->
               {dirs, files}
@@ -775,6 +1090,62 @@ defmodule NaturecountsWeb.VideosLive do
   defp video_file?(name) do
     ext = name |> Path.extname() |> String.downcase()
     ext in @video_extensions
+  end
+
+  defp list_dir_gcs(bucket_id, prefix, processed_files) do
+    case GCSBuckets.get(bucket_id) do
+      nil ->
+        []
+
+      bucket_config ->
+        full_prefix = case {bucket_config["prefix"], prefix} do
+          {"", p} -> p
+          {nil, p} -> p
+          {base, ""} -> base
+          {base, p} -> if String.starts_with?(p, base), do: p, else: base <> p
+        end
+
+        case GCS.list_objects(bucket_config, full_prefix) do
+          {:ok, entries} ->
+            Enum.map(entries, fn
+              %{type: :file, path: path} = entry ->
+                %{entry | processed: Map.get(processed_files, path)}
+              dir_entry ->
+                dir_entry
+            end)
+
+          {:error, reason} ->
+            require Logger
+            Logger.error("[VideosLive] GCS list error: #{reason}")
+            []
+        end
+    end
+  end
+
+  defp gcs_breadcrumbs(prefix, bucket_prefix) do
+    relative = if bucket_prefix && bucket_prefix != "" do
+      String.trim_leading(prefix, bucket_prefix)
+    else
+      prefix
+    end
+    |> String.trim_leading("/")
+    |> String.trim_trailing("/")
+
+    if relative == "" do
+      []
+    else
+      relative
+      |> String.split("/")
+      |> Enum.scan([], fn segment, acc -> acc ++ [segment] end)
+      |> Enum.map(fn segments ->
+        path = case bucket_prefix do
+          nil -> Enum.join(segments, "/") <> "/"
+          "" -> Enum.join(segments, "/") <> "/"
+          bp -> bp <> Enum.join(segments, "/") <> "/"
+        end
+        %{name: List.last(segments), path: path}
+      end)
+    end
   end
 
   defp sort_indicator(current, dir, col) do
@@ -810,6 +1181,52 @@ defmodule NaturecountsWeb.VideosLive do
   defp metric_val(%{metrics: m}, "bbox_mean"), do: get_in(m, ["bbox_areas", "mean"]) || -1
   defp metric_val(%{metrics: m}, "fps"), do: m["fps"] || -1
   defp metric_val(_, _), do: -1
+
+  defp compute_derived_assigns(%{entries: :loading} = assigns) do
+    assign(assigns,
+      visible: [],
+      metrics_page: [],
+      total_visible: 0,
+      has_more_metrics: false,
+      summary: nil,
+      maxes: %{det: 0, brightness: 255, contrast: 0, motion: 0, bbox_mean: 0, duration: 0},
+      scanned_only: [],
+      loading_entries: true
+    )
+  end
+
+  defp compute_derived_assigns(assigns) do
+    visible = filtered_entries(assigns.entries, assigns.metric_filters)
+    summary = compute_metrics_summary(visible)
+
+    scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
+    maxes = %{
+      det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
+      brightness: 255,
+      contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
+      motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
+      bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
+      duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
+    }
+
+    scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
+
+    visible_files = Enum.filter(visible, &(&1.type == :file))
+    total_visible = length(visible_files)
+    metrics_page = Enum.take(visible, assigns.metrics_limit)
+    has_more = total_visible > assigns.metrics_limit
+
+    assign(assigns,
+      visible: visible,
+      metrics_page: metrics_page,
+      total_visible: total_visible,
+      has_more_metrics: has_more,
+      summary: summary,
+      maxes: maxes,
+      scanned_only: Enum.take(scanned_only, assigns.metrics_limit),
+      loading_entries: false
+    )
+  end
 
   defp filtered_entries(entries, metric_filters) when map_size(metric_filters) == 0, do: entries
   defp filtered_entries(entries, metric_filters) do
@@ -1021,37 +1438,7 @@ defmodule NaturecountsWeb.VideosLive do
 
   @impl true
   def render(assigns) do
-    visible = filtered_entries(assigns.entries, assigns.metric_filters)
-    summary = compute_metrics_summary(visible)
-
-    # Compute max values for bar scaling
-    scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
-    maxes = %{
-      det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
-      brightness: 255,
-      contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
-      motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
-      bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
-      duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
-    }
-
-    scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
-
-    # Paginate visible entries for metrics views
-    visible_files = Enum.filter(visible, &(&1.type == :file))
-    total_visible = length(visible_files)
-    metrics_page = Enum.take(visible, assigns.metrics_limit)
-    has_more = total_visible > assigns.metrics_limit
-
-    assigns = assign(assigns,
-      visible: visible,
-      metrics_page: metrics_page,
-      total_visible: total_visible,
-      has_more_metrics: has_more,
-      summary: summary,
-      maxes: maxes,
-      scanned_only: Enum.take(scanned_only, assigns.metrics_limit)
-    )
+    assigns = compute_derived_assigns(assigns)
 
     ~H"""
     <div class="p-4 space-y-4">
@@ -1136,7 +1523,7 @@ defmodule NaturecountsWeb.VideosLive do
               <button class={"btn btn-xs #{if @metric_filters["motion_score"] == {5.0, nil}, do: "btn-secondary"}"} phx-click="quick_filter" phx-value-preset="high_motion">High motion</button>
               <button class={"btn btn-xs #{if @metric_filters["bbox_mean"] == {20000, nil}, do: "btn-accent"}"} phx-click="quick_filter" phx-value-preset="large_bbox">Large bbox</button>
 
-              <%= if map_size(@metric_filters) > 0 do %>
+              <%= if map_size(@metric_filters) > 0 and @entries != :loading do %>
                 <span class="text-xs text-base-content/50 ml-2">
                   {@total_visible} / {length(Enum.filter(@entries, &(&1.type == :file)))} files
                 </span>
@@ -1318,51 +1705,60 @@ defmodule NaturecountsWeb.VideosLive do
             <%= if @metrics_view == "scatter" do %>
               <div>
                 <div class="flex items-center gap-4 mb-2">
-                  <div class="flex items-center gap-1">
+                  <form class="flex items-center gap-1" phx-change="set_scatter_axis">
                     <span class="text-xs text-base-content/60">X:</span>
-                    <select class="select select-bordered select-xs" phx-change="set_scatter_axis" name="value">
-                      <input type="hidden" name="axis" value="x" />
+                    <input type="hidden" name="axis" value="x" />
+                    <select class="select select-bordered select-xs" name="value">
                       <option :for={k <- ["brightness", "det", "contrast", "motion", "duration", "bbox_mean", "size"]}
                         value={k} selected={@scatter_x == k}>{scatter_label(k)}</option>
                     </select>
-                  </div>
-                  <div class="flex items-center gap-1">
+                  </form>
+                  <form class="flex items-center gap-1" phx-change="set_scatter_axis">
                     <span class="text-xs text-base-content/60">Y:</span>
-                    <select class="select select-bordered select-xs" phx-change="set_scatter_axis" name="value">
-                      <input type="hidden" name="axis" value="y" />
+                    <input type="hidden" name="axis" value="y" />
+                    <select class="select select-bordered select-xs" name="value">
                       <option :for={k <- ["det", "brightness", "contrast", "motion", "duration", "bbox_mean", "size"]}
                         value={k} selected={@scatter_y == k}>{scatter_label(k)}</option>
                     </select>
-                  </div>
+                  </form>
                 </div>
                 <div class="bg-base-100 rounded-lg p-4">
-                  <svg viewBox="0 0 520 320" class="w-full max-h-[350px]">
+                  <svg viewBox="0 0 900 320" class="w-full">
                     <%!-- Grid --%>
                     <line x1="50" y1="10" x2="50" y2="280" stroke="currentColor" opacity="0.15" />
-                    <line x1="50" y1="280" x2="510" y2="280" stroke="currentColor" opacity="0.15" />
-                    <line :for={i <- 1..4} x1="50" y1={280 - i * 54} x2="510" y2={280 - i * 54} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
-                    <line :for={i <- 1..4} x1={50 + i * 92} y1="10" x2={50 + i * 92} y2="280" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line x1="50" y1="280" x2="880" y2="280" stroke="currentColor" opacity="0.15" />
+                    <line :for={i <- 1..4} x1="50" y1={280 - i * 54} x2="880" y2={280 - i * 54} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line :for={i <- 1..4} x1={50 + i * 166} y1="10" x2={50 + i * 166} y2="280" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
 
                     <%!-- Axis labels --%>
-                    <text x="280" y="305" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">{scatter_label(@scatter_x)}</text>
+                    <text x="465" y="305" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">{scatter_label(@scatter_x)}</text>
                     <text x="15" y="145" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11" transform="rotate(-90, 15, 145)">{scatter_label(@scatter_y)}</text>
 
-                    <%!-- Data points --%>
+                    <%!-- Data points (color = motion) --%>
                     <% x_max = scatter_max(@scanned_only, @scatter_x) %>
                     <% y_max = scatter_max(@scanned_only, @scatter_y) %>
+                    <% motion_max = scatter_max(@scanned_only, "motion") %>
                     <%= for entry <- @scanned_only do %>
-                      <% cx = 50 + scatter_val(entry, @scatter_x) / x_max * 460 %>
+                      <% cx = 50 + scatter_val(entry, @scatter_x) / x_max * 830 %>
                       <% cy = 280 - scatter_val(entry, @scatter_y) / y_max * 270 %>
+                      <% motion_t = Float.round(min(scatter_val(entry, "motion") / motion_max, 1.0), 3) %>
+                      <% hue = Float.round(240 * (1 - motion_t), 0) %>
                       <circle
                         cx={Float.round(cx, 1)} cy={Float.round(cy, 1)} r={if @selected_file == entry.path, do: "6", else: "4"}
-                        fill={if @selected_file == entry.path, do: "hsl(var(--p))", else: "hsl(var(--s))"}
-                        opacity={if @selected_file == entry.path, do: "1", else: "0.6"}
+                        fill={if @selected_file == entry.path, do: "hsl(var(--p))", else: "hsl(#{hue}, 80%, 55%)"}
+                        opacity={if @selected_file == entry.path, do: "1", else: "0.7"}
                         class="cursor-pointer hover:opacity-100 transition-opacity"
                         phx-click="select_file" phx-value-file={entry.path}
                       >
-                        <title>{entry.name} — {scatter_label(@scatter_x)}: {scatter_val(entry, @scatter_x)}, {scatter_label(@scatter_y)}: {scatter_val(entry, @scatter_y)}</title>
+                        <title>{entry.name} — {scatter_label(@scatter_x)}: {scatter_val(entry, @scatter_x)}, {scatter_label(@scatter_y)}: {scatter_val(entry, @scatter_y)}, motion: {scatter_val(entry, "motion")}</title>
                       </circle>
                     <% end %>
+
+                    <%!-- Motion color legend --%>
+                    <rect :for={i <- 0..9} x={700 + i * 18} y="10" width="18" height="8" rx="1"
+                      fill={"hsl(#{240 - i * 24}, 80%, 55%)"} />
+                    <text x="700" y="28" fill="currentColor" opacity="0.4" font-size="9">still</text>
+                    <text x="880" y="28" text-anchor="end" fill="currentColor" opacity="0.4" font-size="9">motion</text>
                   </svg>
                 </div>
               </div>
@@ -1399,7 +1795,7 @@ defmodule NaturecountsWeb.VideosLive do
                               <rect
                                 x={Float.round(dist.q1 / col_max * 60, 1)}
                                 y="1" rx="1"
-                                width={Float.round(max((dist.q3 - dist.q1) / col_max * 60, 1), 1)}
+                                width={Float.round(max((dist.q3 - dist.q1) / col_max * 60, 1.0), 1)}
                                 height="6"
                                 fill="currentColor" opacity="0.2"
                               />
@@ -1663,30 +2059,30 @@ defmodule NaturecountsWeb.VideosLive do
             <%= if @metrics_view == "temporal_scatter" do %>
               <div>
                 <div class="flex items-center gap-4 mb-2">
-                  <div class="flex items-center gap-1">
+                  <form class="flex items-center gap-1" phx-change="set_temporal_y">
                     <span class="text-xs text-base-content/60">Y axis:</span>
-                    <select class="select select-bordered select-xs" phx-change="set_temporal_y" name="value">
+                    <select class="select select-bordered select-xs" name="value">
                       <option :for={k <- ["det", "bright", "contrast", "motion"]}
                         value={k} selected={@temporal_y == k}>
                         {case k do; "det" -> "Detections"; "bright" -> "Brightness"; "contrast" -> "Contrast"; "motion" -> "Motion"; _ -> k; end}
                       </option>
                     </select>
-                  </div>
+                  </form>
                   <span class="text-[10px] text-base-content/40">X = time position in video (s). Each color = one file.</span>
                 </div>
                 <div class="bg-base-100 rounded-lg p-4">
                   <% temporal_files = Enum.filter(@scanned_only, &has_samples?/1) |> Enum.with_index() %>
                   <% y_max = samples_max(@scanned_only, @temporal_y) %>
                   <% x_max = Enum.reduce(@scanned_only, 0.001, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end) %>
-                  <svg viewBox="0 0 520 300" class="w-full max-h-[350px]">
+                  <svg viewBox="0 0 900 300" class="w-full">
                     <%!-- Grid --%>
                     <line x1="50" y1="10" x2="50" y2="260" stroke="currentColor" opacity="0.15" />
-                    <line x1="50" y1="260" x2="510" y2="260" stroke="currentColor" opacity="0.15" />
-                    <line :for={i <- 1..4} x1="50" y1={260 - i * 50} x2="510" y2={260 - i * 50} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
-                    <line :for={i <- 1..4} x1={50 + i * 92} y1="10" x2={50 + i * 92} y2="260" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line x1="50" y1="260" x2="880" y2="260" stroke="currentColor" opacity="0.15" />
+                    <line :for={i <- 1..4} x1="50" y1={260 - i * 50} x2="880" y2={260 - i * 50} stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
+                    <line :for={i <- 1..4} x1={50 + i * 166} y1="10" x2={50 + i * 166} y2="260" stroke="currentColor" opacity="0.06" stroke-dasharray="4" />
 
                     <%!-- Axis labels --%>
-                    <text x="280" y="285" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">Time (s)</text>
+                    <text x="465" y="285" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">Time (s)</text>
                     <text x="15" y="135" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11" transform="rotate(-90, 15, 135)">
                       {case @temporal_y do; "det" -> "Detections"; "bright" -> "Brightness"; "contrast" -> "Contrast"; "motion" -> "Motion"; _ -> @temporal_y; end}
                     </text>
@@ -1696,7 +2092,7 @@ defmodule NaturecountsWeb.VideosLive do
                       <% color = file_color(fi) %>
                       <% samples = get_samples(entry) %>
                       <%= for s <- samples do %>
-                        <% cx = 50 + (s["t"] || 0) / x_max * 460 %>
+                        <% cx = 50 + (s["t"] || 0) / x_max * 830 %>
                         <% val = s[@temporal_y] || 0 %>
                         <% cy = 260 - val / y_max * 250 %>
                         <circle
@@ -1716,8 +2112,8 @@ defmodule NaturecountsWeb.VideosLive do
 
                     <%!-- Legend --%>
                     <%= for {entry, fi} <- Enum.take(temporal_files, 10) do %>
-                      <circle cx={60 + rem(fi, 5) * 92} cy={270 + div(fi, 5) * 12} r="3" fill={file_color(fi)} />
-                      <text x={67 + rem(fi, 5) * 92} y={273 + div(fi, 5) * 12} fill="currentColor" opacity="0.5" font-size="8">
+                      <circle cx={60 + rem(fi, 5) * 166} cy={270 + div(fi, 5) * 12} r="3" fill={file_color(fi)} />
+                      <text x={67 + rem(fi, 5) * 166} y={273 + div(fi, 5) * 12} fill="currentColor" opacity="0.5" font-size="8">
                         {String.slice(entry.name, 0, 12)}
                       </text>
                     <% end %>
@@ -1812,22 +2208,133 @@ defmodule NaturecountsWeb.VideosLive do
         <%!-- File browser --%>
         <div class="card bg-base-200">
           <div class="card-body">
-            <h2 class="card-title text-lg">Browse Files</h2>
+            <div class="flex items-center justify-between">
+              <h2 class="card-title text-lg">Browse Files</h2>
+              <div class="join">
+                <button
+                  class={"join-item btn btn-xs #{if @source == "local", do: "btn-active"}"}
+                  phx-click="switch_source" phx-value-source="local"
+                >Local</button>
+                <button
+                  class={"join-item btn btn-xs #{if @source == "gcs", do: "btn-active"}"}
+                  phx-click="switch_source" phx-value-source="gcs"
+                >GCS</button>
+              </div>
+            </div>
+
+            <%!-- GCS bucket selector --%>
+            <%= if @source == "gcs" do %>
+              <div class="flex items-center gap-1 flex-wrap">
+                <%= for b <- @gcs_buckets do %>
+                  <div class="flex items-center gap-0">
+                    <button
+                      class={"btn btn-xs #{if @selected_bucket == b["id"], do: "btn-primary", else: "btn-ghost"}"}
+                      phx-click="select_bucket" phx-value-id={b["id"]}
+                      title={b["credentials"] && b["credentials"]["client_email"] || "no credentials"}
+                    >
+                      <span :if={b["credentials"]} class="text-success text-[8px]">*</span>
+                      {b["name"]}
+                    </button>
+                    <button
+                      class="btn btn-xs btn-ghost opacity-50 hover:opacity-100 px-1"
+                      phx-click="edit_bucket" phx-value-id={b["id"]}
+                      title="Edit bucket config"
+                    >e</button>
+                    <button
+                      class="btn btn-xs btn-ghost text-error opacity-50 hover:opacity-100 px-1"
+                      phx-click="delete_bucket" phx-value-id={b["id"]}
+                      data-confirm={"Delete bucket '#{b["name"]}'?"}
+                    >x</button>
+                  </div>
+                <% end %>
+                <button class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">+ Add Bucket</button>
+              </div>
+
+              <%= if @adding_bucket do %>
+                <div class="bg-base-300 rounded-lg p-3 mt-1 space-y-2">
+                  <div class="text-xs font-semibold">
+                    <%= if @editing_bucket, do: "Edit Bucket", else: "Add GCS Bucket" %>
+                  </div>
+                  <form phx-submit="save_bucket" class="space-y-2">
+                    <div class="flex gap-2 flex-wrap">
+                      <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">Display Name</span></label>
+                        <input type="text" name="name" placeholder="Marine Cam East" class="input input-xs input-bordered w-36" value={@new_bucket_name} />
+                      </div>
+                      <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">GCS Bucket ID</span></label>
+                        <input type="text" name="bucket" placeholder="my-project-videos" class="input input-xs input-bordered w-44" value={@new_bucket_id} />
+                      </div>
+                      <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">Path Prefix (optional)</span></label>
+                        <input type="text" name="prefix" placeholder="cameras/east/" class="input input-xs input-bordered w-36" value={@new_bucket_prefix} />
+                      </div>
+                    </div>
+                    <div class="form-control">
+                      <label class="label py-0">
+                        <span class="label-text text-xs">
+                          Service Account JSON
+                          <%= if @editing_bucket do %>
+                            <span class="text-base-content/40">(leave empty to keep existing)</span>
+                          <% end %>
+                        </span>
+                      </label>
+                      <textarea
+                        name="credentials"
+                        rows="4"
+                        placeholder='{"type": "service_account", "project_id": "...", "private_key": "...", "client_email": "..."}'
+                        class="textarea textarea-bordered textarea-xs font-mono text-[10px] leading-tight w-full"
+                      >{@new_bucket_creds}</textarea>
+                    </div>
+                    <%!-- Test + Save buttons --%>
+                    <div class="flex items-center gap-2">
+                      <button type="submit" name="action" value="test" class="btn btn-xs btn-outline">Test Connection</button>
+                      <button type="submit" name="action" value="save" class="btn btn-xs btn-primary">
+                        <%= if @editing_bucket, do: "Update", else: "Save Bucket" %>
+                      </button>
+                      <button type="button" class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">Cancel</button>
+                      <%= if @bucket_test_result do %>
+                        <%= case @bucket_test_result do %>
+                          <% :ok -> %>
+                            <span class="badge badge-xs badge-success">Connected</span>
+                          <% {:error, msg} -> %>
+                            <span class="badge badge-xs badge-error" title={msg}>Failed: {msg}</span>
+                        <% end %>
+                      <% end %>
+                    </div>
+                  </form>
+                </div>
+              <% end %>
+            <% end %>
 
             <%!-- Breadcrumbs + Scan --%>
             <div class="flex items-center justify-between">
               <div class="text-sm breadcrumbs py-0">
                 <ul>
-                  <li>
-                    <a class="link link-hover" phx-click="navigate_dir" phx-value-path="/videos">
-                      /videos
-                    </a>
-                  </li>
-                  <li :for={crumb <- @breadcrumbs}>
-                    <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>
-                      {crumb.name}
-                    </a>
-                  </li>
+                  <%= if @source == "gcs" do %>
+                    <% bucket_config = Enum.find(@gcs_buckets, fn b -> b["id"] == @selected_bucket end) %>
+                    <li>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={bucket_config && bucket_config["prefix"] || ""}>
+                        gs://{bucket_config && bucket_config["bucket"]}
+                      </a>
+                    </li>
+                    <li :for={crumb <- gcs_breadcrumbs(@gcs_prefix, bucket_config && bucket_config["prefix"])}>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>
+                        {crumb.name}
+                      </a>
+                    </li>
+                  <% else %>
+                    <li>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path="/videos">
+                        /videos
+                      </a>
+                    </li>
+                    <li :for={crumb <- @breadcrumbs}>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>
+                        {crumb.name}
+                      </a>
+                    </li>
+                  <% end %>
               </ul>
               </div>
               <div class="flex items-center gap-1">
@@ -1900,9 +2407,15 @@ defmodule NaturecountsWeb.VideosLive do
 
             <%!-- File listing --%>
             <div class="overflow-y-auto max-h-80">
-              <%= if Enum.empty?(@visible) do %>
+              <%= cond do %>
+              <% @loading_entries -> %>
+                <div class="flex items-center gap-2 p-4">
+                  <span class="loading loading-spinner loading-sm"></span>
+                  <span class="text-sm text-base-content/50">Loading files...</span>
+                </div>
+              <% Enum.empty?(@visible) -> %>
                 <p class="text-base-content/50 italic text-sm">No video files match filters.</p>
-              <% else %>
+              <% true -> %>
                 <table class="table table-sm">
                   <thead>
                     <tr>

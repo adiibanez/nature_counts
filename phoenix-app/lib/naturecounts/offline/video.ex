@@ -21,6 +21,8 @@ defmodule Naturecounts.Offline.Video do
     field :vlm_sample_pct, :integer
     field :fishial_enabled, :boolean
     field :vlm_enabled, :boolean, default: true
+    field :storage_backend, :string, default: "local"
+    field :gcs_bucket, :string
 
     has_many :tracks, Naturecounts.Offline.Track
 
@@ -34,10 +36,15 @@ defmodule Naturecounts.Offline.Video do
       :recorded_at, :location, :status, :processing_profile,
       :progress_pct, :error_message, :status_message,
       :total_tracks, :vlm_qualified, :vlm_classified_count, :min_bbox_area,
-      :vlm_sample_pct, :fishial_enabled, :vlm_enabled
+      :vlm_sample_pct, :fishial_enabled, :vlm_enabled,
+      :storage_backend, :gcs_bucket
     ])
     |> validate_required([:filename, :path])
     |> validate_inclusion(:status, ~w(pending processing completed failed))
     |> validate_inclusion(:processing_profile, ~w(light standard deep))
+    |> validate_inclusion(:storage_backend, ~w(local gcs))
   end
+
+  def gcs?(%__MODULE__{storage_backend: "gcs"}), do: true
+  def gcs?(_), do: false
 end

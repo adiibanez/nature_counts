@@ -44,8 +44,15 @@ const VideoPreview = {
 
     this.handleEvent("seek", ({ time }) => {
       if (this._video) {
-        this._video.currentTime = time;
-        this._video.play();
+        const doSeek = () => {
+          this._video.currentTime = time;
+          this._video.play();
+        };
+        if (this._video.readyState >= 1) {
+          doSeek();
+        } else {
+          this._video.addEventListener("loadedmetadata", doSeek, { once: true });
+        }
       }
     });
   },
