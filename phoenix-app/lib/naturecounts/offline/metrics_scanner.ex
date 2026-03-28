@@ -204,10 +204,6 @@ defmodule Naturecounts.Offline.MetricsScanner do
   """
 
   def scan(directory, opts \\ []) do
-    import Ecto.Query
-    alias Naturecounts.Repo
-    alias Naturecounts.Offline.Video
-
     model_path = System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.onnx")
     sample_frames = Keyword.get(opts, :sample_frames, 5)
     force = Keyword.get(opts, :force, false)
@@ -215,13 +211,8 @@ defmodule Naturecounts.Offline.MetricsScanner do
     batch_id = Keyword.get(opts, :batch_id, "0")
     _progress_callback = Keyword.get(opts, :progress_callback)
 
-    # Get filenames already fully processed in DB — skip these
-    processed_filenames =
-      Video
-      |> where([v], v.status == "completed" and like(v.path, ^"#{directory}/%"))
-      |> select([v], v.path)
-      |> Repo.all()
-      |> Enum.map(&Path.basename/1)
+    # Don't skip DB-processed files — metrics scan is lightweight and independent
+    processed_filenames = []
 
     progress_file = Path.join(System.tmp_dir!(), "scan_progress_#{batch_id}.json")
     cancel_file = Path.join(System.tmp_dir!(), "scan_cancel")

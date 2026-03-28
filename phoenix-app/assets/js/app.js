@@ -29,6 +29,7 @@ import VideoPreview from "./hooks/video_preview"
 import FishList from "./hooks/fish_list"
 import PrintMode from "./hooks/print_mode"
 import CropZoom from "./hooks/crop_zoom"
+import RangeSlider from "./hooks/range_slider"
 import { createPlayerHook } from "membrane_webrtc_plugin"
 
 const iceServers = [{ urls: "stun:stun.l.google.com:19302" }]
@@ -53,7 +54,7 @@ const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, Player, InfiniteScroll},
+  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, RangeSlider, Player, InfiniteScroll},
 })
 
 // Show progress bar on live navigation and form submits

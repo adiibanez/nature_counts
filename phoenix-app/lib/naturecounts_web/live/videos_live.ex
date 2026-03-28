@@ -568,15 +568,15 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_event("sort_files", %{"col" => col}, %{assigns: %{entries: :loading}} = socket) do
-    {:noreply, assign(socket, sort_by: col, sort_dir: "asc")}
+    {:noreply, assign(socket, sort_by: col, sort_dir: "desc")}
   end
 
   def handle_event("sort_files", %{"col" => col}, socket) do
     {sort_by, sort_dir} =
       if socket.assigns.sort_by == col do
-        {col, if(socket.assigns.sort_dir == "asc", do: "desc", else: "asc")}
+        {col, if(socket.assigns.sort_dir == "desc", do: "asc", else: "desc")}
       else
-        {col, "asc"}
+        {col, "desc"}
       end
 
     entries = sort_entries(socket.assigns.entries, sort_by, sort_dir)
@@ -904,15 +904,25 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("set_metric_filter", %{"field" => field, "min" => min_str, "max" => max_str}, socket) do
     filters = socket.assigns.metric_filters
+    ranges = socket.assigns.ranges
 
     min_val = parse_number(min_str)
     max_val = parse_number(max_str)
 
+    # If both sliders are at the data bounds, clear the filter
+    range = ranges[field]
+
     filters =
-      if min_val == nil and max_val == nil do
-        Map.delete(filters, field)
-      else
-        Map.put(filters, field, {min_val, max_val})
+      cond do
+        min_val == nil and max_val == nil ->
+          Map.delete(filters, field)
+
+        range != nil and min_val != nil and max_val != nil and
+          min_val <= range.min and max_val >= range.max ->
+          Map.delete(filters, field)
+
+        true ->
+          Map.put(filters, field, {min_val, max_val})
       end
 
     {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50) |> recompute_metrics()}
@@ -1221,6 +1231,7 @@ defmodule NaturecountsWeb.VideosLive do
           has_more_metrics: false,
           summary: nil,
           maxes: %{det: 0, brightness: 255, contrast: 0, motion: 0, bbox_mean: 0, duration: 0},
+          ranges: %{},
           scanned_only: [],
           loading_entries: true
         )
@@ -1239,6 +1250,8 @@ defmodule NaturecountsWeb.VideosLive do
           duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
         }
 
+        ranges = compute_metric_ranges(scanned_files)
+
         scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
 
         visible_files = Enum.filter(visible, &(&1.type == :file))
@@ -1254,6 +1267,7 @@ defmodule NaturecountsWeb.VideosLive do
           summary: summary,
           maxes: maxes,
           scanned_only: Enum.take(scanned_only, assigns.metrics_limit),
+          ranges: ranges,
           loading_entries: false
         )
     end
@@ -1280,6 +1294,69 @@ defmodule NaturecountsWeb.VideosLive do
     end)
   end
 
+  defp compute_metric_ranges(scanned_files) do
+    if scanned_files == [] do
+      %{}
+    else
+      fields = [
+        {"avg_detections_per_frame", 0.1},
+        {"avg_brightness", 1},
+        {"duration_s", 1},
+        {"contrast", 0.1},
+        {"motion_score", 0.1},
+        {"bbox_mean", 100}
+      ]
+
+      for {field, step} <- fields, into: %{} do
+        values =
+          scanned_files
+          |> Enum.map(fn f ->
+            case field do
+              "bbox_mean" -> get_in(f.metrics, ["bbox_areas", "mean"]) || 0
+              key -> f.metrics[key] || 0
+            end
+          end)
+          |> Enum.sort()
+
+        count = length(values)
+        data_min = List.first(values, 0)
+        data_max = List.last(values, 0)
+        # Percentiles for context (p10, p25, median, p75, p90)
+        p10 = Enum.at(values, div(count, 10), data_min)
+        p25 = Enum.at(values, div(count, 4), data_min)
+        median = Enum.at(values, div(count, 2), data_min)
+        p75 = Enum.at(values, div(count * 3, 4), data_max)
+        p90 = Enum.at(values, div(count * 9, 10), data_max)
+
+        # Histogram: 20 bins
+        num_bins = 20
+        bin_width = if data_max > data_min, do: (data_max - data_min) / num_bins, else: 1
+        histogram =
+          if data_max > data_min do
+            bins = List.duplicate(0, num_bins)
+            Enum.reduce(values, bins, fn val, bins ->
+              idx = min(trunc((val - data_min) / bin_width), num_bins - 1)
+              List.update_at(bins, idx, &(&1 + 1))
+            end)
+          else
+            [count]
+          end
+
+        {field, %{
+          min: data_min,
+          max: data_max,
+          step: step,
+          p10: p10,
+          p25: p25,
+          median: median,
+          p75: p75,
+          p90: p90,
+          histogram: histogram
+        }}
+      end
+    end
+  end
+
   defp compute_metrics_summary(entries) do
     scanned = Enum.filter(entries, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
     count = length(scanned)
@@ -1300,6 +1377,62 @@ defmodule NaturecountsWeb.VideosLive do
       }
     end
   end
+
+  attr :field, :string, required: true
+  attr :label, :string, required: true
+  attr :filters, :map, required: true
+  attr :ranges, :map, required: true
+
+  defp metric_filter(assigns) do
+    range = assigns.ranges[assigns.field]
+    filter = assigns.filters[assigns.field]
+    {filter_min, filter_max} = filter || {nil, nil}
+
+    has_range = range != nil and range.max > range.min
+
+    assigns =
+      assigns
+      |> assign(
+        filter_min: filter_min,
+        filter_max: filter_max,
+        has_range: has_range,
+        active: filter != nil,
+        range: range,
+        histogram: if(range, do: Jason.encode!(range.histogram), else: "[]")
+      )
+
+    ~H"""
+    <div>
+      <div class="flex items-center justify-between mb-0.5">
+        <span class={"text-xs #{if @active, do: "text-primary font-semibold", else: "opacity-70"}"}>{@label}</span>
+        <span :if={@has_range} class="text-[10px] font-mono opacity-40">
+          {format_metric_val(@range.min)}–{format_metric_val(@range.max)}
+        </span>
+      </div>
+      <div
+        :if={@has_range}
+        id={"range-slider-#{@field}"}
+        phx-hook="RangeSlider"
+        phx-update="ignore"
+        data-field={@field}
+        data-min={@range.min}
+        data-max={@range.max}
+        data-step={@range.step}
+        data-cur-min={@filter_min || @range.min}
+        data-cur-max={@filter_max || @range.max}
+        data-histogram={@histogram}
+        class="rounded"
+      />
+    </div>
+    """
+  end
+
+  defp format_metric_val(val) when is_float(val) do
+    if val == Float.round(val, 0), do: "#{round(val)}", else: "#{Float.round(val, 1)}"
+  end
+  defp format_metric_val(val) when is_integer(val), do: "#{val}"
+  defp format_metric_val(nil), do: ""
+  defp format_metric_val(val), do: "#{val}"
 
   defp bar_pct(_val, max) when max == 0 or max == nil, do: 0
   defp bar_pct(nil, _max), do: 0
@@ -1560,55 +1693,13 @@ defmodule NaturecountsWeb.VideosLive do
             </div>
 
             <%!-- Range filters --%>
-            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2 mb-3">
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Detections/frame</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="avg_detections_per_frame" />
-                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["avg_detections_per_frame"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["avg_detections_per_frame"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Brightness (0-255)</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="avg_brightness" />
-                  <input type="number" step="1" min="0" max="255" placeholder="min" name="min" value={elem(@metric_filters["avg_brightness"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="1" min="0" max="255" placeholder="max" name="max" value={elem(@metric_filters["avg_brightness"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Duration (s)</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="duration_s" />
-                  <input type="number" step="1" min="0" placeholder="min" name="min" value={elem(@metric_filters["duration_s"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="1" min="0" placeholder="max" name="max" value={elem(@metric_filters["duration_s"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Contrast</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="contrast" />
-                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["contrast"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["contrast"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Motion</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="motion_score" />
-                  <input type="number" step="0.1" min="0" placeholder="min" name="min" value={elem(@metric_filters["motion_score"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="0.1" min="0" placeholder="max" name="max" value={elem(@metric_filters["motion_score"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
-              <form phx-change="set_metric_filter" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">Bbox mean area</span></label>
-                <div class="flex gap-1">
-                  <input type="hidden" name="field" value="bbox_mean" />
-                  <input type="number" step="1000" min="0" placeholder="min" name="min" value={elem(@metric_filters["bbox_mean"] || {nil, nil}, 0)} class="input input-bordered input-xs w-full" />
-                  <input type="number" step="1000" min="0" placeholder="max" name="max" value={elem(@metric_filters["bbox_mean"] || {nil, nil}, 1)} class="input input-bordered input-xs w-full" />
-                </div>
-              </form>
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-x-3 gap-y-1 mb-3">
+              <.metric_filter field="avg_detections_per_frame" label="Detections" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="avg_brightness" label="Brightness" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="duration_s" label="Duration (s)" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="contrast" label="Contrast" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="motion_score" label="Motion" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="bbox_mean" label="Bbox area" filters={@metric_filters} ranges={@ranges} />
             </div>
 
             <%!-- ═══════════════════════════════════════ --%>

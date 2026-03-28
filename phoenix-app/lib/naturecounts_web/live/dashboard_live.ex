@@ -45,7 +45,8 @@ defmodule NaturecountsWeb.DashboardLive do
     end
 
     mediamtx_host = Application.get_env(:naturecounts, :mediamtx_host, "localhost:8889")
-    scenario = active_scenario("live")
+    detected_id = detect_active_scenario()
+    scenario = active_scenario(detected_id)
     cameras = build_cameras(scenario)
 
     {:ok,
@@ -57,7 +58,7 @@ defmodule NaturecountsWeb.DashboardLive do
        pipeline_status: pipeline.container,
        ws_connected: pipeline.ws_connected,
        scenarios: @scenarios,
-       active_scenario: "live",
+       active_scenario: detected_id,
        scenario: scenario,
        applying: false
      )}
@@ -109,7 +110,8 @@ defmodule NaturecountsWeb.DashboardLive do
   @impl true
   def handle_event("apply_scenario", _params, socket) do
     scenario = socket.assigns.scenario
-    socket = assign(socket, applying: true)
+    cameras = build_cameras(scenario)
+    socket = assign(socket, applying: true, cameras: cameras)
 
     Task.start(fn ->
       apply_scenario(scenario)
@@ -133,6 +135,28 @@ defmodule NaturecountsWeb.DashboardLive do
 
   defp active_scenario(id) do
     Enum.find(@scenarios, List.first(@scenarios), &(&1.id == id))
+  end
+
+  defp detect_active_scenario do
+    config_path = resolve_mediamtx_path()
+
+    case File.read(config_path) do
+      {:ok, content} ->
+        # Extract video file paths from the mediamtx.yml
+        files =
+          Regex.scan(~r{-i /videos/(.+\.mp4)}, content)
+          |> Enum.map(fn [_, file] -> file end)
+          |> Enum.sort()
+
+        # Match against known scenarios
+        Enum.find_value(@scenarios, "live", fn scenario ->
+          scenario_files = scenario.clips |> Enum.map(& &1.file) |> Enum.sort()
+          if scenario_files == files, do: scenario.id
+        end)
+
+      _ ->
+        "live"
+    end
   end
 
   defp build_cameras(scenario) do

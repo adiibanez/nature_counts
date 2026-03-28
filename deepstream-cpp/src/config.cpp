@@ -21,7 +21,7 @@ Config load_config() {
 
     cfg.infer_config = config_dir + "/config_infer_primary_cfd_yolov12_ds64.txt";
     cfg.tracker_config = env("TRACKER_CONFIG",
-        (config_dir + "/config_tracker_NvDCF_accuracy.yml").c_str());
+        (config_dir + "/config_tracker_NvDCF_fish.yml").c_str());
     cfg.tracker_lib = ds_root + "/lib/libnvds_nvmultiobjecttracker.so";
     cfg.tracker_width = env_int("TRACKER_WIDTH", 640);
     cfg.tracker_height = env_int("TRACKER_HEIGHT", 384);

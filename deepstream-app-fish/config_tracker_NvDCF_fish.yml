@@ -1,0 +1,65 @@
+%YAML:1.0
+################################################################################
+# NvDCF tracker tuned for underwater fish tracking.
+#
+# Fish appearance changes rapidly (rotation, light refraction, turbulence),
+# so we rely more on IOU/position continuity than visual similarity.
+# Shadow tracking age is high to survive brief occlusions and missed detections.
+################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  maxTargetsPerStream: 150
+
+  # [Creation & Termination Policy]
+  minIouDiff4NewTarget: 0.4    # Lower than default — fish can overlap more
+  minTrackerConfidence: 0.1    # Keep tracks alive even at low visual confidence
+  probationAge: 2              # Confirm new tracks quickly (fish appear/disappear at edges)
+  maxShadowTrackingAge: 90     # Keep lost tracks for ~3s at 30fps — survive brief occlusions
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1     # GLOBAL matching — better for multiple similar-looking fish
+  checkClassMatch: 1
+
+  # [Association Metric: Thresholds — relaxed for fish]
+  minMatchingScore4Overall: 0.0
+  minMatchingScore4SizeSimilarity: 0.3
+  minMatchingScore4Iou: 0.0
+  minMatchingScore4VisualSimilarity: 0.2   # Very low — fish appearance is unreliable
+
+  # [Association Metric: Weights — favor position over appearance]
+  matchingScoreWeight4VisualSimilarity: 0.2  # Low weight on appearance
+  matchingScoreWeight4SizeSimilarity: 0.2    # Some weight on size consistency
+  matchingScoreWeight4Iou: 0.6              # Primary signal: spatial overlap
+
+StateEstimator:
+  stateEstimatorType: 2  # REGULAR — better motion prediction for swimming fish
+
+  # [Dynamics Modeling — tuned for smooth fish movement]
+  processNoiseVar4Loc: 4.0     # Higher — fish can change direction
+  processNoiseVar4Size: 2.0    # Fish bbox size varies as they turn
+  processNoiseVar4Vel: 0.5     # Moderate velocity changes
+  measurementNoiseVar4Detector: 4.0
+  measurementNoiseVar4Tracker: 8.0    # Lower than default — trust tracker more
+
+VisualTracker:
+  visualTrackerType: 1  # NvDCF
+
+  # [NvDCF: Feature Extraction]
+  useColorNames: 1
+  useHog: 0              # Skip HOG — not useful underwater
+  featureImgSizeLevel: 2
+  featureFocusOffsetFactor_y: -0.2
+
+  # [NvDCF: Correlation Filter — faster adaptation for fish]
+  filterLr: 0.15         # Higher learning rate — adapt to appearance changes faster
+  filterChannelWeightsLr: 0.2
+  gaussianSigma: 0.75

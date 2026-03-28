@@ -12,8 +12,8 @@ defmodule Naturecounts.Detection.TrackerState do
 
   @table :tracker_state
   @prune_interval :timer.seconds(5)
-  # Timeout in seconds to match DeepStream's time.time() epoch timestamps
-  @track_timeout_s 5
+  # Timeout in milliseconds to match DeepStream C++ epoch-ms timestamps
+  @track_timeout_ms 5_000
   @max_trajectory_length 50
 
   # --- Public API ---
@@ -30,7 +30,7 @@ defmodule Naturecounts.Detection.TrackerState do
   @doc "Get active track count for a camera."
   def active_count(cam_id) do
     now = latest_ts(cam_id)
-    cutoff = now - @track_timeout_s
+    cutoff = now - @track_timeout_ms
 
     # ETS rows: {{cam_id, track_id}, trajectory, last_seen, label, thumbnail}
     :ets.match(@table, {{cam_id, :_}, :_, :"$1", :_, :_})
@@ -56,7 +56,7 @@ defmodule Naturecounts.Detection.TrackerState do
   @doc "Get active tracks with their latest bbox, label, and thumbnail for a camera."
   def active_tracks(cam_id) do
     now = latest_ts(cam_id)
-    cutoff = now - @track_timeout_s
+    cutoff = now - @track_timeout_ms
 
     # ETS rows: {{cam_id, track_id}, trajectory, last_seen, label, thumbnail}
     :ets.match_object(@table, {{cam_id, :_}, :_, :_, :_, :_})
@@ -142,7 +142,7 @@ defmodule Naturecounts.Detection.TrackerState do
     latest_ts_entries = :ets.match(@table, {{:"$1", :latest_ts}, :"$2"})
 
     for [cam_id, latest_ts] <- latest_ts_entries do
-      cutoff = latest_ts - @track_timeout_s
+      cutoff = latest_ts - @track_timeout_ms
 
       :ets.select_delete(@table, [
         {{{cam_id, :_}, :_, :"$1", :_, :_}, [{:is_number, :"$1"}, {:<, :"$1", cutoff}], [true]}
