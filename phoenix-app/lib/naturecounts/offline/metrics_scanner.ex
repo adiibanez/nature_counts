@@ -11,7 +11,6 @@ defmodule Naturecounts.Offline.MetricsScanner do
   import numpy as np
   import json
   import os
-  import time
   from datetime import datetime, timezone
   from ultralytics import YOLO
 
@@ -21,47 +20,22 @@ defmodule Naturecounts.Offline.MetricsScanner do
       directory = directory.decode("utf-8")
   if isinstance(progress_file, bytes):
       progress_file = progress_file.decode("utf-8")
-  if isinstance(skip_filenames, bytes):
-      skip_filenames = skip_filenames.decode("utf-8")
   if isinstance(cancel_file, bytes):
       cancel_file = cancel_file.decode("utf-8")
   if isinstance(batch_files, bytes):
       batch_files = batch_files.decode("utf-8")
 
-  import fcntl
-
-  skip_set = set(json.loads(skip_filenames))
   batch_list = json.loads(batch_files) if batch_files else []
 
   VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".ts"}
+  SIDECAR_SUFFIX = ".metrics.json"
 
-  index_path = os.path.join(directory, ".metrics.json")
-  lock_path = index_path + ".lock"
-
-  def read_index():
-      if os.path.exists(index_path):
-          with open(index_path) as f:
-              return json.load(f)
-      return {}
-
-  def write_index(data):
-      lock_fd = open(lock_path, "w")
-      fcntl.flock(lock_fd, fcntl.LOCK_EX)
-      try:
-          # Re-read to merge with any concurrent writes
-          current = {}
-          if os.path.exists(index_path):
-              with open(index_path) as f:
-                  current = json.load(f)
-          current.update(data)
-          with open(index_path, "w") as f:
-              json.dump(current, f, indent=2)
-      finally:
-          fcntl.flock(lock_fd, fcntl.LOCK_UN)
-          lock_fd.close()
-
-  # Load existing index for skip check
-  existing = read_index() if not force_rescan else {}
+  def write_sidecar(video_path, metrics):
+      sidecar_path = video_path + SIDECAR_SUFFIX
+      tmp_path = sidecar_path + ".tmp"
+      with open(tmp_path, "w") as f:
+          json.dump(metrics, f, indent=2)
+      os.replace(tmp_path, sidecar_path)
 
   # Find videos to scan
   if batch_list:
@@ -73,7 +47,13 @@ defmodule Naturecounts.Offline.MetricsScanner do
           and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
       ])
 
-  to_scan = [v for v in all_videos if v not in skip_set and (v not in existing or force_rescan)]
+  # Skip videos that already have a sidecar (unless force rescan)
+  to_scan = []
+  for v in all_videos:
+      sidecar = os.path.join(directory, v) + SIDECAR_SUFFIX
+      if force_rescan or not os.path.exists(sidecar):
+          to_scan.append(v)
+
   total_to_scan = len(to_scan)
 
   if total_to_scan > 0:
@@ -84,9 +64,8 @@ defmodule Naturecounts.Offline.MetricsScanner do
           cap = cv2.VideoCapture(video_path)
 
           if not cap.isOpened():
-              existing[filename] = {"error": "could not read video"}
+              write_sidecar(video_path, {"schema_version": 1, "error": "could not read video"})
               cap.release()
-              # Write progress
               with open(progress_file, "w") as pf:
                   json.dump({"done": idx + 1, "total": total_to_scan, "current": filename}, pf)
               continue
@@ -167,7 +146,8 @@ defmodule Naturecounts.Offline.MetricsScanner do
                   "motion": round(mot, 2),
               })
 
-          existing[filename] = {
+          metrics = {
+              "schema_version": 1,
               "total_frames": total_frames,
               "fps": round(fps_val, 2),
               "duration_s": round(duration, 1),
@@ -188,8 +168,8 @@ defmodule Naturecounts.Offline.MetricsScanner do
               },
           }
 
-          # Write incrementally with file lock
-          write_index({filename: existing[filename]})
+          # Write per-file sidecar (no locking needed)
+          write_sidecar(video_path, metrics)
 
           # Write progress
           with open(progress_file, "w") as pf:
@@ -211,9 +191,6 @@ defmodule Naturecounts.Offline.MetricsScanner do
     batch_id = Keyword.get(opts, :batch_id, "0")
     _progress_callback = Keyword.get(opts, :progress_callback)
 
-    # Don't skip DB-processed files — metrics scan is lightweight and independent
-    processed_filenames = []
-
     progress_file = Path.join(System.tmp_dir!(), "scan_progress_#{batch_id}.json")
     cancel_file = Path.join(System.tmp_dir!(), "scan_cancel")
 
@@ -228,7 +205,6 @@ defmodule Naturecounts.Offline.MetricsScanner do
       "force_rescan" => force,
       "progress_file" => progress_file,
       "cancel_file" => cancel_file,
-      "skip_filenames" => Jason.encode!(processed_filenames),
       "batch_files" => Jason.encode!(batch_files)
     }
 

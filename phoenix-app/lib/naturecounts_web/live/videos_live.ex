@@ -887,6 +887,7 @@ defmodule NaturecountsWeb.VideosLive do
     if url do
       {:noreply,
        socket
+       |> assign(selected_file: file, preview_url: url)
        |> push_event("preview", %{url: url, filename: Path.basename(file)})
        |> push_event("seek", %{time: time})}
     else
@@ -1052,18 +1053,7 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   defp load_metrics_index(dir) do
-    index_path = Path.join(dir, ".metrics.json")
-
-    case File.read(index_path) do
-      {:ok, data} ->
-        case Jason.decode(data) do
-          {:ok, index} -> index
-          _ -> %{}
-        end
-
-      _ ->
-        %{}
-    end
+    Naturecounts.Offline.MetricsStore.read_dir(dir)
   end
 
   defp load_processed_files do
@@ -1214,6 +1204,7 @@ defmodule NaturecountsWeb.VideosLive do
   defp metric_val(%{metrics: m}, "brightness"), do: m["avg_brightness"] || -1
   defp metric_val(%{metrics: m}, "contrast"), do: m["contrast"] || -1
   defp metric_val(%{metrics: m}, "motion"), do: m["motion_score"] || -1
+  defp metric_val(%{metrics: m}, "total_detections"), do: m["total_detections"] || -1
   defp metric_val(%{metrics: m}, "bbox_count"), do: get_in(m, ["bbox_areas", "count"]) || -1
   defp metric_val(%{metrics: m}, "bbox_mean"), do: get_in(m, ["bbox_areas", "mean"]) || -1
   defp metric_val(%{metrics: m}, "fps"), do: m["fps"] || -1
@@ -1243,9 +1234,11 @@ defmodule NaturecountsWeb.VideosLive do
         scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
         maxes = %{
           det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
+          total_det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["total_detections"] || 0) end),
           brightness: 255,
           contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
           motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
+          bbox_count: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "count"]) || 0) end),
           bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
           duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
         }
@@ -1300,10 +1293,12 @@ defmodule NaturecountsWeb.VideosLive do
     else
       fields = [
         {"avg_detections_per_frame", 0.1},
+        {"total_detections", 1},
         {"avg_brightness", 1},
         {"duration_s", 1},
         {"contrast", 0.1},
         {"motion_score", 0.1},
+        {"bbox_count", 1},
         {"bbox_mean", 100}
       ]
 
@@ -1313,6 +1308,7 @@ defmodule NaturecountsWeb.VideosLive do
           |> Enum.map(fn f ->
             case field do
               "bbox_mean" -> get_in(f.metrics, ["bbox_areas", "mean"]) || 0
+              "bbox_count" -> get_in(f.metrics, ["bbox_areas", "count"]) || 0
               key -> f.metrics[key] || 0
             end
           end)
@@ -1456,10 +1452,12 @@ defmodule NaturecountsWeb.VideosLive do
   defp scatter_val(entry, key) do
     case key do
       "det" -> metric_val(entry, "det")
+      "total_det" -> metric_val(entry, "total_detections")
       "brightness" -> metric_val(entry, "brightness")
       "contrast" -> metric_val(entry, "contrast")
       "motion" -> metric_val(entry, "motion")
       "duration" -> metric_val(entry, "duration")
+      "bbox_count" -> metric_val(entry, "bbox_count")
       "bbox_mean" -> safe_bbox_mean(entry)
       "size" -> entry.size_mb
       _ -> 0
@@ -1472,11 +1470,13 @@ defmodule NaturecountsWeb.VideosLive do
 
   defp scatter_label(key) do
     case key do
-      "det" -> "Detections/frame"
+      "det" -> "Det/frame"
+      "total_det" -> "Total detections"
       "brightness" -> "Brightness"
       "contrast" -> "Contrast"
       "motion" -> "Motion"
       "duration" -> "Duration (s)"
+      "bbox_count" -> "Bbox count"
       "bbox_mean" -> "Bbox mean area"
       "size" -> "File size (MB)"
       _ -> key
@@ -1660,12 +1660,14 @@ defmodule NaturecountsWeb.VideosLive do
             </div>
 
             <%!-- Range filters --%>
-            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-x-3 gap-y-1 mb-3">
-              <.metric_filter field="avg_detections_per_frame" label="Detections" filters={@metric_filters} ranges={@ranges} />
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-x-3 gap-y-1 mb-3">
+              <.metric_filter field="avg_detections_per_frame" label="Det/frame" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="total_detections" label="Total det" filters={@metric_filters} ranges={@ranges} />
               <.metric_filter field="avg_brightness" label="Brightness" filters={@metric_filters} ranges={@ranges} />
               <.metric_filter field="duration_s" label="Duration (s)" filters={@metric_filters} ranges={@ranges} />
               <.metric_filter field="contrast" label="Contrast" filters={@metric_filters} ranges={@ranges} />
               <.metric_filter field="motion_score" label="Motion" filters={@metric_filters} ranges={@ranges} />
+              <.metric_filter field="bbox_count" label="Bbox count" filters={@metric_filters} ranges={@ranges} />
               <.metric_filter field="bbox_mean" label="Bbox area" filters={@metric_filters} ranges={@ranges} />
             </div>
 
@@ -1681,6 +1683,7 @@ defmodule NaturecountsWeb.VideosLive do
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">Size {sort_indicator(@sort_by, @sort_dir, "size")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="duration">Dur {sort_indicator(@sort_by, @sort_dir, "duration")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det">Det/f {sort_indicator(@sort_by, @sort_dir, "det")}</th>
+                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="total_detections">Total det {sort_indicator(@sort_by, @sort_dir, "total_detections")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="brightness">Bright {sort_indicator(@sort_by, @sort_dir, "brightness")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="contrast">Contrast {sort_indicator(@sort_by, @sort_dir, "contrast")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="motion">Motion {sort_indicator(@sort_by, @sort_dir, "motion")}</th>
@@ -1712,6 +1715,9 @@ defmodule NaturecountsWeb.VideosLive do
                           <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["avg_detections_per_frame"], @maxes.det, 142)}>
                             {entry.metrics["avg_detections_per_frame"]}
                           </td>
+                          <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["total_detections"], @maxes.total_det, 160)}>
+                            {entry.metrics["total_detections"] || 0}
+                          </td>
                           <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["avg_brightness"], 255, 45)}>
                             {entry.metrics["avg_brightness"] || "-"}
                           </td>
@@ -1726,7 +1732,7 @@ defmodule NaturecountsWeb.VideosLive do
                             {get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}
                           </td>
                         <% else %>
-                          <td colspan="7" class="text-xs text-base-content/30 italic">Not scanned</td>
+                          <td colspan="8" class="text-xs text-base-content/30 italic">Not scanned</td>
                         <% end %>
                       </tr>
                     <% end %>
@@ -1796,7 +1802,7 @@ defmodule NaturecountsWeb.VideosLive do
                     <span class="text-xs text-base-content/60">X:</span>
                     <input type="hidden" name="axis" value="x" />
                     <select class="select select-bordered select-xs" name="value">
-                      <option :for={k <- ["brightness", "det", "contrast", "motion", "duration", "bbox_mean", "size"]}
+                      <option :for={k <- ["brightness", "det", "total_det", "contrast", "motion", "duration", "bbox_count", "bbox_mean", "size"]}
                         value={k} selected={@scatter_x == k}>{scatter_label(k)}</option>
                     </select>
                   </form>
@@ -2463,7 +2469,7 @@ defmodule NaturecountsWeb.VideosLive do
                         </tr>
                       <% else %>
                         <tr class={[
-                            "hover",
+                            "hover cursor-pointer",
                             @selected_file == entry.path && "bg-primary/20",
                             MapSet.member?(@selected_files, entry.path) && "bg-error/10",
                             entry.processed && entry.processed.status == "completed" && profile_bg(entry.processed.profile),
@@ -2481,7 +2487,7 @@ defmodule NaturecountsWeb.VideosLive do
                             />
                           </td>
                           <td
-                            class="font-mono text-sm truncate max-w-[200px] cursor-pointer"
+                            class="font-mono text-sm truncate max-w-[200px]"
                             title={entry.name}
                             phx-click="select_file"
                             phx-value-file={entry.path}
@@ -2498,8 +2504,8 @@ defmodule NaturecountsWeb.VideosLive do
                               {entry.name}
                             </span>
                           </td>
-                          <td class="text-sm text-base-content/60 whitespace-nowrap">{entry.size_mb} MB</td>
-                          <td class="text-xs font-mono text-base-content/50">
+                          <td class="text-sm text-base-content/60 whitespace-nowrap" phx-click="select_file" phx-value-file={entry.path}>{entry.size_mb} MB</td>
+                          <td class="text-xs font-mono text-base-content/50" phx-click="select_file" phx-value-file={entry.path}>
                             <%= if entry.metrics && !entry.metrics["error"] do %>
                               <span class="flex items-center gap-1" title={"brightness: #{entry.metrics["avg_brightness"] || "?"}/255, #{get_in(entry.metrics, ["bbox_areas", "count"]) || 0} bboxes, #{entry.metrics["duration_s"]}s"}>
                                 <%= if is_number(entry.metrics["avg_brightness"]) and entry.metrics["avg_brightness"] < 15 do %>

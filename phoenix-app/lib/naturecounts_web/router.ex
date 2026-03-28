@@ -26,6 +26,11 @@ defmodule NaturecountsWeb.Router do
     get "/*path", VideoController, :show
   end
 
+  # Serve short clips with faststart for reliable seeking
+  scope "/serve/clip", NaturecountsWeb do
+    get "/*path", VideoController, :clip
+  end
+
   # Redirect to GCS signed URL for cloud video playback
   scope "/serve/gcs", NaturecountsWeb do
     get "/*path", VideoController, :show_gcs

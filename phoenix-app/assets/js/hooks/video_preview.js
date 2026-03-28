@@ -4,6 +4,7 @@ const VideoPreview = {
     this._video = null;
     this._wrapper = null;
     this._label = null;
+    this._pendingSeek = null;
 
     this.handleEvent("preview", (data) => {
       console.log("[VideoPreview] preview event", data);
@@ -15,7 +16,12 @@ const VideoPreview = {
 
       if (this._video) {
         // Video element already exists — just swap the source
-        if (this._video.src.endsWith(url)) return;
+        if (this._video.src.endsWith(url)) {
+          // Same video, no reload needed
+          this._label.title = filename;
+          this._label.textContent = filename;
+          return;
+        }
         this._video.src = url;
         this._video.load();
       } else {
@@ -46,23 +52,55 @@ const VideoPreview = {
     });
 
     this.handleEvent("seek", ({ time }) => {
-      console.log("[seek] event received", { time, hasVideo: !!this._video, readyState: this._video?.readyState, duration: this._video?.duration });
-      if (this._video) {
-        const doSeek = () => {
-          console.log("[seek] doSeek", { time, duration: this._video.duration, currentTime: this._video.currentTime });
-          this._video.currentTime = time;
-          this._video.play();
-        };
-        if (this._video.readyState >= 1) {
-          doSeek();
-        } else {
-          this._video.addEventListener("loadedmetadata", doSeek, { once: true });
-        }
-      }
+      console.log("[seek] event received", { time, hasVideo: !!this._video });
+      if (!this._video) return;
+
+      this._pendingSeek = time;
+      this._doSeek();
     });
   },
 
+  _doSeek() {
+    const video = this._video;
+    const time = this._pendingSeek;
+    if (!video || time == null) return;
+
+    // readyState >= 1 means metadata is loaded (duration, dimensions known)
+    if (video.readyState >= 1 && isFinite(video.duration)) {
+      const clampedTime = Math.min(time, video.duration - 0.1);
+      console.log("[seek] seeking to", clampedTime, "duration:", video.duration);
+      video.currentTime = clampedTime;
+      video.play().catch(() => {});
+      this._pendingSeek = null;
+    } else {
+      console.log("[seek] waiting for video metadata, readyState:", video.readyState);
+      // Wait for enough data to seek
+      const onReady = () => {
+        video.removeEventListener("canplay", onReady);
+        video.removeEventListener("loadedmetadata", onReady);
+        // Small delay to let the browser finish processing metadata
+        setTimeout(() => this._doSeek(), 50);
+      };
+      video.addEventListener("loadedmetadata", onReady, { once: false });
+      video.addEventListener("canplay", onReady, { once: false });
+
+      // Timeout fallback: if metadata never loads, try seeking anyway after 3s
+      setTimeout(() => {
+        video.removeEventListener("canplay", onReady);
+        video.removeEventListener("loadedmetadata", onReady);
+        if (this._pendingSeek != null && video.readyState >= 1) {
+          console.log("[seek] timeout fallback, attempting seek");
+          const t = this._pendingSeek;
+          this._pendingSeek = null;
+          video.currentTime = isFinite(video.duration) ? Math.min(t, video.duration - 0.1) : t;
+          video.play().catch(() => {});
+        }
+      }, 3000);
+    }
+  },
+
   _clear() {
+    this._pendingSeek = null;
     if (this._video) {
       this._video.pause();
       this._video.removeAttribute("src");
