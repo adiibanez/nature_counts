@@ -1447,39 +1447,6 @@ defmodule NaturecountsWeb.VideosLive do
     "background: hsla(#{hue}, 70%, 50%, #{alpha})"
   end
 
-  # Radar chart: generates SVG points for a radar/spider chart
-  defp radar_points(entry, maxes) do
-    axes = [
-      {metric_val(entry, "det"), maxes.det},
-      {metric_val(entry, "brightness"), 255},
-      {metric_val(entry, "contrast"), maxes.contrast},
-      {metric_val(entry, "motion"), maxes.motion},
-      {safe_bbox_mean(entry), maxes.bbox_mean}
-    ]
-
-    n = length(axes)
-
-    axes
-    |> Enum.with_index()
-    |> Enum.map(fn {{val, max_v}, i} ->
-      r = if max_v > 0 and val >= 0, do: min(val / max_v, 1.0) * 18, else: 0
-      angle = 2 * :math.pi() * i / n - :math.pi() / 2
-      x = 22 + r * :math.cos(angle)
-      y = 22 + r * :math.sin(angle)
-      "#{Float.round(x, 1)},#{Float.round(y, 1)}"
-    end)
-    |> Enum.join(" ")
-  end
-
-  defp radar_grid_points(ring, n) do
-    Enum.map(0..(n - 1), fn i ->
-      angle = 2 * :math.pi() * i / n - :math.pi() / 2
-      x = 22 + ring * :math.cos(angle)
-      y = 22 + ring * :math.sin(angle)
-      "#{Float.round(x, 1)},#{Float.round(y, 1)}"
-    end)
-    |> Enum.join(" ")
-  end
 
   defp safe_bbox_mean(%{metrics: nil}), do: 0
   defp safe_bbox_mean(%{metrics: m}), do: get_in(m, ["bbox_areas", "mean"]) || 0
@@ -1610,7 +1577,7 @@ defmodule NaturecountsWeb.VideosLive do
           <%= if @show_metrics do %>
             <div class="flex flex-col items-end gap-0.5 mr-2">
               <div class="join">
-                <button :for={v <- [{"heatmap", "Heatmap"}, {"cards", "Cards"}, {"scatter", "Scatter"}, {"grouped", "Grouped"}, {"radar", "Radar"}]}
+                <button :for={v <- [{"heatmap", "Heatmap"}, {"cards", "Cards"}, {"scatter", "Scatter"}, {"grouped", "Grouped"}]}
                   class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
                   phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
                 >
@@ -2000,87 +1967,6 @@ defmodule NaturecountsWeb.VideosLive do
               </div>
             <% end %>
 
-            <%!-- ═══════════════════════════════════════ --%>
-            <%!-- VIEW 5: RADAR / SPIDER THUMBNAILS      --%>
-            <%!-- ═══════════════════════════════════════ --%>
-            <%= if @metrics_view == "radar" do %>
-              <div class="overflow-x-auto">
-                <%!-- Legend --%>
-                <div class="flex gap-3 text-[10px] text-base-content/50 mb-2">
-                  <span :for={{label, color} <- [{"Det", "hsl(142, 70%, 50%)"}, {"Bright", "hsl(45, 70%, 50%)"}, {"Contrast", "hsl(200, 70%, 50%)"}, {"Motion", "hsl(280, 70%, 50%)"}, {"Bbox", "hsl(30, 70%, 50%)"}]}>
-                    <span class="inline-block w-2 h-2 rounded-full mr-0.5" style={"background: #{color}"} />{label}
-                  </span>
-                </div>
-                <table class="table table-xs">
-                  <thead>
-                    <tr class="text-xs">
-                      <th class="w-12">Shape</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">Size {sort_indicator(@sort_by, @sort_dir, "size")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det">Det/f {sort_indicator(@sort_by, @sort_dir, "det")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="brightness">Bright {sort_indicator(@sort_by, @sort_dir, "brightness")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="contrast">Contrast {sort_indicator(@sort_by, @sort_dir, "contrast")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="motion">Motion {sort_indicator(@sort_by, @sort_dir, "motion")}</th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="bbox_mean">Bbox avg {sort_indicator(@sort_by, @sort_dir, "bbox_mean")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <%= for entry <- @metrics_page, entry.type == :file do %>
-                      <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
-                        phx-click="select_file" phx-value-file={entry.path}>
-                        <td class="p-1">
-                          <%= if entry.metrics && !entry.metrics["error"] do %>
-                            <svg viewBox="0 0 44 44" class="w-10 h-10">
-                              <%!-- Grid rings --%>
-                              <polygon points={radar_grid_points(18, 5)} fill="none" stroke="currentColor" opacity="0.08" />
-                              <polygon points={radar_grid_points(12, 5)} fill="none" stroke="currentColor" opacity="0.06" />
-                              <polygon points={radar_grid_points(6, 5)} fill="none" stroke="currentColor" opacity="0.04" />
-                              <%!-- Axes --%>
-                              <line :for={i <- 0..4}
-                                x1="22" y1="22"
-                                x2={Float.round(22 + 18 * :math.cos(2 * :math.pi() * i / 5 - :math.pi() / 2), 1)}
-                                y2={Float.round(22 + 18 * :math.sin(2 * :math.pi() * i / 5 - :math.pi() / 2), 1)}
-                                stroke="currentColor" opacity="0.1"
-                              />
-                              <%!-- Data polygon --%>
-                              <polygon
-                                points={radar_points(entry, @maxes)}
-                                fill="hsl(var(--s))" fill-opacity="0.3"
-                                stroke="hsl(var(--s))" stroke-width="1.5"
-                              />
-                            </svg>
-                          <% else %>
-                            <div class="w-10 h-10 flex items-center justify-center text-base-content/20 text-lg">?</div>
-                          <% end %>
-                        </td>
-                        <td class="font-mono text-xs truncate max-w-[160px]" title={entry.name}>
-                          <span class="flex items-center gap-1">
-                            <%= if entry.processed do %>
-                              <span class={["w-2 h-2 rounded-full shrink-0",
-                                entry.processed.status == "completed" && profile_dot(entry.processed.profile),
-                                entry.processed.status == "processing" && "bg-info animate-pulse",
-                                entry.processed.status == "pending" && "bg-base-content/30"
-                              ]} />
-                            <% end %>
-                            {entry.name}
-                          </span>
-                        </td>
-                        <td class="text-xs text-base-content/60">{entry.size_mb}MB</td>
-                        <%= if entry.metrics && !entry.metrics["error"] do %>
-                          <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
-                          <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
-                          <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
-                          <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
-                          <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
-                        <% else %>
-                          <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
-                        <% end %>
-                      </tr>
-                    <% end %>
-                  </tbody>
-                </table>
-              </div>
-            <% end %>
 
             <%!-- ═══════════════════════════════════════ --%>
             <%!-- VIEW 6: TIMELINE SPARKLINES            --%>
