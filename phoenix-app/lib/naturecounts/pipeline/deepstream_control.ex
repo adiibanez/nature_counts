@@ -30,17 +30,24 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
     GenServer.call(__MODULE__, :stop_pipeline, 15_000)
   end
 
+  @doc "Restarts the MediaMTX container."
+  def restart_mediamtx do
+    GenServer.call(__MODULE__, :restart_mediamtx, 30_000)
+  end
+
   # --- GenServer callbacks ---
 
   @impl true
   def init(_opts) do
     container = System.get_env("DEEPSTREAM_CONTAINER_NAME", "2022_naturecounts-deepstream-1")
+    mediamtx_container = System.get_env("MEDIAMTX_CONTAINER_NAME", "2022_naturecounts-mediamtx-1")
     socket_path = System.get_env("DOCKER_SOCKET_PATH", "/var/run/docker.sock")
 
     Phoenix.PubSub.subscribe(Naturecounts.PubSub, "deepstream:connection")
 
     state = %{
       container: container,
+      mediamtx_container: mediamtx_container,
       socket_path: socket_path,
       container_status: :unknown,
       ws_connected: false
@@ -84,6 +91,20 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
         {:reply, :ok, state}
 
       {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:restart_mediamtx, _from, state) do
+    result = docker_post(state, "/containers/#{state.mediamtx_container}/restart?t=5")
+
+    case result do
+      {:ok, status} when status in [204] ->
+        Logger.info("[DeepstreamControl] MediaMTX container restarted")
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        Logger.error("[DeepstreamControl] Failed to restart MediaMTX: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
   end

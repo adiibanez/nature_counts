@@ -1,10 +1,13 @@
 const VideoPreview = {
   mounted() {
+    console.log("[VideoPreview] hook MOUNTED", this.el.id);
     this._video = null;
     this._wrapper = null;
     this._label = null;
 
-    this.handleEvent("preview", ({ url, filename }) => {
+    this.handleEvent("preview", (data) => {
+      console.log("[VideoPreview] preview event", data);
+      const { url, filename } = data;
       if (!url) {
         this._clear();
         return;
@@ -43,8 +46,10 @@ const VideoPreview = {
     });
 
     this.handleEvent("seek", ({ time }) => {
+      console.log("[seek] event received", { time, hasVideo: !!this._video, readyState: this._video?.readyState, duration: this._video?.duration });
       if (this._video) {
         const doSeek = () => {
+          console.log("[seek] doSeek", { time, duration: this._video.duration, currentTime: this._video.currentTime });
           this._video.currentTime = time;
           this._video.play();
         };

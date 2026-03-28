@@ -58,6 +58,7 @@ defmodule NaturecountsWeb.VideosLive do
        metrics_view: "heatmap",
        scatter_x: "brightness",
        scatter_y: "det",
+       scatter_color: "motion",
        temporal_y: "det",
        metrics_limit: 50,
        source: "local",
@@ -71,7 +72,8 @@ defmodule NaturecountsWeb.VideosLive do
        new_bucket_prefix: "",
        new_bucket_creds: "",
        bucket_test_result: nil
-     )}
+     )
+     |> recompute_metrics()}
   end
 
   @impl true
@@ -85,7 +87,7 @@ defmodule NaturecountsWeb.VideosLive do
       end
       |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-    {:noreply, assign(socket, entries: entries, processed_files: processed_files)}
+    {:noreply, assign(socket, entries: entries, processed_files: processed_files) |> recompute_metrics()}
   end
 
   def handle_info({:load_gcs, bucket_id, prefix}, socket) do
@@ -95,7 +97,7 @@ defmodule NaturecountsWeb.VideosLive do
       list_dir_gcs(bucket_id, prefix, processed_files)
       |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-    {:noreply, assign(socket, entries: entries, processed_files: processed_files)}
+    {:noreply, assign(socket, entries: entries, processed_files: processed_files) |> recompute_metrics()}
   end
 
   def handle_info({:scan_progress, _directory, progress}, socket) do
@@ -116,7 +118,7 @@ defmodule NaturecountsWeb.VideosLive do
     socket = assign(socket, entries: entries, processed_files: processed_files, scanning: still_scanning)
     socket = if not still_scanning, do: assign(socket, scan_progress: nil), else: socket
 
-    {:noreply, socket}
+    {:noreply, recompute_metrics(socket)}
   end
 
   def handle_info({:scan_complete, _directory}, socket) do
@@ -129,6 +131,7 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply,
      socket
      |> assign(scanning: false, scan_progress: nil, entries: entries, processed_files: processed_files)
+     |> recompute_metrics()
      |> put_flash(:info, "Metrics scan complete")}
   end
 
@@ -149,7 +152,7 @@ defmodule NaturecountsWeb.VideosLive do
           list_dir(socket.assigns.current_dir, processed_files)
           |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-        {:noreply, assign(socket, entries: entries, processed_files: processed_files, scan_progress: nil)}
+        {:noreply, assign(socket, entries: entries, processed_files: processed_files, scan_progress: nil) |> recompute_metrics()}
 
       # Scan running — read progress from any progress file
       scanning ->
@@ -179,6 +182,7 @@ defmodule NaturecountsWeb.VideosLive do
            preview_url: nil,
            selected_files: MapSet.new()
          )
+         |> recompute_metrics()
          |> push_event("preview", %{url: nil, filename: nil})}
 
       _ ->
@@ -196,6 +200,7 @@ defmodule NaturecountsWeb.VideosLive do
            preview_url: nil,
            selected_files: MapSet.new()
          )
+         |> recompute_metrics()
          |> push_event("preview", %{url: nil, filename: nil})}
     end
   end
@@ -217,7 +222,8 @@ defmodule NaturecountsWeb.VideosLive do
          preview_url: nil,
          selected_files: MapSet.new(),
          gcs_buckets: buckets
-       )}
+       )
+       |> recompute_metrics()}
     else
       {:noreply, assign(socket, source: "gcs", adding_bucket: true, gcs_buckets: buckets)}
     end
@@ -235,7 +241,8 @@ defmodule NaturecountsWeb.VideosLive do
        selected_file: nil,
        preview_url: nil,
        selected_files: MapSet.new()
-     )}
+     )
+     |> recompute_metrics()}
   end
 
   def handle_event("select_bucket", %{"id" => id}, socket) do
@@ -255,7 +262,8 @@ defmodule NaturecountsWeb.VideosLive do
            selected_file: nil,
            preview_url: nil,
            selected_files: MapSet.new()
-         )}
+         )
+         |> recompute_metrics()}
     end
   end
 
@@ -357,7 +365,8 @@ defmodule NaturecountsWeb.VideosLive do
                new_bucket_prefix: "",
                new_bucket_creds: "",
                bucket_test_result: nil
-             )}
+             )
+             |> recompute_metrics()}
           end
 
         id ->
@@ -396,9 +405,9 @@ defmodule NaturecountsWeb.VideosLive do
 
     if first do
       send(self(), {:load_gcs, first["id"], first["prefix"] || ""})
-      {:noreply, assign(socket, selected_bucket: first["id"], gcs_prefix: first["prefix"] || "", entries: :loading)}
+      {:noreply, assign(socket, selected_bucket: first["id"], gcs_prefix: first["prefix"] || "", entries: :loading) |> recompute_metrics()}
     else
-      {:noreply, assign(socket, selected_bucket: nil, entries: [], source: "gcs")}
+      {:noreply, assign(socket, selected_bucket: nil, entries: [], source: "gcs") |> recompute_metrics()}
     end
   end
 
@@ -481,6 +490,7 @@ defmodule NaturecountsWeb.VideosLive do
        preview_url: preview_url,
        jobs: list_jobs()
      )
+     |> recompute_metrics()
      |> put_flash(:info, "Deleted #{count} file(s) and associated data")}
   end
 
@@ -543,6 +553,7 @@ defmodule NaturecountsWeb.VideosLive do
        preview_url: preview_url,
        jobs: list_jobs()
      )
+     |> recompute_metrics()
      |> put_flash(:info, "Deleted #{Path.basename(file)}")}
   end
 
@@ -569,7 +580,7 @@ defmodule NaturecountsWeb.VideosLive do
       end
 
     entries = sort_entries(socket.assigns.entries, sort_by, sort_dir)
-    {:noreply, assign(socket, sort_by: sort_by, sort_dir: sort_dir, entries: entries)}
+    {:noreply, assign(socket, sort_by: sort_by, sort_dir: sort_dir, entries: entries) |> recompute_metrics()}
   end
 
   def handle_event("scan_metrics", _params, socket) do
@@ -612,6 +623,7 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply,
      socket
      |> assign(scanning: false, scan_progress: nil, entries: entries, processed_files: processed_files)
+     |> recompute_metrics()
      |> put_flash(:info, "Scan cancelled")}
   end
 
@@ -807,7 +819,7 @@ defmodule NaturecountsWeb.VideosLive do
       list_dir(socket.assigns.current_dir, processed_files)
       |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-    {:noreply, assign(socket, jobs: list_jobs(), entries: entries, processed_files: processed_files)}
+    {:noreply, assign(socket, jobs: list_jobs(), entries: entries, processed_files: processed_files) |> recompute_metrics()}
   end
 
   def handle_event("clean_orphans", _params, socket) do
@@ -827,6 +839,7 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply,
      socket
      |> assign(jobs: list_jobs(), entries: entries, processed_files: processed_files)
+     |> recompute_metrics()
      |> put_flash(:info, "Removed #{length(orphans)} orphaned record(s)")}
   end
 
@@ -835,13 +848,14 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_event("set_metrics_view", %{"view" => view}, socket) do
-    {:noreply, assign(socket, metrics_view: view, metrics_limit: 50)}
+    {:noreply, assign(socket, metrics_view: view, metrics_limit: 50) |> recompute_metrics()}
   end
 
   def handle_event("set_scatter_axis", %{"axis" => axis, "value" => value}, socket) do
     case axis do
       "x" -> {:noreply, assign(socket, scatter_x: value)}
       "y" -> {:noreply, assign(socket, scatter_y: value)}
+      "color" -> {:noreply, assign(socket, scatter_color: value)}
       _ -> {:noreply, socket}
     end
   end
@@ -857,22 +871,35 @@ defmodule NaturecountsWeb.VideosLive do
         :error -> 0.0
       end
 
-    socket =
-      if socket.assigns.selected_file != file do
-        # Select the file first, then seek
-        socket
-        |> assign(selected_file: file)
-        |> push_event("preview", %{url: "/serve/videos/#{Path.relative_to(file, @videos_root)}", filename: Path.basename(file)})
-        |> push_event("seek", %{time: time})
-      else
-        push_event(socket, "seek", %{time: time})
+    url =
+      case socket.assigns.source do
+        "gcs" ->
+          bucket_config = GCSBuckets.get(socket.assigns.selected_bucket)
+          case GCS.signed_url(bucket_config, file) do
+            {:ok, signed} -> signed
+            _ -> nil
+          end
+
+        _ ->
+          "/serve/videos/#{Path.relative_to(file, @videos_root)}"
       end
 
-    {:noreply, socket}
+    if url do
+      {:noreply,
+       socket
+       |> push_event("preview", %{url: url, filename: Path.basename(file)})
+       |> push_event("seek", %{time: time})}
+    else
+      {:noreply, socket}
+    end
   end
 
   def handle_event("load_more_metrics", _params, socket) do
-    {:noreply, assign(socket, metrics_limit: socket.assigns.metrics_limit + 50)}
+    {:noreply, assign(socket, metrics_limit: socket.assigns.metrics_limit + 50) |> recompute_metrics()}
+  end
+
+  def handle_event("load_all_metrics", _params, socket) do
+    {:noreply, assign(socket, metrics_limit: 999_999) |> recompute_metrics()}
   end
 
   def handle_event("set_metric_filter", %{"field" => field, "min" => min_str, "max" => max_str}, socket) do
@@ -888,7 +915,7 @@ defmodule NaturecountsWeb.VideosLive do
         Map.put(filters, field, {min_val, max_val})
       end
 
-    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50)}
+    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50) |> recompute_metrics()}
   end
 
   def handle_event("quick_filter", %{"preset" => preset}, socket) do
@@ -904,7 +931,7 @@ defmodule NaturecountsWeb.VideosLive do
         _ -> socket.assigns.metric_filters
       end
 
-    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50)}
+    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50) |> recompute_metrics()}
   end
 
   defp parse_number(""), do: nil
@@ -1182,50 +1209,54 @@ defmodule NaturecountsWeb.VideosLive do
   defp metric_val(%{metrics: m}, "fps"), do: m["fps"] || -1
   defp metric_val(_, _), do: -1
 
-  defp compute_derived_assigns(%{entries: :loading} = assigns) do
-    assign(assigns,
-      visible: [],
-      metrics_page: [],
-      total_visible: 0,
-      has_more_metrics: false,
-      summary: nil,
-      maxes: %{det: 0, brightness: 255, contrast: 0, motion: 0, bbox_mean: 0, duration: 0},
-      scanned_only: [],
-      loading_entries: true
-    )
-  end
+  defp recompute_metrics(socket) do
+    assigns = socket.assigns
 
-  defp compute_derived_assigns(assigns) do
-    visible = filtered_entries(assigns.entries, assigns.metric_filters)
-    summary = compute_metrics_summary(visible)
+    case assigns.entries do
+      :loading ->
+        assign(socket,
+          visible: [],
+          metrics_page: [],
+          total_visible: 0,
+          has_more_metrics: false,
+          summary: nil,
+          maxes: %{det: 0, brightness: 255, contrast: 0, motion: 0, bbox_mean: 0, duration: 0},
+          scanned_only: [],
+          loading_entries: true
+        )
 
-    scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
-    maxes = %{
-      det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
-      brightness: 255,
-      contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
-      motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
-      bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
-      duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
-    }
+      entries ->
+        visible = filtered_entries(entries, assigns.metric_filters)
+        summary = compute_metrics_summary(visible)
 
-    scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
+        scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
+        maxes = %{
+          det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
+          brightness: 255,
+          contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
+          motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
+          bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
+          duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
+        }
 
-    visible_files = Enum.filter(visible, &(&1.type == :file))
-    total_visible = length(visible_files)
-    metrics_page = Enum.take(visible, assigns.metrics_limit)
-    has_more = total_visible > assigns.metrics_limit
+        scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
 
-    assign(assigns,
-      visible: visible,
-      metrics_page: metrics_page,
-      total_visible: total_visible,
-      has_more_metrics: has_more,
-      summary: summary,
-      maxes: maxes,
-      scanned_only: Enum.take(scanned_only, assigns.metrics_limit),
-      loading_entries: false
-    )
+        visible_files = Enum.filter(visible, &(&1.type == :file))
+        total_visible = length(visible_files)
+        metrics_page = Enum.take(visible, assigns.metrics_limit)
+        has_more = total_visible > assigns.metrics_limit
+
+        assign(socket,
+          visible: visible,
+          metrics_page: metrics_page,
+          total_visible: total_visible,
+          has_more_metrics: has_more,
+          summary: summary,
+          maxes: maxes,
+          scanned_only: Enum.take(scanned_only, assigns.metrics_limit),
+          loading_entries: false
+        )
+    end
   end
 
   defp filtered_entries(entries, metric_filters) when map_size(metric_filters) == 0, do: entries
@@ -1438,8 +1469,6 @@ defmodule NaturecountsWeb.VideosLive do
 
   @impl true
   def render(assigns) do
-    assigns = compute_derived_assigns(assigns)
-
     ~H"""
     <div class="p-4 space-y-4">
       <div class="flex items-center justify-between">
@@ -1721,6 +1750,14 @@ defmodule NaturecountsWeb.VideosLive do
                         value={k} selected={@scatter_y == k}>{scatter_label(k)}</option>
                     </select>
                   </form>
+                  <form class="flex items-center gap-1" phx-change="set_scatter_axis">
+                    <span class="text-xs text-base-content/60">Color:</span>
+                    <input type="hidden" name="axis" value="color" />
+                    <select class="select select-bordered select-xs" name="value">
+                      <option :for={k <- ["motion", "brightness", "det", "contrast", "duration", "bbox_mean", "size"]}
+                        value={k} selected={@scatter_color == k}>{scatter_label(k)}</option>
+                    </select>
+                  </form>
                 </div>
                 <div class="bg-base-100 rounded-lg p-4">
                   <svg viewBox="0 0 900 320" class="w-full">
@@ -1734,15 +1771,15 @@ defmodule NaturecountsWeb.VideosLive do
                     <text x="465" y="305" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11">{scatter_label(@scatter_x)}</text>
                     <text x="15" y="145" text-anchor="middle" fill="currentColor" opacity="0.5" font-size="11" transform="rotate(-90, 15, 145)">{scatter_label(@scatter_y)}</text>
 
-                    <%!-- Data points (color = motion) --%>
+                    <%!-- Data points --%>
                     <% x_max = scatter_max(@scanned_only, @scatter_x) %>
                     <% y_max = scatter_max(@scanned_only, @scatter_y) %>
-                    <% motion_max = scatter_max(@scanned_only, "motion") %>
+                    <% color_max = scatter_max(@scanned_only, @scatter_color) %>
                     <%= for entry <- @scanned_only do %>
                       <% cx = 50 + scatter_val(entry, @scatter_x) / x_max * 830 %>
                       <% cy = 280 - scatter_val(entry, @scatter_y) / y_max * 270 %>
-                      <% motion_t = Float.round(min(scatter_val(entry, "motion") / motion_max, 1.0), 3) %>
-                      <% hue = Float.round(240 * (1 - motion_t), 0) %>
+                      <% color_t = Float.round(min(scatter_val(entry, @scatter_color) / color_max, 1.0), 3) %>
+                      <% hue = Float.round(240 * (1 - color_t), 0) %>
                       <circle
                         cx={Float.round(cx, 1)} cy={Float.round(cy, 1)} r={if @selected_file == entry.path, do: "6", else: "4"}
                         fill={if @selected_file == entry.path, do: "hsl(var(--p))", else: "hsl(#{hue}, 80%, 55%)"}
@@ -1750,15 +1787,15 @@ defmodule NaturecountsWeb.VideosLive do
                         class="cursor-pointer hover:opacity-100 transition-opacity"
                         phx-click="select_file" phx-value-file={entry.path}
                       >
-                        <title>{entry.name} — {scatter_label(@scatter_x)}: {scatter_val(entry, @scatter_x)}, {scatter_label(@scatter_y)}: {scatter_val(entry, @scatter_y)}, motion: {scatter_val(entry, "motion")}</title>
+                        <title>{entry.name} — {scatter_label(@scatter_x)}: {scatter_val(entry, @scatter_x)}, {scatter_label(@scatter_y)}: {scatter_val(entry, @scatter_y)}, {scatter_label(@scatter_color)}: {scatter_val(entry, @scatter_color)}</title>
                       </circle>
                     <% end %>
 
-                    <%!-- Motion color legend --%>
+                    <%!-- Color legend --%>
                     <rect :for={i <- 0..9} x={700 + i * 18} y="10" width="18" height="8" rx="1"
                       fill={"hsl(#{240 - i * 24}, 80%, 55%)"} />
-                    <text x="700" y="28" fill="currentColor" opacity="0.4" font-size="9">still</text>
-                    <text x="880" y="28" text-anchor="end" fill="currentColor" opacity="0.4" font-size="9">motion</text>
+                    <text x="700" y="28" fill="currentColor" opacity="0.4" font-size="9">low</text>
+                    <text x="880" y="28" text-anchor="end" fill="currentColor" opacity="0.4" font-size="9">{scatter_label(@scatter_color)}</text>
                   </svg>
                 </div>
               </div>
@@ -2191,6 +2228,7 @@ defmodule NaturecountsWeb.VideosLive do
                   Showing {@metrics_limit} of {@total_visible} files
                 </span>
                 <button class="btn btn-ghost btn-xs" phx-click="load_more_metrics">Load more</button>
+                <button class="btn btn-ghost btn-xs" phx-click="load_all_metrics">All</button>
               </div>
             <% else %>
               <%= if @total_visible > 0 do %>
