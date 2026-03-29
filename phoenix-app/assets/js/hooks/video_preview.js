@@ -14,6 +14,12 @@ const VideoPreview = {
         return;
       }
 
+      // Clean up any pending seek from previous video
+      if (this._seekCleanup) {
+        this._seekCleanup();
+        this._seekCleanup = null;
+      }
+
       if (this._video) {
         // Video element already exists — just swap the source
         if (this._video.src.endsWith(url)) {
@@ -65,6 +71,12 @@ const VideoPreview = {
     const time = this._pendingSeek;
     if (!video || time == null) return;
 
+    // Clean up any previous seek listeners to avoid accumulation
+    if (this._seekCleanup) {
+      this._seekCleanup();
+      this._seekCleanup = null;
+    }
+
     // readyState >= 1 means metadata is loaded (duration, dimensions known)
     if (video.readyState >= 1 && isFinite(video.duration)) {
       const clampedTime = Math.min(time, video.duration - 0.1);
@@ -76,18 +88,23 @@ const VideoPreview = {
       console.log("[seek] waiting for video metadata, readyState:", video.readyState);
       // Wait for enough data to seek
       const onReady = () => {
-        video.removeEventListener("canplay", onReady);
-        video.removeEventListener("loadedmetadata", onReady);
+        cleanup();
         // Small delay to let the browser finish processing metadata
         setTimeout(() => this._doSeek(), 50);
       };
-      video.addEventListener("loadedmetadata", onReady, { once: false });
-      video.addEventListener("canplay", onReady, { once: false });
+      video.addEventListener("loadedmetadata", onReady, { once: true });
+      video.addEventListener("canplay", onReady, { once: true });
 
-      // Timeout fallback: if metadata never loads, try seeking anyway after 3s
-      setTimeout(() => {
+      const cleanup = () => {
         video.removeEventListener("canplay", onReady);
         video.removeEventListener("loadedmetadata", onReady);
+        clearTimeout(fallbackTimer);
+        this._seekCleanup = null;
+      };
+
+      // Timeout fallback: if metadata never loads, try seeking anyway after 3s
+      const fallbackTimer = setTimeout(() => {
+        cleanup();
         if (this._pendingSeek != null && video.readyState >= 1) {
           console.log("[seek] timeout fallback, attempting seek");
           const t = this._pendingSeek;
@@ -96,11 +113,17 @@ const VideoPreview = {
           video.play().catch(() => {});
         }
       }, 3000);
+
+      this._seekCleanup = cleanup;
     }
   },
 
   _clear() {
     this._pendingSeek = null;
+    if (this._seekCleanup) {
+      this._seekCleanup();
+      this._seekCleanup = null;
+    }
     if (this._video) {
       this._video.pause();
       this._video.removeAttribute("src");

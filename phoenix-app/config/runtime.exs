@@ -20,6 +20,12 @@ if System.get_env("PHX_SERVER") do
   config :naturecounts, NaturecountsWeb.Endpoint, server: true
 end
 
+# Scanning concurrency: one Python subprocess per slot, default 4
+scan_workers = String.to_integer(System.get_env("SCAN_WORKERS", "4"))
+
+config :naturecounts, Oban,
+  queues: [video_processing: 1, scanning: scan_workers]
+
 config :naturecounts, NaturecountsWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4005"))]
 

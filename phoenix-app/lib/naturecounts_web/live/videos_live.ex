@@ -50,6 +50,7 @@ defmodule NaturecountsWeb.VideosLive do
        context_name: "",
        scanning: scan_running?(),
        scan_progress: nil,
+       scan_last_reload: 0,
        scan_force: false,
        sort_by: "name",
        sort_dir: "asc",
@@ -105,20 +106,23 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_info({:scan_batch_complete, _directory, _batch_id, _result}, socket) do
-    # Reload entries to pick up new metrics from this batch
-    Naturecounts.Cache.invalidate_group(:file_browser)
-    processed_files = load_processed_files()
-    entries =
-      list_dir(socket.assigns.current_dir, processed_files)
-      |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
+    # Throttle entry reloads to at most every 5 seconds
+    now = System.monotonic_time(:second)
 
-    # Check if any scan jobs are still running
-    still_scanning = scan_running?()
+    if now - socket.assigns.scan_last_reload >= 5 do
+      Naturecounts.Cache.invalidate_group(:file_browser)
+      processed_files = load_processed_files()
+      entries =
+        list_dir(socket.assigns.current_dir, processed_files)
+        |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-    socket = assign(socket, entries: entries, processed_files: processed_files, scanning: still_scanning)
-    socket = if not still_scanning, do: assign(socket, scan_progress: nil), else: socket
-
-    {:noreply, recompute_metrics(socket)}
+      {:noreply,
+       socket
+       |> assign(entries: entries, processed_files: processed_files, scan_last_reload: now)
+       |> recompute_metrics()}
+    else
+      {:noreply, socket}
+    end
   end
 
   def handle_info({:scan_complete, _directory}, socket) do
@@ -144,7 +148,7 @@ defmodule NaturecountsWeb.VideosLive do
     socket = assign(socket, jobs: list_jobs(), scanning: scanning)
 
     cond do
-      # Scan just finished — reload entries to pick up new metrics
+      # Scan just finished — final reload
       was_scanning and not scanning ->
         Naturecounts.Cache.invalidate_group(:file_browser)
         processed_files = load_processed_files()
@@ -152,11 +156,14 @@ defmodule NaturecountsWeb.VideosLive do
           list_dir(socket.assigns.current_dir, processed_files)
           |> sort_entries(socket.assigns.sort_by, socket.assigns.sort_dir)
 
-        {:noreply, assign(socket, entries: entries, processed_files: processed_files, scan_progress: nil) |> recompute_metrics()}
+        {:noreply,
+         socket
+         |> assign(entries: entries, processed_files: processed_files, scan_progress: nil)
+         |> recompute_metrics()}
 
-      # Scan running — read progress from any progress file
+      # Scan running — poll Oban job counts for progress
       scanning ->
-        progress = read_scan_progress()
+        progress = poll_scan_progress()
         {:noreply, assign(socket, scan_progress: progress)}
 
       true ->
@@ -445,12 +452,43 @@ defmodule NaturecountsWeb.VideosLive do
   def handle_event("toggle_select", %{"file" => file}, socket) do
     selected = socket.assigns.selected_files
 
+    # Check if this is a directory entry
+    entry = Enum.find(visible_entries(socket.assigns), &(&1.path == file))
+
     selected =
-      if MapSet.member?(selected, file),
-        do: MapSet.delete(selected, file),
-        else: MapSet.put(selected, file)
+      case entry do
+        %{type: :dir, path: dir_path} ->
+          # Collect all video files recursively under this directory
+          dir_files = collect_video_files_recursive(dir_path)
+          all_selected? = Enum.all?(dir_files, &MapSet.member?(selected, &1))
+
+          if all_selected? do
+            Enum.reduce(dir_files, selected, &MapSet.delete(&2, &1))
+          else
+            Enum.reduce(dir_files, selected, &MapSet.put(&2, &1))
+          end
+
+        _ ->
+          if MapSet.member?(selected, file),
+            do: MapSet.delete(selected, file),
+            else: MapSet.put(selected, file)
+      end
 
     {:noreply, assign(socket, selected_files: selected)}
+  end
+
+  def handle_event("select_all", _params, socket) do
+    all_files =
+      (socket.assigns.visible || [])
+      |> Enum.filter(&(&1.type == :file))
+      |> Enum.map(& &1.path)
+      |> MapSet.new()
+
+    {:noreply, assign(socket, selected_files: all_files)}
+  end
+
+  def handle_event("select_none", _params, socket) do
+    {:noreply, assign(socket, selected_files: MapSet.new())}
   end
 
   def handle_event("delete_selected", _params, socket) do
@@ -585,12 +623,12 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("scan_metrics", _params, socket) do
     %{
+      "mode" => "dispatch",
       "directory" => socket.assigns.current_dir,
       "force" => socket.assigns.scan_force,
-      "sample_frames" => 20,
-      "parallel" => true
+      "sample_frames" => 60
     }
-    |> ScanMetricsWorker.new()
+    |> ScanMetricsWorker.new(priority: 1)
     |> Oban.insert!()
 
     {:noreply, assign(socket, scanning: true)}
@@ -727,10 +765,21 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   def handle_event("start_processing", _params, socket) do
-    file = socket.assigns.selected_file
+    selected = socket.assigns.selected_files
+    single_file = socket.assigns.selected_file
     profile = socket.assigns.selected_profile
 
-    if file do
+    # Determine the list of files to process: selected files take priority, fallback to single file
+    files_to_process =
+      if MapSet.size(selected) > 0 do
+        MapSet.to_list(selected)
+      else
+        if single_file, do: [single_file], else: []
+      end
+
+    if files_to_process == [] do
+      {:noreply, put_flash(socket, :error, "No file selected")}
+    else
       gcs_attrs =
         case socket.assigns.source do
           "gcs" ->
@@ -740,32 +789,34 @@ defmodule NaturecountsWeb.VideosLive do
             %{storage_backend: "local"}
         end
 
-      video =
-        %Video{}
-        |> Video.changeset(
-          Map.merge(gcs_attrs, %{
-            filename: Path.basename(file),
-            path: file,
-            processing_profile: profile,
-            min_bbox_area: socket.assigns.min_bbox_area,
-            vlm_sample_pct: socket.assigns.vlm_sample_pct,
-            fishial_enabled: socket.assigns.fishial_enabled,
-            vlm_enabled: socket.assigns.vlm_enabled,
-            location: socket.assigns.vlm_context_prompt
-          })
-        )
-        |> Repo.insert!()
+      Enum.each(files_to_process, fn file ->
+        video =
+          %Video{}
+          |> Video.changeset(
+            Map.merge(gcs_attrs, %{
+              filename: Path.basename(file),
+              path: file,
+              processing_profile: profile,
+              min_bbox_area: socket.assigns.min_bbox_area,
+              vlm_sample_pct: socket.assigns.vlm_sample_pct,
+              fishial_enabled: socket.assigns.fishial_enabled,
+              vlm_enabled: socket.assigns.vlm_enabled,
+              location: socket.assigns.vlm_context_prompt
+            })
+          )
+          |> Repo.insert!()
 
-      %{video_id: video.id}
-      |> ProcessVideoWorker.new()
-      |> Oban.insert!()
+        %{video_id: video.id}
+        |> ProcessVideoWorker.new()
+        |> Oban.insert!()
+      end)
+
+      count = length(files_to_process)
 
       {:noreply,
        socket
-       |> assign(selected_file: nil, preview_url: nil, jobs: list_jobs())
-       |> put_flash(:info, "Processing started for #{Path.basename(file)}")}
-    else
-      {:noreply, put_flash(socket, :error, "No file selected")}
+       |> assign(selected_file: nil, preview_url: nil, selected_files: MapSet.new(), jobs: list_jobs())
+       |> put_flash(:info, "Processing started for #{count} file(s)")}
     end
   end
 
@@ -987,46 +1038,37 @@ defmodule NaturecountsWeb.VideosLive do
     end
   end
 
-  defp read_scan_progress do
-    tmp = System.tmp_dir!()
+  defp poll_scan_progress do
+    import Ecto.Query
 
-    # Read all batch progress files and aggregate
-    progress_files =
-      case File.ls(tmp) do
-        {:ok, names} ->
-          names
-          |> Enum.filter(&String.starts_with?(&1, "scan_progress_"))
-          |> Enum.map(&Path.join(tmp, &1))
+    worker = "Naturecounts.Offline.ScanMetricsWorker"
 
-        _ -> []
-      end
+    counts =
+      Oban.Job
+      |> where([j], j.worker == ^worker)
+      |> where([j], j.state in ["available", "executing", "completed", "discarded", "retryable"])
+      |> group_by([j], j.state)
+      |> select([j], {j.state, count(j.id)})
+      |> Repo.all()
+      |> Map.new()
 
-    # Also check legacy single-worker file
-    legacy = Path.join(tmp, "scan_progress.json")
-    progress_files = if File.exists?(legacy), do: [legacy | progress_files], else: progress_files
+    executing = Map.get(counts, "executing", 0)
+    available = Map.get(counts, "available", 0)
+    completed = Map.get(counts, "completed", 0)
+    failed = Map.get(counts, "discarded", 0) + Map.get(counts, "retryable", 0)
 
-    if progress_files == [] do
-      nil
+    total = executing + available + completed + failed
+
+    if total > 0 do
+      %{
+        "done" => completed,
+        "total" => total,
+        "executing" => executing,
+        "pending" => available,
+        "failed" => failed
+      }
     else
-      results = Enum.flat_map(progress_files, fn f ->
-        case File.read(f) do
-          {:ok, data} ->
-            case Jason.decode(data) do
-              {:ok, p} -> [p]
-              _ -> []
-            end
-          _ -> []
-        end
-      end)
-
-      if results == [] do
-        nil
-      else
-        total_done = Enum.reduce(results, 0, fn p, acc -> acc + (p["done"] || 0) end)
-        total_total = Enum.reduce(results, 0, fn p, acc -> acc + (p["total"] || 0) end)
-        current = results |> Enum.max_by(fn p -> p["done"] || 0 end) |> Map.get("current", "")
-        %{"done" => total_done, "total" => total_total, "current" => current}
-      end
+      nil
     end
   end
 
@@ -1041,16 +1083,6 @@ defmodule NaturecountsWeb.VideosLive do
     end, ttl: 2_000, group: :videos)
   end
 
-  defp scan_active_count do
-    import Ecto.Query
-
-    Naturecounts.Cache.get_or_compute(:scan_active_count, fn ->
-      Oban.Job
-      |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
-      |> where([j], j.state in ["available", "executing"])
-      |> Repo.aggregate(:count)
-    end, ttl: 2_000, group: :videos)
-  end
 
   defp load_metrics_index(dir) do
     Naturecounts.Offline.MetricsStore.read_dir(dir)
@@ -1117,6 +1149,36 @@ defmodule NaturecountsWeb.VideosLive do
   defp video_file?(name) do
     ext = name |> Path.extname() |> String.downcase()
     ext in @video_extensions
+  end
+
+  defp collect_video_files_recursive(dir) do
+    case File.ls(dir) do
+      {:ok, names} ->
+        Enum.flat_map(names, fn name ->
+          path = Path.join(dir, name)
+
+          cond do
+            File.dir?(path) and not String.starts_with?(name, ".") ->
+              collect_video_files_recursive(path)
+
+            video_file?(name) ->
+              [path]
+
+            true ->
+              []
+          end
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp visible_entries(assigns) do
+    case assigns.entries do
+      :loading -> []
+      entries -> entries
+    end
   end
 
   defp list_dir_gcs(bucket_id, prefix, processed_files) do
@@ -1430,9 +1492,6 @@ defmodule NaturecountsWeb.VideosLive do
   defp format_metric_val(nil), do: ""
   defp format_metric_val(val), do: "#{val}"
 
-  defp bar_pct(_val, max) when max == 0 or max == nil, do: 0
-  defp bar_pct(nil, _max), do: 0
-  defp bar_pct(val, max), do: min(round(val / max * 100), 100)
 
   # Heatmap: returns an rgba background color string for a value in [0, max]
   defp heatmap_bg(_val, max, _hue) when max == 0 or max == nil, do: "background: transparent"
@@ -1523,27 +1582,6 @@ defmodule NaturecountsWeb.VideosLive do
     "hsl(#{hue}, 70%, 55%)"
   end
 
-  defp distribution_data(files, key) do
-    vals =
-      files
-      |> Enum.map(&scatter_val(&1, key))
-      |> Enum.filter(&(&1 >= 0))
-      |> Enum.sort()
-
-    case vals do
-      [] -> nil
-      _ ->
-        n = length(vals)
-        %{
-          min: List.first(vals),
-          q1: Enum.at(vals, div(n, 4)),
-          median: Enum.at(vals, div(n, 2)),
-          q3: Enum.at(vals, div(3 * n, 4)),
-          max: List.last(vals)
-        }
-    end
-  end
-
   defp profile_bg("light"), do: "bg-success/10"
   defp profile_bg("standard"), do: "bg-warning/10"
   defp profile_bg("deep"), do: "bg-error/10"
@@ -1577,7 +1615,7 @@ defmodule NaturecountsWeb.VideosLive do
           <%= if @show_metrics do %>
             <div class="flex flex-col items-end gap-0.5 mr-2">
               <div class="join">
-                <button :for={v <- [{"heatmap", "Heatmap"}, {"cards", "Cards"}, {"scatter", "Scatter"}, {"grouped", "Grouped"}]}
+                <button :for={v <- [{"heatmap", "Heatmap"}, {"scatter", "Scatter"}]}
                   class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
                   phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
                 >
@@ -1679,6 +1717,7 @@ defmodule NaturecountsWeb.VideosLive do
                 <table class="table table-xs">
                   <thead>
                     <tr class="text-xs">
+                      <th class="w-6"></th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">Size {sort_indicator(@sort_by, @sort_dir, "size")}</th>
                       <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="duration">Dur {sort_indicator(@sort_by, @sort_dir, "duration")}</th>
@@ -1694,10 +1733,20 @@ defmodule NaturecountsWeb.VideosLive do
                   <tbody>
                     <%= for entry <- @metrics_page, entry.type == :file do %>
                       <tr
-                        class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
-                        phx-click="select_file" phx-value-file={entry.path}
+                        class={["hover cursor-pointer",
+                          @selected_file == entry.path && "ring-1 ring-primary",
+                          MapSet.member?(@selected_files, entry.path) && "bg-error/10"]}
                       >
-                        <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            class="checkbox checkbox-xs checkbox-error"
+                            checked={MapSet.member?(@selected_files, entry.path)}
+                            phx-click="toggle_select"
+                            phx-value-file={entry.path}
+                          />
+                        </td>
+                        <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name} phx-click="select_file" phx-value-file={entry.path}>
                           <span class="flex items-center gap-1">
                             <%= if entry.processed do %>
                               <span class={["w-2 h-2 rounded-full shrink-0",
@@ -1709,7 +1758,7 @@ defmodule NaturecountsWeb.VideosLive do
                             {entry.name}
                           </span>
                         </td>
-                        <td class="text-xs text-base-content/60">{entry.size_mb}MB</td>
+                        <td class="text-xs text-base-content/60" phx-click="select_file" phx-value-file={entry.path}>{entry.size_mb}MB</td>
                         <%= if entry.metrics && !entry.metrics["error"] do %>
                           <td class="text-xs font-mono">{entry.metrics["duration_s"]}s</td>
                           <td class="text-xs font-mono text-center rounded" style={heatmap_bg(entry.metrics["avg_detections_per_frame"], @maxes.det, 142)}>
@@ -1738,57 +1787,6 @@ defmodule NaturecountsWeb.VideosLive do
                     <% end %>
                   </tbody>
                 </table>
-              </div>
-            <% end %>
-
-            <%!-- ═══════════════════════════════════════ --%>
-            <%!-- VIEW 2: CARD GRID                      --%>
-            <%!-- ═══════════════════════════════════════ --%>
-            <%= if @metrics_view == "cards" do %>
-              <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2 max-h-[500px] overflow-y-auto">
-                <%= for entry <- @metrics_page, entry.type == :file do %>
-                  <div
-                    class={["card card-compact bg-base-100 cursor-pointer hover:shadow-md transition-shadow",
-                      @selected_file == entry.path && "ring-2 ring-primary"]}
-                    phx-click="select_file" phx-value-file={entry.path}
-                  >
-                    <div class="card-body p-3">
-                      <div class="flex items-center gap-1 mb-1">
-                        <%= if entry.processed do %>
-                          <span class={["w-2 h-2 rounded-full shrink-0",
-                            entry.processed.status == "completed" && profile_dot(entry.processed.profile),
-                            entry.processed.status == "processing" && "bg-info animate-pulse",
-                            entry.processed.status == "pending" && "bg-base-content/30"
-                          ]} />
-                        <% end %>
-                        <span class="font-mono text-xs truncate" title={entry.name}>{entry.name}</span>
-                      </div>
-                      <div class="text-[10px] text-base-content/50">{entry.size_mb}MB</div>
-
-                      <%= if entry.metrics && !entry.metrics["error"] do %>
-                        <%!-- Micro bar chart fingerprint --%>
-                        <div class="flex items-end gap-px h-8 mt-1">
-                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["avg_detections_per_frame"], @maxes.det)}%; background: hsl(142, 70%, 50%); min-height: 2px"} title={"Det: #{entry.metrics["avg_detections_per_frame"]}"} />
-                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["avg_brightness"], 255)}%; background: hsl(45, 70%, 50%); min-height: 2px"} title={"Bright: #{entry.metrics["avg_brightness"]}"} />
-                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["contrast"], @maxes.contrast)}%; background: hsl(200, 70%, 50%); min-height: 2px"} title={"Contrast: #{entry.metrics["contrast"]}"} />
-                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(entry.metrics["motion_score"], @maxes.motion)}%; background: hsl(280, 70%, 50%); min-height: 2px"} title={"Motion: #{entry.metrics["motion_score"]}"} />
-                          <div class="flex-1 rounded-t" style={"height: #{bar_pct(get_in(entry.metrics, ["bbox_areas", "mean"]), @maxes.bbox_mean)}%; background: hsl(30, 70%, 50%); min-height: 2px"} title={"Bbox: #{get_in(entry.metrics, ["bbox_areas", "mean"])}"} />
-                        </div>
-                        <div class="flex justify-between text-[9px] text-base-content/40 mt-0.5">
-                          <span>Det</span><span>Bri</span><span>Con</span><span>Mot</span><span>Bbx</span>
-                        </div>
-                        <div class="flex gap-2 text-[10px] text-base-content/60 mt-1">
-                          <span>{entry.metrics["duration_s"]}s</span>
-                          <span>{entry.metrics["avg_detections_per_frame"]} det</span>
-                        </div>
-                      <% else %>
-                        <div class="h-8 flex items-center justify-center">
-                          <span class="text-[10px] text-base-content/30 italic">Not scanned</span>
-                        </div>
-                      <% end %>
-                    </div>
-                  </div>
-                <% end %>
               </div>
             <% end %>
 
@@ -1866,115 +1864,6 @@ defmodule NaturecountsWeb.VideosLive do
             <% end %>
 
             <%!-- ═══════════════════════════════════════ --%>
-            <%!-- VIEW 4: GROUPED TABLE + DISTRIBUTIONS  --%>
-            <%!-- ═══════════════════════════════════════ --%>
-            <%= if @metrics_view == "grouped" do %>
-              <div class="overflow-x-auto">
-                <table class="table table-xs">
-                  <thead>
-                    <tr class="text-xs">
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">File {sort_indicator(@sort_by, @sort_dir, "name")}</th>
-                      <th :for={{col, label} <- [{"det", "Det/f"}, {"brightness", "Bright"}, {"contrast", "Contrast"}, {"motion", "Motion"}, {"bbox_mean", "Bbox avg"}]}
-                        class="cursor-pointer select-none" phx-click="sort_files" phx-value-col={col}
-                      >
-                        <div class="flex flex-col gap-1">
-                          <span>{label} {sort_indicator(@sort_by, @sort_dir, col)}</span>
-                          <%!-- Distribution strip --%>
-                          <% dist = distribution_data(@scanned_only, col) %>
-                          <%= if dist do %>
-                            <% col_max = case col do
-                              "brightness" -> 255
-                              "det" -> @maxes.det
-                              "contrast" -> @maxes.contrast
-                              "motion" -> @maxes.motion
-                              "bbox_mean" -> @maxes.bbox_mean
-                              _ -> dist.max
-                            end %>
-                            <% col_max = if col_max == 0, do: 1, else: col_max %>
-                            <svg viewBox="0 0 60 8" class="w-full h-2">
-                              <rect x="0" y="3" width="60" height="2" rx="1" fill="currentColor" opacity="0.1" />
-                              <rect
-                                x={Float.round(dist.q1 / col_max * 60, 1)}
-                                y="1" rx="1"
-                                width={Float.round(max((dist.q3 - dist.q1) / col_max * 60, 1.0), 1)}
-                                height="6"
-                                fill="currentColor" opacity="0.2"
-                              />
-                              <line
-                                x1={Float.round(dist.median / col_max * 60, 1)} y1="0"
-                                x2={Float.round(dist.median / col_max * 60, 1)} y2="8"
-                                stroke="currentColor" opacity="0.6" stroke-width="1.5"
-                              />
-                            </svg>
-                          <% end %>
-                        </div>
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <%!-- Group: processed files --%>
-                    <% {processed, unprocessed} = Enum.split_with(
-                      Enum.filter(@metrics_page, &(&1.type == :file)),
-                      &(&1.processed && &1.processed.status == "completed")
-                    ) %>
-                    <%= if length(processed) > 0 do %>
-                      <tr><td colspan="6" class="text-xs font-bold text-success/80 bg-success/5 py-1">Processed ({length(processed)})</td></tr>
-                      <%= for entry <- processed do %>
-                        <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
-                          phx-click="select_file" phx-value-file={entry.path}>
-                          <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
-                            <span class="flex items-center gap-1">
-                              <span class={["w-2 h-2 rounded-full shrink-0", profile_dot(entry.processed.profile)]} />
-                              {entry.name}
-                            </span>
-                          </td>
-                          <%= if entry.metrics && !entry.metrics["error"] do %>
-                            <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
-                            <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
-                            <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
-                            <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
-                            <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
-                          <% else %>
-                            <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
-                          <% end %>
-                        </tr>
-                      <% end %>
-                    <% end %>
-                    <%= if length(unprocessed) > 0 do %>
-                      <tr><td colspan="6" class="text-xs font-bold text-base-content/50 bg-base-300/30 py-1">Unprocessed ({length(unprocessed)})</td></tr>
-                      <%= for entry <- unprocessed do %>
-                        <tr class={["hover cursor-pointer", @selected_file == entry.path && "ring-1 ring-primary"]}
-                          phx-click="select_file" phx-value-file={entry.path}>
-                          <td class="font-mono text-xs truncate max-w-[180px]" title={entry.name}>
-                            <span class="flex items-center gap-1">
-                              <%= if entry.processed do %>
-                                <span class={["w-2 h-2 rounded-full shrink-0",
-                                  entry.processed.status == "processing" && "bg-info animate-pulse",
-                                  entry.processed.status == "pending" && "bg-base-content/30"
-                                ]} />
-                              <% end %>
-                              {entry.name}
-                            </span>
-                          </td>
-                          <%= if entry.metrics && !entry.metrics["error"] do %>
-                            <td class="text-xs font-mono">{entry.metrics["avg_detections_per_frame"]}</td>
-                            <td class="text-xs font-mono">{entry.metrics["avg_brightness"] || "-"}</td>
-                            <td class="text-xs font-mono">{entry.metrics["contrast"] || "-"}</td>
-                            <td class="text-xs font-mono">{entry.metrics["motion_score"] || "-"}</td>
-                            <td class="text-xs font-mono">{get_in(entry.metrics, ["bbox_areas", "mean"]) || 0}</td>
-                          <% else %>
-                            <td colspan="5" class="text-xs text-base-content/30 italic">Not scanned</td>
-                          <% end %>
-                        </tr>
-                      <% end %>
-                    <% end %>
-                  </tbody>
-                </table>
-              </div>
-            <% end %>
-
-
-            <%!-- ═══════════════════════════════════════ --%>
             <%!-- VIEW 6: TIMELINE SPARKLINES            --%>
             <%!-- ═══════════════════════════════════════ --%>
             <%= if @metrics_view == "timeline" do %>
@@ -2001,10 +1890,17 @@ defmodule NaturecountsWeb.VideosLive do
                   <%= for entry <- @metrics_page, entry.type == :file do %>
                     <div
                       class={["flex items-center gap-2 p-1 rounded hover:bg-base-300/50 cursor-pointer",
-                        @selected_file == entry.path && "ring-1 ring-primary bg-primary/10"]}
-                      phx-click="select_file" phx-value-file={entry.path}
+                        @selected_file == entry.path && "ring-1 ring-primary bg-primary/10",
+                        MapSet.member?(@selected_files, entry.path) && "bg-error/10"]}
                     >
-                      <div class="w-[140px] shrink-0">
+                      <input
+                        type="checkbox"
+                        class="checkbox checkbox-xs checkbox-error shrink-0"
+                        checked={MapSet.member?(@selected_files, entry.path)}
+                        phx-click="toggle_select"
+                        phx-value-file={entry.path}
+                      />
+                      <div class="w-[140px] shrink-0" phx-click="select_file" phx-value-file={entry.path}>
                         <span class="flex items-center gap-1">
                           <%= if entry.processed do %>
                             <span class={["w-2 h-2 rounded-full shrink-0",
@@ -2162,10 +2058,17 @@ defmodule NaturecountsWeb.VideosLive do
                   <%= for entry <- @metrics_page, entry.type == :file do %>
                     <div
                       class={["flex items-center gap-1 cursor-pointer hover:bg-base-300/30 rounded",
-                        @selected_file == entry.path && "ring-1 ring-primary"]}
-                      phx-click="select_file" phx-value-file={entry.path}
+                        @selected_file == entry.path && "ring-1 ring-primary",
+                        MapSet.member?(@selected_files, entry.path) && "bg-error/10"]}
                     >
-                      <div class="w-[130px] shrink-0 pr-1">
+                      <input
+                        type="checkbox"
+                        class="checkbox checkbox-xs checkbox-error shrink-0"
+                        checked={MapSet.member?(@selected_files, entry.path)}
+                        phx-click="toggle_select"
+                        phx-value-file={entry.path}
+                      />
+                      <div class="w-[130px] shrink-0 pr-1" phx-click="select_file" phx-value-file={entry.path}>
                         <span class="font-mono text-[10px] truncate block" title={entry.name}>{entry.name}</span>
                       </div>
                       <div class="flex-1 flex items-center gap-px h-5">
@@ -2225,111 +2128,139 @@ defmodule NaturecountsWeb.VideosLive do
         </div>
       <% end %>
 
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <%!-- File browser --%>
-        <div class="card bg-base-200">
-          <div class="card-body">
-            <div class="flex items-center justify-between">
-              <h2 class="card-title text-lg">Browse Files</h2>
-              <div class="join">
-                <button
-                  class={"join-item btn btn-xs #{if @source == "local", do: "btn-active"}"}
-                  phx-click="switch_source" phx-value-source="local"
-                >Local</button>
-                <button
-                  class={"join-item btn btn-xs #{if @source == "gcs", do: "btn-active"}"}
-                  phx-click="switch_source" phx-value-source="gcs"
-                >GCS</button>
-              </div>
-            </div>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <%!-- ═══════════════════════════════════════ --%>
+        <%!-- LEFT COLUMN: Browse + Preview (2/3)    --%>
+        <%!-- ═══════════════════════════════════════ --%>
+        <div class="lg:col-span-2 space-y-4">
 
-            <%!-- GCS bucket selector --%>
-            <%= if @source == "gcs" do %>
-              <div class="flex items-center gap-1 flex-wrap">
-                <%= for b <- @gcs_buckets do %>
-                  <div class="flex items-center gap-0">
+          <%!-- Browse Files --%>
+          <div class="card bg-base-200">
+            <div class="card-body p-4">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <h2 class="card-title text-lg">Files</h2>
+                  <div class="join">
                     <button
-                      class={"btn btn-xs #{if @selected_bucket == b["id"], do: "btn-primary", else: "btn-ghost"}"}
-                      phx-click="select_bucket" phx-value-id={b["id"]}
-                      title={b["credentials"] && b["credentials"]["client_email"] || "no credentials"}
-                    >
-                      <span :if={b["credentials"]} class="text-success text-[8px]">*</span>
-                      {b["name"]}
+                      class={"join-item btn btn-xs #{if @source == "local", do: "btn-active"}"}
+                      phx-click="switch_source" phx-value-source="local"
+                    >Local</button>
+                    <button
+                      class={"join-item btn btn-xs #{if @source == "gcs", do: "btn-active"}"}
+                      phx-click="switch_source" phx-value-source="gcs"
+                    >GCS</button>
+                  </div>
+                </div>
+                <div class="flex items-center gap-1">
+                  <%= if @scanning do %>
+                    <button class="btn btn-error btn-xs gap-1" phx-click="cancel_scan">
+                      <span class="loading loading-spinner loading-xs"></span> Cancel
                     </button>
-                    <button
-                      class="btn btn-xs btn-ghost opacity-50 hover:opacity-100 px-1"
-                      phx-click="edit_bucket" phx-value-id={b["id"]}
-                      title="Edit bucket config"
-                    >e</button>
-                    <button
-                      class="btn btn-xs btn-ghost text-error opacity-50 hover:opacity-100 px-1"
-                      phx-click="delete_bucket" phx-value-id={b["id"]}
-                      data-confirm={"Delete bucket '#{b["name"]}'?"}
-                    >x</button>
-                  </div>
-                <% end %>
-                <button class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">+ Add Bucket</button>
+                  <% else %>
+                    <label class="label cursor-pointer gap-1 p-0">
+                      <span class="label-text text-[10px] text-base-content/50">Force</span>
+                      <input type="checkbox" class="checkbox checkbox-xs" checked={@scan_force} phx-click="toggle_scan_force" />
+                    </label>
+                    <button class="btn btn-ghost btn-xs" phx-click="scan_metrics">Scan</button>
+                    <button class="btn btn-ghost btn-xs" phx-click="select_black_videos" title="Select videos with 0 detections">Select empty</button>
+                  <% end %>
+                </div>
               </div>
 
-              <%= if @adding_bucket do %>
-                <div class="bg-base-300 rounded-lg p-3 mt-1 space-y-2">
-                  <div class="text-xs font-semibold">
-                    <%= if @editing_bucket, do: "Edit Bucket", else: "Add GCS Bucket" %>
-                  </div>
-                  <form phx-submit="save_bucket" class="space-y-2">
-                    <div class="flex gap-2 flex-wrap">
-                      <div class="form-control">
-                        <label class="label py-0"><span class="label-text text-xs">Display Name</span></label>
-                        <input type="text" name="name" placeholder="Marine Cam East" class="input input-xs input-bordered w-36" value={@new_bucket_name} />
-                      </div>
-                      <div class="form-control">
-                        <label class="label py-0"><span class="label-text text-xs">GCS Bucket ID</span></label>
-                        <input type="text" name="bucket" placeholder="my-project-videos" class="input input-xs input-bordered w-44" value={@new_bucket_id} />
-                      </div>
-                      <div class="form-control">
-                        <label class="label py-0"><span class="label-text text-xs">Path Prefix (optional)</span></label>
-                        <input type="text" name="prefix" placeholder="cameras/east/" class="input input-xs input-bordered w-36" value={@new_bucket_prefix} />
-                      </div>
-                    </div>
-                    <div class="form-control">
-                      <label class="label py-0">
-                        <span class="label-text text-xs">
-                          Service Account JSON
-                          <%= if @editing_bucket do %>
-                            <span class="text-base-content/40">(leave empty to keep existing)</span>
-                          <% end %>
-                        </span>
-                      </label>
-                      <textarea
-                        name="credentials"
-                        rows="4"
-                        placeholder='{"type": "service_account", "project_id": "...", "private_key": "...", "client_email": "..."}'
-                        class="textarea textarea-bordered textarea-xs font-mono text-[10px] leading-tight w-full"
-                      >{@new_bucket_creds}</textarea>
-                    </div>
-                    <%!-- Test + Save buttons --%>
+              <%!-- Scan progress bar --%>
+              <%= if @scanning do %>
+                <div class="bg-base-300 rounded-lg p-2 space-y-1">
+                  <%= if @scan_progress do %>
+                    <% done = @scan_progress["done"] || 0 %>
+                    <% total = @scan_progress["total"] || 1 %>
+                    <% executing = @scan_progress["executing"] || 0 %>
+                    <% pending = @scan_progress["pending"] || 0 %>
+                    <% failed = @scan_progress["failed"] || 0 %>
+                    <% pct = if total > 0, do: round(done / total * 100), else: 0 %>
                     <div class="flex items-center gap-2">
-                      <button type="submit" name="action" value="test" class="btn btn-xs btn-outline">Test Connection</button>
-                      <button type="submit" name="action" value="save" class="btn btn-xs btn-primary">
-                        <%= if @editing_bucket, do: "Update", else: "Save Bucket" %>
-                      </button>
-                      <button type="button" class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">Cancel</button>
-                      <%= if @bucket_test_result do %>
-                        <%= case @bucket_test_result do %>
-                          <% :ok -> %>
-                            <span class="badge badge-xs badge-success">Connected</span>
-                          <% {:error, msg} -> %>
-                            <span class="badge badge-xs badge-error" title={msg}>Failed: {msg}</span>
-                        <% end %>
-                      <% end %>
+                      <progress class="progress progress-primary flex-1" value={done} max={total} />
+                      <span class="text-xs font-mono font-bold whitespace-nowrap">{pct}%</span>
                     </div>
-                  </form>
+                    <div class="flex items-center gap-3 text-[10px] text-base-content/50">
+                      <span class="text-success">{done} done</span>
+                      <span>{executing} running</span>
+                      <span>{pending} queued</span>
+                      <span :if={failed > 0} class="text-error">{failed} failed</span>
+                      <span class="ml-auto">{total} total</span>
+                    </div>
+                  <% else %>
+                    <div class="flex items-center gap-2">
+                      <span class="loading loading-spinner loading-xs"></span>
+                      <span class="text-xs text-base-content/50">Starting scan...</span>
+                    </div>
+                  <% end %>
                 </div>
               <% end %>
-            <% end %>
 
-            <%!-- Breadcrumbs + Scan --%>
-            <div class="flex items-center justify-between">
+              <%!-- GCS bucket selector --%>
+              <%= if @source == "gcs" do %>
+                <div class="flex items-center gap-1 flex-wrap">
+                  <%= for b <- @gcs_buckets do %>
+                    <div class="flex items-center gap-0">
+                      <button
+                        class={"btn btn-xs #{if @selected_bucket == b["id"], do: "btn-primary", else: "btn-ghost"}"}
+                        phx-click="select_bucket" phx-value-id={b["id"]}
+                        title={b["credentials"] && b["credentials"]["client_email"] || "no credentials"}
+                      >
+                        <span :if={b["credentials"]} class="text-success text-[8px]">*</span>
+                        {b["name"]}
+                      </button>
+                      <button class="btn btn-xs btn-ghost opacity-50 hover:opacity-100 px-1" phx-click="edit_bucket" phx-value-id={b["id"]} title="Edit">e</button>
+                      <button class="btn btn-xs btn-ghost text-error opacity-50 hover:opacity-100 px-1" phx-click="delete_bucket" phx-value-id={b["id"]} data-confirm={"Delete bucket '#{b["name"]}'?"}>x</button>
+                    </div>
+                  <% end %>
+                  <button class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">+ Add</button>
+                </div>
+
+                <%= if @adding_bucket do %>
+                  <div class="bg-base-300 rounded-lg p-3 mt-1 space-y-2">
+                    <div class="text-xs font-semibold"><%= if @editing_bucket, do: "Edit Bucket", else: "Add GCS Bucket" %></div>
+                    <form phx-submit="save_bucket" class="space-y-2">
+                      <div class="flex gap-2 flex-wrap">
+                        <div class="form-control">
+                          <label class="label py-0"><span class="label-text text-xs">Display Name</span></label>
+                          <input type="text" name="name" placeholder="Marine Cam East" class="input input-xs input-bordered w-36" value={@new_bucket_name} />
+                        </div>
+                        <div class="form-control">
+                          <label class="label py-0"><span class="label-text text-xs">GCS Bucket ID</span></label>
+                          <input type="text" name="bucket" placeholder="my-project-videos" class="input input-xs input-bordered w-44" value={@new_bucket_id} />
+                        </div>
+                        <div class="form-control">
+                          <label class="label py-0"><span class="label-text text-xs">Path Prefix (optional)</span></label>
+                          <input type="text" name="prefix" placeholder="cameras/east/" class="input input-xs input-bordered w-36" value={@new_bucket_prefix} />
+                        </div>
+                      </div>
+                      <div class="form-control">
+                        <label class="label py-0">
+                          <span class="label-text text-xs">
+                            Service Account JSON
+                            <%= if @editing_bucket do %><span class="text-base-content/40">(leave empty to keep existing)</span><% end %>
+                          </span>
+                        </label>
+                        <textarea name="credentials" rows="3" placeholder='{"type": "service_account", ...}' class="textarea textarea-bordered textarea-xs font-mono text-[10px] leading-tight w-full">{@new_bucket_creds}</textarea>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <button type="submit" name="action" value="test" class="btn btn-xs btn-outline">Test</button>
+                        <button type="submit" name="action" value="save" class="btn btn-xs btn-primary"><%= if @editing_bucket, do: "Update", else: "Save" %></button>
+                        <button type="button" class="btn btn-xs btn-ghost" phx-click="toggle_add_bucket">Cancel</button>
+                        <%= if @bucket_test_result do %>
+                          <%= case @bucket_test_result do %>
+                            <% :ok -> %><span class="badge badge-xs badge-success">Connected</span>
+                            <% {:error, msg} -> %><span class="badge badge-xs badge-error" title={msg}>Failed</span>
+                          <% end %>
+                        <% end %>
+                      </div>
+                    </form>
+                  </div>
+                <% end %>
+              <% end %>
+
+              <%!-- Breadcrumbs --%>
               <div class="text-sm breadcrumbs py-0">
                 <ul>
                   <%= if @source == "gcs" do %>
@@ -2340,193 +2271,155 @@ defmodule NaturecountsWeb.VideosLive do
                       </a>
                     </li>
                     <li :for={crumb <- gcs_breadcrumbs(@gcs_prefix, bucket_config && bucket_config["prefix"])}>
-                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>
-                        {crumb.name}
-                      </a>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>{crumb.name}</a>
                     </li>
                   <% else %>
-                    <li>
-                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path="/videos">
-                        /videos
-                      </a>
-                    </li>
+                    <li><a class="link link-hover" phx-click="navigate_dir" phx-value-path="/videos">/videos</a></li>
                     <li :for={crumb <- @breadcrumbs}>
-                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>
-                        {crumb.name}
-                      </a>
+                      <a class="link link-hover" phx-click="navigate_dir" phx-value-path={crumb.path}>{crumb.name}</a>
                     </li>
                   <% end %>
-              </ul>
+                </ul>
               </div>
-              <div class="flex items-center gap-1">
-                <%= if @scanning do %>
-                  <span class="text-xs text-base-content/50">{scan_active_count()} workers</span>
-                  <button
-                    class="btn btn-error btn-xs gap-1"
-                    phx-click="cancel_scan"
-                  >
-                    <span class="loading loading-spinner loading-xs"></span>
-                    Cancel
-                  </button>
-                <% else %>
-                  <label class="label cursor-pointer gap-1 p-0">
-                    <span class="label-text text-[10px] text-base-content/50">Force</span>
-                    <input
-                      type="checkbox"
-                      class="checkbox checkbox-xs"
-                      checked={@scan_force}
-                      phx-click="toggle_scan_force"
-                    />
-                  </label>
-                  <button class="btn btn-ghost btn-xs" phx-click="scan_metrics">Scan</button>
-                  <button
-                    class="btn btn-ghost btn-xs"
-                    phx-click="select_black_videos"
-                    title="Select videos with 0 detections"
-                  >
-                    Select empty
-                  </button>
+
+              <%!-- Selection bar --%>
+              <div class="flex items-center gap-2 py-1">
+                <button class="btn btn-ghost btn-xs" phx-click="select_all">All</button>
+                <button class="btn btn-ghost btn-xs" phx-click="select_none">None</button>
+                <%= if MapSet.size(@selected_files) > 0 do %>
+                  <span class="text-xs text-base-content/60">{MapSet.size(@selected_files)} selected</span>
+                  <button class="btn btn-error btn-xs" phx-click="delete_selected" data-confirm={"Delete #{MapSet.size(@selected_files)} file(s)? This cannot be undone."}>Delete selected</button>
+                <% end %>
+              </div>
+
+              <%!-- File listing --%>
+              <div class="overflow-y-auto max-h-[50vh]">
+                <%= cond do %>
+                <% @loading_entries -> %>
+                  <div class="flex items-center gap-2 p-4">
+                    <span class="loading loading-spinner loading-sm"></span>
+                    <span class="text-sm text-base-content/50">Loading files...</span>
+                  </div>
+                <% Enum.empty?(@visible) -> %>
+                  <p class="text-base-content/50 italic text-sm">No video files match filters.</p>
+                <% true -> %>
+                  <table class="table table-sm">
+                    <thead>
+                      <tr>
+                        <th class="w-8"></th>
+                        <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">
+                          Name {sort_indicator(@sort_by, @sort_dir, "name")}
+                        </th>
+                        <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">
+                          Size {sort_indicator(@sort_by, @sort_dir, "size")}
+                        </th>
+                        <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det" title="Avg detections per sampled frame">
+                          Det {sort_indicator(@sort_by, @sort_dir, "det")}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <%= for entry <- @visible do %>
+                        <%= if entry.type == :dir do %>
+                          <tr class="hover cursor-pointer">
+                            <td>
+                              <input
+                                type="checkbox"
+                                class="checkbox checkbox-xs checkbox-primary"
+                                phx-click="toggle_select"
+                                phx-value-file={entry.path}
+                              />
+                            </td>
+                            <td class="font-mono text-sm" phx-click="navigate_dir" phx-value-path={entry.path}><span class="text-primary">📁</span> {entry.name}/</td>
+                            <td phx-click="navigate_dir" phx-value-path={entry.path}></td>
+                            <td phx-click="navigate_dir" phx-value-path={entry.path}></td>
+                          </tr>
+                        <% else %>
+                          <tr class={[
+                              "hover cursor-pointer",
+                              @selected_file == entry.path && "bg-primary/20",
+                              MapSet.member?(@selected_files, entry.path) && "bg-error/10",
+                              entry.processed && entry.processed.status == "completed" && profile_bg(entry.processed.profile),
+                              entry.processed && entry.processed.status == "processing" && "bg-info/10",
+                              entry.processed && entry.processed.status == "pending" && "bg-base-300/50"
+                            ]}
+                          >
+                            <td>
+                              <input
+                                type="checkbox"
+                                class="checkbox checkbox-xs checkbox-error"
+                                checked={MapSet.member?(@selected_files, entry.path)}
+                                phx-click="toggle_select"
+                                phx-value-file={entry.path}
+                              />
+                            </td>
+                            <td
+                              class="font-mono text-sm truncate max-w-[300px]"
+                              title={entry.name}
+                              phx-click="select_file"
+                              phx-value-file={entry.path}
+                            >
+                              <span class="flex items-center gap-1">
+                                <%= if entry.processed do %>
+                                  <span class={[
+                                    "w-2 h-2 rounded-full shrink-0",
+                                    entry.processed.status == "completed" && profile_dot(entry.processed.profile),
+                                    entry.processed.status == "processing" && "bg-info animate-pulse",
+                                    entry.processed.status == "pending" && "bg-base-content/30"
+                                  ]} title={"#{entry.processed.status} (#{entry.processed.profile})"} />
+                                <% end %>
+                                {entry.name}
+                              </span>
+                            </td>
+                            <td class="text-sm text-base-content/60 whitespace-nowrap" phx-click="select_file" phx-value-file={entry.path}>{entry.size_mb} MB</td>
+                            <td class="text-xs font-mono text-base-content/50" phx-click="select_file" phx-value-file={entry.path}>
+                              <%= if entry.metrics && !entry.metrics["error"] do %>
+                                <span class="flex items-center gap-1" title={"brightness: #{entry.metrics["avg_brightness"] || "?"}/255, #{get_in(entry.metrics, ["bbox_areas", "count"]) || 0} bboxes, #{entry.metrics["duration_s"]}s"}>
+                                  <%= if is_number(entry.metrics["avg_brightness"]) and entry.metrics["avg_brightness"] < 15 do %>
+                                    <span class="w-2 h-2 rounded-full bg-black border border-base-content/20 shrink-0" title="Dark video" />
+                                  <% end %>
+                                  {entry.metrics["avg_detections_per_frame"]}
+                                </span>
+                              <% end %>
+                            </td>
+                          </tr>
+                        <% end %>
+                      <% end %>
+                    </tbody>
+                  </table>
                 <% end %>
               </div>
             </div>
+          </div>
 
-            <%= if @scanning and @scan_progress do %>
-              <div class="flex items-center gap-2 text-xs text-base-content/60">
-                <progress
-                  class="progress progress-primary flex-1"
-                  value={@scan_progress["done"] || 0}
-                  max={@scan_progress["total"] || 1}
-                />
-                <span class="whitespace-nowrap">
-                  {@scan_progress["done"]}/{@scan_progress["total"]}
-                </span>
-                <span class="truncate max-w-[120px] font-mono" title={@scan_progress["current"]}>
-                  {@scan_progress["current"]}
-                </span>
-              </div>
-            <% end %>
-
-            <%!-- Delete bar --%>
-            <%= if MapSet.size(@selected_files) > 0 do %>
-              <div class="flex items-center gap-2 py-1">
-                <span class="text-xs text-base-content/60">{MapSet.size(@selected_files)} selected</span>
-                <button
-                  class="btn btn-error btn-xs"
-                  phx-click="delete_selected"
-                  data-confirm={"Delete #{MapSet.size(@selected_files)} file(s)? This cannot be undone."}
-                >
-                  Delete selected
-                </button>
-                <button
-                  class="btn btn-ghost btn-xs"
-                  phx-click="clear_selection"
-                >
-                  Clear
-                </button>
-              </div>
-            <% end %>
-
-            <%!-- File listing --%>
-            <div class="overflow-y-auto max-h-80">
-              <%= cond do %>
-              <% @loading_entries -> %>
-                <div class="flex items-center gap-2 p-4">
-                  <span class="loading loading-spinner loading-sm"></span>
-                  <span class="text-sm text-base-content/50">Loading files...</span>
+          <%!-- Preview --%>
+          <div class="card bg-base-200">
+            <div class="card-body p-4">
+              <div
+                id="video-preview-hook"
+                phx-hook="VideoPreview"
+                phx-update="ignore"
+              >
+                <div class="flex items-center justify-center aspect-video bg-base-300 rounded-lg">
+                  <p class="text-base-content/40 text-sm">Select a video to preview</p>
                 </div>
-              <% Enum.empty?(@visible) -> %>
-                <p class="text-base-content/50 italic text-sm">No video files match filters.</p>
-              <% true -> %>
-                <table class="table table-sm">
-                  <thead>
-                    <tr>
-                      <th class="w-8"></th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="name">
-                        Name {sort_indicator(@sort_by, @sort_dir, "name")}
-                      </th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="size">
-                        Size {sort_indicator(@sort_by, @sort_dir, "size")}
-                      </th>
-                      <th class="cursor-pointer select-none" phx-click="sort_files" phx-value-col="det" title="Avg detections per sampled frame">
-                        Det {sort_indicator(@sort_by, @sort_dir, "det")}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <%= for entry <- @visible do %>
-                      <%= if entry.type == :dir do %>
-                        <tr
-                          class="hover cursor-pointer"
-                          phx-click="navigate_dir"
-                          phx-value-path={entry.path}
-                        >
-                          <td></td>
-                          <td class="font-mono text-sm">
-                            <span class="text-primary">📁</span> {entry.name}/
-                          </td>
-                          <td></td>
-                          <td></td>
-                        </tr>
-                      <% else %>
-                        <tr class={[
-                            "hover cursor-pointer",
-                            @selected_file == entry.path && "bg-primary/20",
-                            MapSet.member?(@selected_files, entry.path) && "bg-error/10",
-                            entry.processed && entry.processed.status == "completed" && profile_bg(entry.processed.profile),
-                            entry.processed && entry.processed.status == "processing" && "bg-info/10",
-                            entry.processed && entry.processed.status == "pending" && "bg-base-300/50"
-                          ]}
-                        >
-                          <td>
-                            <input
-                              type="checkbox"
-                              class="checkbox checkbox-xs checkbox-error"
-                              checked={MapSet.member?(@selected_files, entry.path)}
-                              phx-click="toggle_select"
-                              phx-value-file={entry.path}
-                            />
-                          </td>
-                          <td
-                            class="font-mono text-sm truncate max-w-[200px]"
-                            title={entry.name}
-                            phx-click="select_file"
-                            phx-value-file={entry.path}
-                          >
-                            <span class="flex items-center gap-1">
-                              <%= if entry.processed do %>
-                                <span class={[
-                                  "w-2 h-2 rounded-full shrink-0",
-                                  entry.processed.status == "completed" && profile_dot(entry.processed.profile),
-                                  entry.processed.status == "processing" && "bg-info animate-pulse",
-                                  entry.processed.status == "pending" && "bg-base-content/30"
-                                ]} title={"#{entry.processed.status} (#{entry.processed.profile})"} />
-                              <% end %>
-                              {entry.name}
-                            </span>
-                          </td>
-                          <td class="text-sm text-base-content/60 whitespace-nowrap" phx-click="select_file" phx-value-file={entry.path}>{entry.size_mb} MB</td>
-                          <td class="text-xs font-mono text-base-content/50" phx-click="select_file" phx-value-file={entry.path}>
-                            <%= if entry.metrics && !entry.metrics["error"] do %>
-                              <span class="flex items-center gap-1" title={"brightness: #{entry.metrics["avg_brightness"] || "?"}/255, #{get_in(entry.metrics, ["bbox_areas", "count"]) || 0} bboxes, #{entry.metrics["duration_s"]}s"}>
-                                <%= if is_number(entry.metrics["avg_brightness"]) and entry.metrics["avg_brightness"] < 15 do %>
-                                  <span class="w-2 h-2 rounded-full bg-black border border-base-content/20 shrink-0" title="Dark video" />
-                                <% end %>
-                                {entry.metrics["avg_detections_per_frame"]}
-                              </span>
-                            <% end %>
-                          </td>
-                        </tr>
-                      <% end %>
-                    <% end %>
-                  </tbody>
-                </table>
-              <% end %>
+              </div>
             </div>
+          </div>
 
-            <%!-- Profile selector + start --%>
-            <div class="form-control mt-4">
-              <label class="label"><span class="label-text">Processing Profile</span></label>
-              <div class="join">
+        </div>
+
+        <%!-- ═══════════════════════════════════════ --%>
+        <%!-- RIGHT COLUMN: Processing + Queue (1/3) --%>
+        <%!-- ═══════════════════════════════════════ --%>
+        <div class="space-y-4">
+
+          <%!-- Processing config --%>
+          <div class="card bg-base-200">
+            <div class="card-body p-4">
+              <h2 class="card-title text-lg">Processing</h2>
+
+              <div class="join flex-wrap">
                 <button
                   :for={{key, profile} <- @profiles}
                   class={"join-item btn btn-sm #{if @selected_profile == key, do: "btn-primary", else: "btn-ghost"}"}
@@ -2536,286 +2429,154 @@ defmodule NaturecountsWeb.VideosLive do
                   {profile.label}
                 </button>
               </div>
-              <label class="label">
-                <span class="label-text-alt text-base-content/50">
-                  {(@profiles[@selected_profile] || %{}).description}
-                </span>
-              </label>
-            </div>
+              <p class="text-xs text-base-content/50">{(@profiles[@selected_profile] || %{}).description}</p>
 
-            <div class="flex gap-4 mt-2">
-              <form phx-change="set_min_bbox_area" class="form-control flex-1">
-                <label class="label py-0"><span class="label-text text-xs">Min detection area (px)</span></label>
-                <div class="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="1000"
-                    max="100000"
-                    step="1000"
-                    value={@min_bbox_area}
-                    class="range range-xs range-primary flex-1"
-                    name="area"
-                  />
-                  <span class="text-xs font-mono w-16">{@min_bbox_area}</span>
-                </div>
-                <label class="label py-0">
-                  <span class="label-text-alt text-base-content/40">
-                    ~{round(:math.sqrt(@min_bbox_area))}x{round(:math.sqrt(@min_bbox_area))} px
-                  </span>
-                </label>
-              </form>
-              <form phx-change="set_vlm_sample_pct" class="form-control flex-1">
-                <label class="label py-0"><span class="label-text text-xs">VLM sample %</span></label>
-                <div class="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="5"
-                    max="100"
-                    step="5"
-                    value={@vlm_sample_pct}
-                    class="range range-xs range-secondary flex-1"
-                    name="pct"
-                  />
-                  <span class="text-xs font-mono w-10">{@vlm_sample_pct}%</span>
-                </div>
-              </form>
-              <form phx-change="set_ttl_days" class="form-control">
-                <label class="label py-0"><span class="label-text text-xs">TTL (days)</span></label>
-                <input
-                  type="number"
-                  min="1"
-                  max="365"
-                  value={@classification_ttl_days}
-                  class="input input-bordered input-sm w-20"
-                  name="days"
-                />
-              </form>
-            </div>
-
-            <div class="flex items-center gap-4 mt-2">
-              <label class="label cursor-pointer gap-2 p-0">
-                <span class="label-text text-xs">Fishial</span>
-                <input
-                  type="checkbox"
-                  class="toggle toggle-sm toggle-info"
-                  checked={@fishial_enabled}
-                  phx-click="toggle_fishial"
-                  disabled={not @fishial_ready}
-                />
-              </label>
-              <label class="label cursor-pointer gap-2 p-0">
-                <span class="label-text text-xs">VLM</span>
-                <input
-                  type="checkbox"
-                  class="toggle toggle-sm toggle-secondary"
-                  checked={@vlm_enabled}
-                  phx-click="toggle_vlm"
-                />
-              </label>
-              <span class="text-xs text-base-content/40">
-                <%= cond do %>
-                  <% not @fishial_ready and @fishial_enabled -> %>
-                    <span class="text-warning">Fishial model not downloaded</span>
-                  <% @fishial_enabled and @vlm_enabled -> %>
-                    Fishial first, VLM fallback
-                  <% @fishial_enabled -> %>
-                    Fishial only
-                  <% @vlm_enabled -> %>
-                    VLM only
-                  <% true -> %>
-                    Detection only (no classification)
-                <% end %>
-              </span>
-            </div>
-
-            <%!-- VLM Context --%>
-            <div class="mt-3">
-              <label class="label py-0"><span class="label-text text-xs">VLM Context</span></label>
-              <div class="flex items-center gap-1 mt-1">
-                <select
-                  class="select select-bordered select-sm flex-1"
-                  phx-change="select_context"
-                  name="id"
-                >
-                  <option
-                    :for={ctx <- @vlm_contexts}
-                    value={ctx["id"]}
-                    selected={ctx["id"] == @selected_context_id}
-                  >
-                    {ctx["name"]}
-                  </option>
-                </select>
-                <button class="btn btn-ghost btn-xs" phx-click="edit_context" title="Edit">Edit</button>
-                <button class="btn btn-ghost btn-xs" phx-click="new_context" title="New">+</button>
-              </div>
-
-              <%= if @editing_context do %>
-                <div class="mt-1 space-y-1">
-                  <input
-                    type="text"
-                    class="input input-bordered input-sm w-full"
-                    placeholder="Context name"
-                    value={@context_name}
-                    phx-blur="set_context_name"
-                    phx-keyup="set_context_name"
-                    phx-value-name=""
-                    name="name"
-                    phx-change="set_context_name"
-                  />
-                  <textarea
-                    class="textarea textarea-bordered textarea-sm w-full"
-                    rows="3"
-                    placeholder="Location and species context for VLM identification..."
-                    phx-blur="edit_context_prompt"
-                    name="prompt"
-                    phx-change="edit_context_prompt"
-                  >{@vlm_context_prompt}</textarea>
-                  <div class="flex gap-1">
-                    <button class="btn btn-primary btn-xs" phx-click="save_context">Save</button>
-                    <button class="btn btn-ghost btn-xs" phx-click="cancel_edit_context">Cancel</button>
-                    <%= if @selected_context_id do %>
-                      <button
-                        class="btn btn-error btn-xs btn-outline ml-auto"
-                        phx-click="delete_context"
-                        data-confirm="Delete this context?"
-                      >Delete</button>
-                    <% end %>
+              <div class="space-y-2 mt-2">
+                <form phx-change="set_min_bbox_area">
+                  <label class="text-xs text-base-content/70">Min detection area</label>
+                  <div class="flex items-center gap-2">
+                    <input type="range" min="1000" max="100000" step="1000" value={@min_bbox_area} class="range range-xs range-primary flex-1" name="area" />
+                    <span class="text-xs font-mono w-16">{@min_bbox_area}</span>
                   </div>
-                </div>
-              <% else %>
-                <p class="text-xs text-base-content/50 mt-1 line-clamp-2">{@vlm_context_prompt}</p>
-              <% end %>
-            </div>
+                  <span class="text-[10px] text-base-content/40">~{round(:math.sqrt(@min_bbox_area))}x{round(:math.sqrt(@min_bbox_area))} px</span>
+                </form>
 
-            <button
-              class="btn btn-primary mt-2"
-              phx-click="start_processing"
-              disabled={@selected_file == nil}
-            >
-              Start Processing
-            </button>
-          </div>
-        </div>
+                <form phx-change="set_vlm_sample_pct">
+                  <label class="text-xs text-base-content/70">VLM sample %</label>
+                  <div class="flex items-center gap-2">
+                    <input type="range" min="5" max="100" step="5" value={@vlm_sample_pct} class="range range-xs range-secondary flex-1" name="pct" />
+                    <span class="text-xs font-mono w-10">{@vlm_sample_pct}%</span>
+                  </div>
+                </form>
 
-        <%!-- Video player --%>
-        <div class="card bg-base-200">
-          <div class="card-body">
-            <h2 class="card-title text-lg">Preview</h2>
-            <div
-              id="video-preview-hook"
-              phx-hook="VideoPreview"
-              phx-update="ignore"
-            >
-              <div class="flex items-center justify-center aspect-video bg-base-300 rounded-lg">
-                <p class="text-base-content/40 text-sm">Select a video to preview</p>
+                <form phx-change="set_ttl_days" class="flex items-center gap-2">
+                  <label class="text-xs text-base-content/70">TTL</label>
+                  <input type="number" min="1" max="365" value={@classification_ttl_days} class="input input-bordered input-xs w-16" name="days" />
+                  <span class="text-xs text-base-content/40">days</span>
+                </form>
               </div>
+
+              <div class="flex items-center gap-3 mt-2">
+                <label class="label cursor-pointer gap-1 p-0">
+                  <span class="label-text text-xs">Fishial</span>
+                  <input type="checkbox" class="toggle toggle-xs toggle-info" checked={@fishial_enabled} phx-click="toggle_fishial" disabled={not @fishial_ready} />
+                </label>
+                <label class="label cursor-pointer gap-1 p-0">
+                  <span class="label-text text-xs">VLM</span>
+                  <input type="checkbox" class="toggle toggle-xs toggle-secondary" checked={@vlm_enabled} phx-click="toggle_vlm" />
+                </label>
+                <span class="text-[10px] text-base-content/40">
+                  <%= cond do %>
+                    <% not @fishial_ready and @fishial_enabled -> %><span class="text-warning">Model not downloaded</span>
+                    <% @fishial_enabled and @vlm_enabled -> %>Fishial + VLM fallback
+                    <% @fishial_enabled -> %>Fishial only
+                    <% @vlm_enabled -> %>VLM only
+                    <% true -> %>No classification
+                  <% end %>
+                </span>
+              </div>
+
+              <%!-- VLM Context --%>
+              <div class="mt-2">
+                <div class="flex items-center gap-1">
+                  <select class="select select-bordered select-xs flex-1" phx-change="select_context" name="id">
+                    <option :for={ctx <- @vlm_contexts} value={ctx["id"]} selected={ctx["id"] == @selected_context_id}>{ctx["name"]}</option>
+                  </select>
+                  <button class="btn btn-ghost btn-xs" phx-click="edit_context" title="Edit">Edit</button>
+                  <button class="btn btn-ghost btn-xs" phx-click="new_context" title="New">+</button>
+                </div>
+                <%= if @editing_context do %>
+                  <div class="mt-1 space-y-1">
+                    <input type="text" class="input input-bordered input-xs w-full" placeholder="Context name" value={@context_name} phx-blur="set_context_name" phx-keyup="set_context_name" phx-value-name="" name="name" phx-change="set_context_name" />
+                    <textarea class="textarea textarea-bordered textarea-xs w-full" rows="2" placeholder="Location and species context..." phx-blur="edit_context_prompt" name="prompt" phx-change="edit_context_prompt">{@vlm_context_prompt}</textarea>
+                    <div class="flex gap-1">
+                      <button class="btn btn-primary btn-xs" phx-click="save_context">Save</button>
+                      <button class="btn btn-ghost btn-xs" phx-click="cancel_edit_context">Cancel</button>
+                      <%= if @selected_context_id do %>
+                        <button class="btn btn-error btn-xs btn-outline ml-auto" phx-click="delete_context" data-confirm="Delete this context?">Delete</button>
+                      <% end %>
+                    </div>
+                  </div>
+                <% else %>
+                  <p class="text-[10px] text-base-content/50 mt-1 line-clamp-2">{@vlm_context_prompt}</p>
+                <% end %>
+              </div>
+
+              <% process_count = if MapSet.size(@selected_files) > 0, do: MapSet.size(@selected_files), else: if(@selected_file, do: 1, else: 0) %>
+              <button
+                class="btn btn-primary btn-sm mt-3"
+                phx-click="start_processing"
+                disabled={process_count == 0}
+              >
+                <%= if process_count > 1 do %>
+                  Process {process_count} files
+                <% else %>
+                  Start Processing
+                <% end %>
+              </button>
             </div>
           </div>
-        </div>
 
-        <%!-- Job queue --%>
-        <div class="card bg-base-200">
-          <div class="card-body">
-            <div class="flex items-center justify-between">
-              <h2 class="card-title text-lg">Processing Queue</h2>
-              <button
-                class="btn btn-ghost btn-xs text-warning"
-                phx-click="clean_orphans"
-                data-confirm="Remove all video records whose files no longer exist on disk?"
-              >Clean orphans</button>
-            </div>
-            <div class="overflow-y-auto max-h-96">
-              <%= if Enum.empty?(@jobs) do %>
-                <p class="text-base-content/50 italic">No videos processed yet.</p>
-              <% else %>
-                <div class="space-y-2">
-                  <div :for={job <- @jobs} class="card card-compact bg-base-100">
-                    <div class="card-body p-3">
-                      <div class="flex items-center justify-between">
-                        <span class="font-mono text-sm font-bold">{job.filename}</span>
-                        <div class="flex items-center gap-2">
-                          <span class={[
-                            "badge badge-sm",
-                            job.status == "completed" && "badge-success",
-                            job.status == "processing" && "badge-info",
-                            job.status == "pending" && "badge-ghost",
-                            job.status == "failed" && "badge-error"
-                          ]}>
-                            {job.status}
-                          </span>
-                          <%= if job.status in ["processing", "pending"] do %>
-                            <button
-                              class="btn btn-ghost btn-xs text-warning"
-                              phx-click="cancel_job"
-                              phx-value-id={job.id}
-                            >
-                              Cancel
-                            </button>
-                          <% end %>
-                          <%= if job.status == "failed" do %>
-                            <button
-                              class="btn btn-ghost btn-xs text-info"
-                              phx-click="retry_job"
-                              phx-value-id={job.id}
-                            >
-                              Retry
-                            </button>
-                          <% end %>
-                          <%= if job.status in ["completed", "failed"] do %>
-                            <button
-                              class="btn btn-ghost btn-xs text-error"
-                              phx-click="delete_job"
-                              phx-value-id={job.id}
-                              data-confirm="Remove this job?"
-                            >
-                              Delete
-                            </button>
-                          <% end %>
+          <%!-- Job queue --%>
+          <div class="card bg-base-200">
+            <div class="card-body p-4">
+              <div class="flex items-center justify-between">
+                <h2 class="card-title text-lg">Queue</h2>
+                <button class="btn btn-ghost btn-xs text-warning" phx-click="clean_orphans" data-confirm="Remove all video records whose files no longer exist on disk?">Clean</button>
+              </div>
+              <div class="overflow-y-auto max-h-96">
+                <%= if Enum.empty?(@jobs) do %>
+                  <p class="text-base-content/50 italic text-sm">No jobs yet.</p>
+                <% else %>
+                  <div class="space-y-2">
+                    <div :for={job <- @jobs} class="card card-compact bg-base-100">
+                      <div class="card-body p-3">
+                        <div class="flex items-center justify-between">
+                          <span class="font-mono text-xs font-bold truncate">{job.filename}</span>
+                          <div class="flex items-center gap-1">
+                            <span class={["badge badge-xs",
+                              job.status == "completed" && "badge-success",
+                              job.status == "processing" && "badge-info",
+                              job.status == "pending" && "badge-ghost",
+                              job.status == "failed" && "badge-error"
+                            ]}>{job.status}</span>
+                            <%= if job.status in ["processing", "pending"] do %>
+                              <button class="btn btn-ghost btn-xs text-warning" phx-click="cancel_job" phx-value-id={job.id}>Cancel</button>
+                            <% end %>
+                            <%= if job.status == "failed" do %>
+                              <button class="btn btn-ghost btn-xs text-info" phx-click="retry_job" phx-value-id={job.id}>Retry</button>
+                            <% end %>
+                            <%= if job.status in ["completed", "failed"] do %>
+                              <button class="btn btn-ghost btn-xs text-error" phx-click="delete_job" phx-value-id={job.id} data-confirm="Remove this job?">Del</button>
+                            <% end %>
+                          </div>
                         </div>
-                      </div>
-                      <%= if job.status == "processing" do %>
-                        <progress
-                          class="progress progress-info w-full"
-                          value={job.progress_pct}
-                          max="100"
-                        />
-                        <span class="text-xs text-base-content/50">
-                          {job.status_message || "#{job.progress_pct}%"}
-                        </span>
-                      <% end %>
-                      <%= if job.status == "completed" and job.status_message do %>
-                        <span class="text-xs text-success">{job.status_message}</span>
-                      <% end %>
-                      <%= if job.status == "failed" and job.error_message do %>
-                        <p class="text-xs text-error">{job.error_message}</p>
-                      <% end %>
-                      <div class="text-xs text-base-content/40 flex flex-wrap gap-x-3">
-                        <span>Profile: {job.processing_profile}</span>
-                        <%= if job.min_bbox_area do %>
-                          <span>Min area: {job.min_bbox_area}px</span>
+                        <%= if job.status == "processing" do %>
+                          <progress class="progress progress-info w-full" value={job.progress_pct} max="100" />
+                          <span class="text-xs text-base-content/50">{job.status_message || "#{job.progress_pct}%"}</span>
                         <% end %>
-                        <%= if job.total_tracks do %>
-                          <span>
-                            VLM: {job.vlm_classified_count || 0}/{job.vlm_qualified || 0} classified
-                            ({job.total_tracks} tracks)
-                          </span>
+                        <%= if job.status == "completed" and job.status_message do %>
+                          <span class="text-xs text-success">{job.status_message}</span>
                         <% end %>
-                        <%= if job.fishial_enabled do %>
-                          <span class="badge badge-info badge-xs">Fishial</span>
+                        <%= if job.status == "failed" and job.error_message do %>
+                          <p class="text-xs text-error">{job.error_message}</p>
                         <% end %>
-                        <%= if Map.get(job, :vlm_enabled, true) do %>
-                          <span class="badge badge-secondary badge-xs">VLM</span>
-                        <% end %>
-                        <%= if job.location do %>
-                          <span class="truncate max-w-[150px]" title={job.location}>{job.location}</span>
-                        <% end %>
+                        <div class="text-[10px] text-base-content/40 flex flex-wrap gap-x-2">
+                          <span>{job.processing_profile}</span>
+                          <%= if job.total_tracks do %>
+                            <span>VLM: {job.vlm_classified_count || 0}/{job.vlm_qualified || 0} ({job.total_tracks} tracks)</span>
+                          <% end %>
+                          <span :if={job.fishial_enabled} class="badge badge-info badge-xs">Fish</span>
+                          <span :if={Map.get(job, :vlm_enabled, true)} class="badge badge-secondary badge-xs">VLM</span>
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
-              <% end %>
+                <% end %>
+              </div>
             </div>
           </div>
+
         </div>
       </div>
     </div>

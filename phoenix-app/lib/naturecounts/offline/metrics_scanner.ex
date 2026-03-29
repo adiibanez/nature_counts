@@ -1,258 +1,186 @@
 defmodule Naturecounts.Offline.MetricsScanner do
   @moduledoc """
-  Fast video metrics scanner. Samples a few frames per video,
-  runs YOLO detection, and writes a .metrics.json index file.
+  Video metrics scanner. Spawns a Python subprocess per video file
+  so each gets its own GIL and memory — true parallelism.
   """
 
   require Logger
 
-  @python_code """
-  import cv2
-  import numpy as np
-  import json
-  import os
-  from datetime import datetime, timezone
-  from ultralytics import YOLO
+  @script_path Path.join(:code.priv_dir(:naturecounts), "python/scan_metrics.py")
+  @timeout 300_000
 
-  if isinstance(model_path, bytes):
-      model_path = model_path.decode("utf-8")
-  if isinstance(directory, bytes):
-      directory = directory.decode("utf-8")
-  if isinstance(progress_file, bytes):
-      progress_file = progress_file.decode("utf-8")
-  if isinstance(cancel_file, bytes):
-      cancel_file = cancel_file.decode("utf-8")
-  if isinstance(batch_files, bytes):
-      batch_files = batch_files.decode("utf-8")
-
-  batch_list = json.loads(batch_files) if batch_files else []
-
-  VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".ts"}
-  SIDECAR_SUFFIX = ".metrics.json"
-
-  def write_sidecar(video_path, metrics):
-      sidecar_path = video_path + SIDECAR_SUFFIX
-      tmp_path = sidecar_path + ".tmp"
-      with open(tmp_path, "w") as f:
-          json.dump(metrics, f, indent=2)
-      os.replace(tmp_path, sidecar_path)
-
-  # Find videos to scan
-  if batch_list:
-      all_videos = batch_list
-  else:
-      all_videos = sorted([
-          f for f in os.listdir(directory)
-          if os.path.isfile(os.path.join(directory, f))
-          and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
-      ])
-
-  # Skip videos that already have a sidecar (unless force rescan)
-  to_scan = []
-  for v in all_videos:
-      sidecar = os.path.join(directory, v) + SIDECAR_SUFFIX
-      if force_rescan or not os.path.exists(sidecar):
-          to_scan.append(v)
-
-  total_to_scan = len(to_scan)
-
-  if total_to_scan > 0:
-      model = YOLO(model_path)
-
-      for idx, filename in enumerate(to_scan):
-          video_path = os.path.join(directory, filename)
-          cap = cv2.VideoCapture(video_path)
-
-          if not cap.isOpened():
-              write_sidecar(video_path, {"schema_version": 1, "error": "could not read video"})
-              cap.release()
-              with open(progress_file, "w") as pf:
-                  json.dump({"done": idx + 1, "total": total_to_scan, "current": filename}, pf)
-              continue
-
-          total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-          fps_val = cap.get(cv2.CAP_PROP_FPS)
-          width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-          height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-          duration = total_frames / fps_val if fps_val > 0 else 0
-
-          # Sample frames
-          start_f = int(total_frames * 0.05)
-          end_f = int(total_frames * 0.95)
-          if end_f <= start_f:
-              start_f, end_f = 0, max(total_frames - 1, 0)
-
-          n = sample_frames
-          positions = [start_f + i * (end_f - start_f) // max(n - 1, 1) for i in range(n)]
-
-          frames = []
-          frame_positions = []
-          for pos in positions:
-              cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-              ret, frame = cap.read()
-              if ret:
-                  frames.append(frame)
-                  frame_positions.append(pos)
-          cap.release()
-
-          all_areas = []
-          total_detections = 0
-          brightness_values = []
-          contrast_values = []
-          grays = []
-          per_frame_detections = []
-
-          for frame in frames:
-              gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-              grays.append(gray)
-              brightness_values.append(float(np.mean(gray)))
-              contrast_values.append(float(np.std(gray)))
-
-              frame_det_count = 0
-              results = model(frame, verbose=False, imgsz=640, conf=0.15)
-              for r in results:
-                  boxes = r.boxes
-                  if boxes is not None and len(boxes) > 0:
-                      frame_det_count += len(boxes)
-                      for box in boxes.xyxy.cpu().numpy():
-                          x1, y1, x2, y2 = box[:4]
-                          area = int((x2 - x1) * (y2 - y1))
-                          all_areas.append(area)
-              total_detections += frame_det_count
-              per_frame_detections.append(frame_det_count)
-
-          # Motion score: mean absolute difference between consecutive frames
-          motion_diffs = []
-          for i in range(1, len(grays)):
-              diff = cv2.absdiff(grays[i - 1], grays[i])
-              motion_diffs.append(float(np.mean(diff)))
-
-          n_sampled = len(frames)
-          avg_det = total_detections / n_sampled if n_sampled > 0 else 0
-          avg_brightness = round(sum(brightness_values) / len(brightness_values), 1) if brightness_values else 0
-          avg_contrast = round(sum(contrast_values) / len(contrast_values), 1) if contrast_values else 0
-          motion_score = round(sum(motion_diffs) / len(motion_diffs), 2) if motion_diffs else 0
-
-          # Per-sample temporal data
-          samples = []
-          for si in range(n_sampled):
-              ts = round(frame_positions[si] / fps_val, 1) if fps_val > 0 else 0
-              mot = motion_diffs[si - 1] if si > 0 and si - 1 < len(motion_diffs) else 0
-              samples.append({
-                  "t": ts,
-                  "det": per_frame_detections[si],
-                  "bright": round(brightness_values[si], 1),
-                  "contrast": round(contrast_values[si], 1),
-                  "motion": round(mot, 2),
-              })
-
-          metrics = {
-              "schema_version": 1,
-              "total_frames": total_frames,
-              "fps": round(fps_val, 2),
-              "duration_s": round(duration, 1),
-              "resolution": f"{width}x{height}",
-              "sampled_frames": n_sampled,
-              "total_detections": total_detections,
-              "avg_detections_per_frame": round(avg_det, 1),
-              "avg_brightness": avg_brightness,
-              "contrast": avg_contrast,
-              "motion_score": motion_score,
-              "scanned_at": datetime.now(timezone.utc).isoformat(),
-              "samples": samples,
-              "bbox_areas": {
-                  "count": len(all_areas),
-                  "min": min(all_areas) if all_areas else 0,
-                  "max": max(all_areas) if all_areas else 0,
-                  "mean": round(sum(all_areas) / len(all_areas)) if all_areas else 0,
-              },
-          }
-
-          # Write per-file sidecar (no locking needed)
-          write_sidecar(video_path, metrics)
-
-          # Write progress
-          with open(progress_file, "w") as pf:
-              json.dump({"done": idx + 1, "total": total_to_scan, "current": filename}, pf)
-
-          # Check for cancellation
-          if os.path.exists(cancel_file):
-              os.remove(cancel_file)
-              break
-
-  scan_result = json.dumps({"scanned": total_to_scan, "total": len(all_videos), "skipped": len(all_videos) - total_to_scan})
+  @doc """
+  Scan a single video file. Returns `{:ok, result}` or `{:error, reason}`.
   """
-
-  def scan(directory, opts \\ []) do
+  def scan_file(video_path, opts \\ []) do
     model_path = System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.onnx")
-    sample_frames = Keyword.get(opts, :sample_frames, 5)
-    force = Keyword.get(opts, :force, false)
-    batch_files = Keyword.get(opts, :batch_files, [])
-    batch_id = Keyword.get(opts, :batch_id, "0")
-    _progress_callback = Keyword.get(opts, :progress_callback)
+    sample_frames = Keyword.get(opts, :sample_frames, 60)
 
-    progress_file = Path.join(System.tmp_dir!(), "scan_progress_#{batch_id}.json")
-    cancel_file = Path.join(System.tmp_dir!(), "scan_cancel")
+    python = find_python()
 
-    # Clear stale state (only clear cancel file for batch 0)
-    if batch_id == "0", do: File.rm(cancel_file)
-    File.rm(progress_file)
+    args = [
+      @script_path,
+      video_path,
+      model_path,
+      to_string(sample_frames)
+    ]
 
-    globals = %{
-      "directory" => directory,
-      "model_path" => model_path,
-      "sample_frames" => sample_frames,
-      "force_rescan" => force,
-      "progress_file" => progress_file,
-      "cancel_file" => cancel_file,
-      "batch_files" => Jason.encode!(batch_files)
-    }
-
-    {:ok, poller_pid} = Task.start(fn -> poll_progress(progress_file, directory) end)
-
-    Logger.info("[MetricsScanner] Scanning #{directory}")
+    Logger.info("[MetricsScanner] Scanning #{Path.basename(video_path)} (#{sample_frames} frames)")
 
     try do
-      {_result, updated_globals} = Pythonx.eval(@python_code, globals)
+      {output, exit_code} = cmd_with_timeout(python, args, @timeout)
 
-      Process.exit(poller_pid, :normal)
-      File.rm(progress_file)
+      case exit_code do
+        0 ->
+          parse_result(output, video_path)
 
-      result_json = Pythonx.decode(updated_globals["scan_result"])
-
-      case Jason.decode(result_json) do
-        {:ok, result} ->
-          Logger.info("[MetricsScanner] Done: #{result["scanned"]} scanned, #{result["skipped"]} skipped")
-          {:ok, result}
-
-        {:error, reason} ->
-          {:error, "Failed to parse scan results: #{inspect(reason)}"}
+        exit_code ->
+          reason = extract_error(output, exit_code)
+          Logger.error("[MetricsScanner] Failed #{Path.basename(video_path)}: #{reason}")
+          {:error, reason}
       end
     rescue
       e ->
-        Process.exit(poller_pid, :normal)
-        File.rm(progress_file)
-        Logger.error("[MetricsScanner] Failed: #{Exception.message(e)}")
+        Logger.error("[MetricsScanner] Crash scanning #{Path.basename(video_path)}: #{Exception.message(e)}")
         {:error, Exception.message(e)}
     end
   end
 
-  defp poll_progress(progress_file, directory) do
-    case File.read(progress_file) do
-      {:ok, content} ->
-        case Jason.decode(content) do
-          {:ok, data} ->
-            Phoenix.PubSub.broadcast(
-              Naturecounts.PubSub,
-              "scan:progress",
-              {:scan_progress, directory, data}
-            )
+  @doc """
+  Legacy scan interface for backwards compatibility with old batch workers.
+  Scans files sequentially in one call.
+  """
+  def scan(directory, opts \\ []) do
+    batch_files = Keyword.get(opts, :batch_files, [])
+    force = Keyword.get(opts, :force, false)
+    sample_frames = Keyword.get(opts, :sample_frames, 60)
+
+    files =
+      if batch_files != [] do
+        Enum.map(batch_files, &Path.join(directory, &1))
+      else
+        list_video_files(directory, force)
+      end
+
+    total = length(files)
+    scanned = Enum.count(files, fn path ->
+      case scan_file(path, sample_frames: sample_frames) do
+        {:ok, _} -> true
+        _ -> false
+      end
+    end)
+
+    {:ok, %{"scanned" => scanned, "total" => total, "skipped" => total - scanned}}
+  end
+
+  defp parse_result(output, video_path) do
+    # Find the last line that looks like JSON
+    json_line =
+      output
+      |> String.split("\n")
+      |> Enum.reverse()
+      |> Enum.find(&String.starts_with?(String.trim(&1), "{"))
+
+    case json_line && Jason.decode(String.trim(json_line)) do
+      {:ok, %{"status" => "ok"} = result} ->
+        {:ok, result}
+
+      {:ok, %{"error" => reason}} ->
+        {:error, reason}
+
+      _ ->
+        Logger.warning("[MetricsScanner] No JSON output for #{Path.basename(video_path)}, raw: #{String.slice(output, 0, 200)}")
+        {:error, "no valid output"}
+    end
+  end
+
+  defp extract_error(output, exit_code) do
+    json_line =
+      output
+      |> String.split("\n")
+      |> Enum.reverse()
+      |> Enum.find(&String.starts_with?(String.trim(&1), "{"))
+
+    case json_line && Jason.decode(String.trim(json_line)) do
+      {:ok, %{"error" => reason}} -> reason
+      _ -> "exit code #{exit_code}: #{String.slice(output, -300, 300)}"
+    end
+  end
+
+  defp find_python do
+    # Check explicit env var first
+    case System.get_env("PYTHON_PATH") do
+      nil -> :skip
+      "" -> :skip
+      path -> if File.exists?(path), do: path
+    end
+    |> case do
+      path when is_binary(path) ->
+        path
+
+      _ ->
+        # Use Pythonx's managed venv — probe the build dir
+        pythonx_venv =
+          [:code.priv_dir(:pythonx)]
+          |> Enum.map(&Path.join([to_string(&1), "uv", "project", ".venv", "bin", "python3"]))
+          |> Enum.find(&File.exists?/1)
+
+        pythonx_venv || System.find_executable("python3") || "python3"
+    end
+  end
+
+  defp cmd_with_timeout(cmd, args, timeout_ms) do
+    port =
+      Port.open({:spawn_executable, System.find_executable(cmd)}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        args: args,
+        env: [{~c"PYTHONUNBUFFERED", ~c"1"}]
+      ])
+
+    collect_port_output(port, "", timeout_ms)
+  end
+
+  defp collect_port_output(port, acc, timeout_ms) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_port_output(port, acc <> data, timeout_ms)
+
+      {^port, {:exit_status, status}} ->
+        {acc, status}
+    after
+      timeout_ms ->
+        # Kill the OS process
+        case Port.info(port, :os_pid) do
+          {:os_pid, os_pid} -> System.cmd("kill", ["-9", to_string(os_pid)])
           _ -> :ok
         end
-      _ -> :ok
-    end
 
-    Process.sleep(1500)
-    poll_progress(progress_file, directory)
+        Port.close(port)
+        {acc <> "\n[TIMEOUT after #{div(timeout_ms, 1000)}s]", 124}
+    end
+  end
+
+  defp list_video_files(directory, force) do
+    extensions = ~w(.mp4 .avi .mkv .mov .ts)
+
+    case File.ls(directory) do
+      {:ok, names} ->
+        names
+        |> Enum.filter(fn name ->
+          ext = name |> Path.extname() |> String.downcase()
+          path = Path.join(directory, name)
+          File.regular?(path) and ext in extensions
+        end)
+        |> Enum.reject(fn name ->
+          not force and File.exists?(Path.join(directory, name) <> ".metrics.json")
+        end)
+        |> Enum.map(&Path.join(directory, &1))
+        |> Enum.sort()
+
+      _ ->
+        []
+    end
   end
 end
