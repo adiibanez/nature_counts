@@ -46,8 +46,8 @@ defmodule NaturecountsWeb.Layouts do
         </div>
         <div class="flex-none">
           <ul class="menu menu-horizontal px-1 gap-1 items-center">
-            <li><.link navigate={~p"/"} class={nav_class(@current_path, "/")}>Video streams</.link></li>
-            <li><.link navigate={~p"/videos"} class={nav_class(@current_path, "/videos")}>Videos</.link></li>
+            <li><.link navigate={~p"/"} class={nav_class(@current_path, "/")}>Live videos</.link></li>
+            <li><.link navigate={~p"/videos"} class={nav_class(@current_path, "/videos")}>Offline videos</.link></li>
             <li><.link navigate={~p"/inventory"} class={nav_class(@current_path, "/inventory")}>Inventory</.link></li>
             <li><.link navigate={~p"/crops"} class={nav_class(@current_path, "/crops")}>Crops</.link></li>
             <li><.theme_toggle /></li>

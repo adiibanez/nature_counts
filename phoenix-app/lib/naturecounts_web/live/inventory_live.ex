@@ -22,6 +22,7 @@ defmodule NaturecountsWeb.InventoryLive do
         filter_file: nil,
         filter_source: nil,
         filter_age: nil,
+        species_search: "",
         print_mode: false,
         loading: true
       )
@@ -78,6 +79,10 @@ defmodule NaturecountsWeb.InventoryLive do
 
   def handle_event("filter_age", %{"age" => age}, socket) do
     apply_filter(socket, :filter_age, age)
+  end
+
+  def handle_event("search_species", %{"query" => query}, socket) do
+    {:noreply, assign(socket, species_search: query)}
   end
 
   def handle_event("keep_track", %{"id" => id}, socket) do
@@ -497,20 +502,39 @@ defmodule NaturecountsWeb.InventoryLive do
             </div>
 
             <div class="divider my-1 text-xs">Species</div>
+            <form phx-change="search_species" class="mb-1">
+              <input
+                type="text"
+                name="query"
+                value={@species_search}
+                placeholder="Search species..."
+                class="input input-xs input-bordered w-full"
+                phx-debounce="150"
+                autocomplete="off"
+              />
+            </form>
+            <% filtered_species = if @species_search == "" do
+              @species_summary
+            else
+              q = String.downcase(@species_search)
+              Enum.filter(@species_summary, fn s -> String.contains?(String.downcase(s.species), q) end)
+            end %>
             <%= if Enum.empty?(@species_summary) do %>
               <p class="text-base-content/50 italic">No species identified yet.</p>
             <% else %>
               <div class="space-y-1 overflow-y-auto max-h-[40vh]">
+                <%= if @species_search == "" do %>
+                  <button
+                    class={"btn btn-ghost btn-sm btn-block justify-between #{if @filter_species == nil, do: "btn-active"}"}
+                    phx-click="filter_species"
+                    phx-value-species=""
+                  >
+                    <span>All species</span>
+                    <span class="badge badge-sm">{Enum.reduce(@species_summary, 0, &(&1.count + &2))}</span>
+                  </button>
+                <% end %>
                 <button
-                  class={"btn btn-ghost btn-sm btn-block justify-between #{if @filter_species == nil, do: "btn-active"}"}
-                  phx-click="filter_species"
-                  phx-value-species=""
-                >
-                  <span>All species</span>
-                  <span class="badge badge-sm">{Enum.reduce(@species_summary, 0, &(&1.count + &2))}</span>
-                </button>
-                <button
-                  :for={s <- @species_summary}
+                  :for={s <- filtered_species}
                   class={"btn btn-ghost btn-sm btn-block justify-between #{if @filter_species == s.species, do: "btn-active"}"}
                   phx-click="filter_species"
                   phx-value-species={s.species}
@@ -518,6 +542,9 @@ defmodule NaturecountsWeb.InventoryLive do
                   <span>{s.species}</span>
                   <span class="badge badge-sm">{s.count}</span>
                 </button>
+                <%= if @species_search != "" and Enum.empty?(filtered_species) do %>
+                  <p class="text-base-content/40 italic text-xs text-center py-2">No matches</p>
+                <% end %>
               </div>
             <% end %>
           </div>

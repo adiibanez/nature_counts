@@ -1317,6 +1317,7 @@ defmodule NaturecountsWeb.VideosLive do
         visible = filtered_entries(entries, assigns.metric_filters)
         summary = compute_metrics_summary(visible)
 
+        all_scanned = Enum.filter(entries, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
         scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
         maxes = %{
           det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
@@ -1329,7 +1330,7 @@ defmodule NaturecountsWeb.VideosLive do
           duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
         }
 
-        ranges = compute_metric_ranges(scanned_files)
+        ranges = compute_metric_ranges(all_scanned)
 
         scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
 
