@@ -21,7 +21,7 @@ if System.get_env("PHX_SERVER") do
 end
 
 # Scanning concurrency: one Python subprocess per slot, default 4
-scan_workers = String.to_integer(System.get_env("SCAN_WORKERS", "4"))
+scan_workers = String.to_integer(System.get_env("SCAN_WORKERS", "8"))
 
 config :naturecounts, Oban,
   queues: [video_processing: 1, scanning: scan_workers]

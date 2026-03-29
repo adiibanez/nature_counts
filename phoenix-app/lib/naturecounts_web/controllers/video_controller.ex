@@ -1,9 +1,7 @@
 defmodule NaturecountsWeb.VideoController do
   use NaturecountsWeb, :controller
-  require Logger
 
   @videos_root "/videos"
-  @faststart_cache Path.join(System.tmp_dir!(), "video_faststart")
 
   def show(conn, %{"path" => path_segments}) do
     relative = Path.join(path_segments)
@@ -14,8 +12,7 @@ defmodule NaturecountsWeb.VideoController do
       full_path = Path.join(@videos_root, relative)
 
       if File.exists?(full_path) and File.regular?(full_path) do
-        serve_path = ensure_faststart(full_path)
-        %{size: file_size} = File.stat!(serve_path)
+        %{size: file_size} = File.stat!(full_path)
         mime = MIME.from_path(full_path)
 
         case get_req_header(conn, "range") do
@@ -28,14 +25,14 @@ defmodule NaturecountsWeb.VideoController do
             |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-range", "bytes #{range_start}-#{range_end}/#{file_size}")
             |> put_resp_header("content-length", "#{length}")
-            |> send_file(206, serve_path, range_start, length)
+            |> send_file(206, full_path, range_start, length)
 
           _ ->
             conn
             |> put_resp_content_type(mime, nil)
             |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-length", "#{file_size}")
-            |> send_file(200, serve_path)
+            |> send_file(200, full_path)
         end
       else
         send_resp(conn, 404, "Not found")
@@ -86,7 +83,7 @@ defmodule NaturecountsWeb.VideoController do
           File.mkdir_p!(Path.dirname(clip_path))
 
           {_output, exit_code} =
-            System.cmd("ffmpeg", [
+            System.cmd(ffmpeg_path(), [
               "-ss", t,
               "-i", full_path,
               "-t", dur,
@@ -134,95 +131,14 @@ defmodule NaturecountsWeb.VideoController do
     end
   end
 
-  # Returns a path to a faststart-ready version of the video.
-  # If the moov atom is already at the front, returns the original path.
-  # Otherwise remuxes to a cached copy with +faststart (no re-encoding).
-  defp ensure_faststart(path) do
-    ext = Path.extname(path) |> String.downcase()
+  defp ffmpeg_path do
+    case System.find_executable("ffmpeg") do
+      nil ->
+        Path.wildcard("/app/deps/bundlex/**/bin/ffmpeg") |> List.first() || "ffmpeg"
 
-    # Only MP4/MOV benefit from faststart; other formats (TS, MKV, AVI) don't use moov atoms
-    if ext in [".mp4", ".mov"] and not has_faststart?(path) do
-      cached = faststart_cache_path(path)
-
-      if File.exists?(cached) do
-        cached
-      else
-        File.mkdir_p!(Path.dirname(cached))
-        tmp = cached <> ".tmp"
-
-        {_output, exit_code} =
-          System.cmd("ffmpeg", [
-            "-i", path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            "-y",
-            tmp
-          ], stderr_to_stdout: true)
-
-        if exit_code == 0 do
-          File.rename!(tmp, cached)
-          Logger.info("[VideoController] Created faststart cache for #{Path.basename(path)}")
-          cached
-        else
-          File.rm(tmp)
-          Logger.warning("[VideoController] faststart remux failed for #{Path.basename(path)}, serving original")
-          path
-        end
-      end
-    else
-      path
+      path ->
+        path
     end
-  end
-
-  # Check if the moov atom appears before mdat by reading the first chunk of the file.
-  # MP4 is a sequence of boxes: [size(4 bytes)][type(4 bytes)][...]. We scan for moov vs mdat.
-  defp has_faststart?(path) do
-    case File.open(path, [:read, :binary]) do
-      {:ok, file} ->
-        result = scan_mp4_atoms(file, 0, File.stat!(path).size)
-        File.close(file)
-        result
-
-      _ ->
-        false
-    end
-  end
-
-  defp scan_mp4_atoms(_file, offset, file_size) when offset >= file_size, do: false
-
-  defp scan_mp4_atoms(file, offset, file_size) do
-    case :file.pread(file, offset, 8) do
-      {:ok, <<size::32, type::binary-size(4)>>} ->
-        box_size = if size == 0, do: file_size - offset, else: size
-        # size == 1 means 64-bit extended size
-        box_size =
-          if size == 1 do
-            case :file.pread(file, offset + 8, 8) do
-              {:ok, <<extended::64>>} -> extended
-              _ -> file_size - offset
-            end
-          else
-            box_size
-          end
-
-        cond do
-          type == "moov" -> true    # moov before mdat = faststart
-          type == "mdat" -> false   # mdat before moov = not faststart
-          box_size < 8 -> false     # corrupt/unexpected
-          true -> scan_mp4_atoms(file, offset + box_size, file_size)
-        end
-
-      _ ->
-        false
-    end
-  end
-
-  defp faststart_cache_path(video_path) do
-    hash = :crypto.hash(:md5, video_path) |> Base.encode16(case: :lower) |> binary_part(0, 12)
-    %{size: size, mtime: mtime} = File.stat!(video_path)
-    # Include size+mtime so cache invalidates if the source file changes
-    key = :crypto.hash(:md5, "#{hash}:#{size}:#{:erlang.phash2(mtime)}") |> Base.encode16(case: :lower) |> binary_part(0, 16)
-    Path.join(@faststart_cache, "#{key}#{Path.extname(video_path)}")
   end
 
   defp clip_cache_path(video_path, t, dur) do

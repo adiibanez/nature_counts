@@ -2,7 +2,7 @@ defmodule NaturecountsWeb.VideosLive do
   use NaturecountsWeb, :live_view
 
   alias Naturecounts.Repo
-  alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker, VlmContexts}
+  alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, VlmContexts}
   alias Naturecounts.Storage.{GCS, GCSBuckets}
 
   import Ecto.Query
@@ -143,7 +143,7 @@ defmodule NaturecountsWeb.VideosLive do
   def handle_info(:refresh, socket) do
     schedule_refresh()
     was_scanning = socket.assigns.scanning
-    scanning = if was_scanning, do: scan_running?(), else: false
+    scanning = scan_running?()
 
     socket = assign(socket, jobs: list_jobs(), scanning: scanning)
 
@@ -634,6 +634,17 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply, assign(socket, scanning: true)}
   end
 
+  def handle_event("fix_timestamps", _params, socket) do
+    %{"mode" => "dispatch", "directory" => socket.assigns.current_dir}
+    |> FixTimestampsWorker.new(priority: 1)
+    |> Oban.insert!()
+
+    {:noreply,
+     socket
+     |> assign(scanning: true)
+     |> put_flash(:info, "Fixing timestamps for videos in #{Path.basename(socket.assigns.current_dir)}...")}
+  end
+
   def handle_event("toggle_scan_force", _params, socket) do
     {:noreply, assign(socket, scan_force: !socket.assigns.scan_force)}
   end
@@ -646,7 +657,10 @@ defmodule NaturecountsWeb.VideosLive do
 
     # Cancel Oban jobs
     Oban.Job
-    |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
+    |> where([j], j.worker in [
+      "Naturecounts.Offline.ScanMetricsWorker",
+      "Naturecounts.Offline.FixTimestampsWorker"
+    ])
     |> where([j], j.state in ["available", "executing", "scheduled"])
     |> Repo.all()
     |> Enum.each(&Oban.cancel_job(&1.id))
@@ -1041,12 +1055,19 @@ defmodule NaturecountsWeb.VideosLive do
   defp poll_scan_progress do
     import Ecto.Query
 
-    worker = "Naturecounts.Offline.ScanMetricsWorker"
+    workers = [
+      "Naturecounts.Offline.ScanMetricsWorker",
+      "Naturecounts.Offline.FixTimestampsWorker"
+    ]
+
+    # Only count active + recently finished jobs (last 2 hours)
+    cutoff = DateTime.add(DateTime.utc_now(), -2, :hour)
 
     counts =
       Oban.Job
-      |> where([j], j.worker == ^worker)
+      |> where([j], j.worker in ^workers)
       |> where([j], j.state in ["available", "executing", "completed", "discarded", "retryable"])
+      |> where([j], j.inserted_at >= ^cutoff)
       |> group_by([j], j.state)
       |> select([j], {j.state, count(j.id)})
       |> Repo.all()
@@ -1077,7 +1098,10 @@ defmodule NaturecountsWeb.VideosLive do
 
     Naturecounts.Cache.get_or_compute(:scan_running, fn ->
       Oban.Job
-      |> where([j], j.worker == "Naturecounts.Offline.ScanMetricsWorker")
+      |> where([j], j.worker in [
+        "Naturecounts.Offline.ScanMetricsWorker",
+        "Naturecounts.Offline.FixTimestampsWorker"
+      ])
       |> where([j], j.state in ["available", "executing", "scheduled"])
       |> Repo.exists?()
     end, ttl: 2_000, group: :videos)
@@ -2162,6 +2186,7 @@ defmodule NaturecountsWeb.VideosLive do
                       <input type="checkbox" class="checkbox checkbox-xs" checked={@scan_force} phx-click="toggle_scan_force" />
                     </label>
                     <button class="btn btn-ghost btn-xs" phx-click="scan_metrics">Scan</button>
+                    <button class="btn btn-ghost btn-xs" phx-click="fix_timestamps" title="Remux MP4s to fix non-zero start_time (enables browser seeking)">Fix seek</button>
                     <button class="btn btn-ghost btn-xs" phx-click="select_black_videos" title="Select videos with 0 detections">Select empty</button>
                   <% end %>
                 </div>
