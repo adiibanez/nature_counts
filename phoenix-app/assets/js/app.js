@@ -50,6 +50,12 @@ const InfiniteScroll = {
   }
 }
 
+// Format seconds to m:ss (used by annotation buttons)
+window._fmtTime = (s) => {
+  s = Math.round(s);
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+};
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,

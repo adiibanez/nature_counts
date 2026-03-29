@@ -14,21 +14,31 @@ const VideoPreview = {
 
       if (!this._video) this._buildPlayer();
 
+      // Pick up seek request set via onclick before the server event arrived
+      if (window._pendingSeek != null) {
+        this._pendingSeek = window._pendingSeek;
+        window._pendingSeek = null;
+      }
+
       // Load new source if different, or reload on error
       if (this._currentUrl !== url || this._video.error) {
-        this._pendingSeek = null;
+        const seekAfterLoad = this._pendingSeek;
+        this._pendingSeek = seekAfterLoad; // preserve across reload
         this._currentUrl = url;
         this._video.src = url;
         this._video.load();
+      } else {
+        // Same file already loaded — seek immediately
+        this._trySeek();
       }
 
       this._label.title = filename;
       this._label.textContent = filename;
     });
 
-    this.handleEvent("seek", ({ time }) => {
+    this.handleEvent("seek", ({ seconds, time }) => {
       if (!this._video) return;
-      this._pendingSeek = time;
+      this._pendingSeek = parseFloat(seconds ?? time);
       this._trySeek();
     });
   },

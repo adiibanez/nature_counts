@@ -2,7 +2,7 @@ defmodule NaturecountsWeb.VideosLive do
   use NaturecountsWeb, :live_view
 
   alias Naturecounts.Repo
-  alias Naturecounts.Offline.{Video, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, VlmContexts}
+  alias Naturecounts.Offline.{Video, Annotation, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, VlmContexts}
   alias Naturecounts.Storage.{GCS, GCSBuckets}
 
   import Ecto.Query
@@ -18,8 +18,6 @@ defmodule NaturecountsWeb.VideosLive do
       Phoenix.PubSub.subscribe(Naturecounts.PubSub, "scan:progress")
     end
 
-    if connected?(socket), do: send(self(), {:load_dir, @videos_root})
-
     jobs = list_jobs()
 
     default_profile = Profiles.get("standard")
@@ -34,6 +32,11 @@ defmodule NaturecountsWeb.VideosLive do
        jobs: jobs,
        selected_file: nil,
        preview_url: nil,
+       annotations: [],
+       all_annotations: [],
+       annotation_search: "",
+       annotation_suggestions: [],
+       editing_annotation: nil,
        selected_files: MapSet.new(),
        selected_profile: "standard",
        profiles: Profiles.all(),
@@ -55,7 +58,7 @@ defmodule NaturecountsWeb.VideosLive do
        sort_by: "name",
        sort_dir: "asc",
        metric_filters: %{},
-       show_metrics: false,
+       active_tab: "files",
        metrics_view: "heatmap",
        scatter_x: "brightness",
        scatter_y: "det",
@@ -75,6 +78,83 @@ defmodule NaturecountsWeb.VideosLive do
        bucket_test_result: nil
      )
      |> recompute_metrics()}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    tab = params["tab"] || "files"
+    sort_by = params["sort"] || "name"
+    sort_dir = params["dir"] || "asc"
+    source = params["source"] || "local"
+    view = params["view"] || "heatmap"
+    path = params["path"] || ""
+
+    # Resolve directory
+    {dir, gcs_prefix} =
+      case source do
+        "gcs" -> {socket.assigns.current_dir, if(path != "", do: path, else: socket.assigns.gcs_prefix)}
+        _ -> {if(path != "", do: safe_resolve(path), else: @videos_root), socket.assigns.gcs_prefix}
+      end
+
+    # Check if directory changed
+    dir_changed = case source do
+      "gcs" -> gcs_prefix != socket.assigns.gcs_prefix or source != socket.assigns.source
+      _ -> dir != socket.assigns.current_dir or source != socket.assigns.source
+    end
+
+    # Check if sort changed
+    sort_changed = sort_by != socket.assigns.sort_by or sort_dir != socket.assigns.sort_dir
+
+    socket = assign(socket,
+      active_tab: tab,
+      sort_by: sort_by,
+      sort_dir: sort_dir,
+      source: source,
+      metrics_view: view
+    )
+
+    # Load annotations tab data if needed
+    socket = if tab == "annotations" and socket.assigns.all_annotations == [] do
+      assign(socket, all_annotations: load_all_annotations(), annotation_search: "", annotation_suggestions: [])
+    else
+      socket
+    end
+
+    # Load directory if changed or first load
+    socket =
+      cond do
+        dir_changed ->
+          case source do
+            "gcs" ->
+              send(self(), {:load_gcs, socket.assigns.selected_bucket, gcs_prefix})
+              assign(socket, gcs_prefix: gcs_prefix, entries: :loading, selected_file: nil, preview_url: nil, selected_files: MapSet.new())
+
+            _ ->
+              send(self(), {:load_dir, dir})
+              assign(socket,
+                current_dir: dir,
+                breadcrumbs: build_breadcrumbs(dir),
+                entries: :loading,
+                selected_file: nil,
+                preview_url: nil,
+                selected_files: MapSet.new()
+              )
+          end
+          |> recompute_metrics()
+
+        socket.assigns.entries == :loading ->
+          send(self(), {:load_dir, dir})
+          assign(socket, current_dir: dir, breadcrumbs: build_breadcrumbs(dir))
+
+        sort_changed ->
+          entries = sort_entries(socket.assigns.entries, sort_by, sort_dir)
+          assign(socket, entries: entries) |> recompute_metrics()
+
+        true ->
+          socket
+      end
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -175,41 +255,15 @@ defmodule NaturecountsWeb.VideosLive do
 
   @impl true
   def handle_event("navigate_dir", %{"path" => path}, socket) do
-    case socket.assigns.source do
-      "gcs" ->
-        prefix = path
-        send(self(), {:load_gcs, socket.assigns.selected_bucket, prefix})
-
-        {:noreply,
-         socket
-         |> assign(
-           gcs_prefix: prefix,
-           entries: :loading,
-           selected_file: nil,
-           preview_url: nil,
-           selected_files: MapSet.new()
-         )
-         |> recompute_metrics()
-         |> push_event("preview", %{url: nil, filename: nil})}
-
-      _ ->
-        safe_path = safe_resolve(path)
-        breadcrumbs = build_breadcrumbs(safe_path)
-        send(self(), {:load_dir, safe_path})
-
-        {:noreply,
-         socket
-         |> assign(
-           current_dir: safe_path,
-           breadcrumbs: breadcrumbs,
-           entries: :loading,
-           selected_file: nil,
-           preview_url: nil,
-           selected_files: MapSet.new()
-         )
-         |> recompute_metrics()
-         |> push_event("preview", %{url: nil, filename: nil})}
+    url_path = case socket.assigns.source do
+      "gcs" -> path
+      _ -> Path.relative_to(safe_resolve(path), @videos_root)
     end
+
+    {:noreply,
+     socket
+     |> push_event("preview", %{url: nil, filename: nil})
+     |> push_patch(to: videos_url(socket, %{path: url_path}))}
   end
 
   def handle_event("switch_source", %{"source" => "gcs"}, socket) do
@@ -428,8 +482,8 @@ defmodule NaturecountsWeb.VideosLive do
             {:ok, url} ->
               {:noreply,
                socket
-               |> assign(selected_file: file, preview_url: url)
-               |> push_event("preview", %{url: url, filename: Path.basename(file)})}
+               |> assign(selected_file: file, preview_url: url, annotations: list_annotations(file))
+                             |> push_event("preview", %{url: url, filename: Path.basename(file)})}
 
             {:error, reason} ->
               {:noreply, put_flash(socket, :error, "GCS signed URL error: #{reason}")}
@@ -444,8 +498,8 @@ defmodule NaturecountsWeb.VideosLive do
 
         {:noreply,
          socket
-         |> assign(selected_file: file, preview_url: preview_url)
-         |> push_event("preview", %{url: preview_url, filename: Path.basename(file)})}
+         |> assign(selected_file: file, preview_url: preview_url, annotations: list_annotations(file))
+                 |> push_event("preview", %{url: preview_url, filename: Path.basename(file)})}
     end
   end
 
@@ -605,20 +659,15 @@ defmodule NaturecountsWeb.VideosLive do
     {:noreply, assign(socket, min_bbox_area: area)}
   end
 
-  def handle_event("sort_files", %{"col" => col}, %{assigns: %{entries: :loading}} = socket) do
-    {:noreply, assign(socket, sort_by: col, sort_dir: "desc")}
-  end
-
   def handle_event("sort_files", %{"col" => col}, socket) do
-    {sort_by, sort_dir} =
+    new_dir =
       if socket.assigns.sort_by == col do
-        {col, if(socket.assigns.sort_dir == "desc", do: "asc", else: "desc")}
+        if socket.assigns.sort_dir == "desc", do: "asc", else: "desc"
       else
-        {col, "desc"}
+        "desc"
       end
 
-    entries = sort_entries(socket.assigns.entries, sort_by, sort_dir)
-    {:noreply, assign(socket, sort_by: sort_by, sort_dir: sort_dir, entries: entries) |> recompute_metrics()}
+    {:noreply, push_patch(socket, to: videos_url(socket, %{sort: col, dir: new_dir}))}
   end
 
   def handle_event("scan_metrics", _params, socket) do
@@ -908,12 +957,110 @@ defmodule NaturecountsWeb.VideosLive do
      |> put_flash(:info, "Removed #{length(orphans)} orphaned record(s)")}
   end
 
-  def handle_event("toggle_metrics", _params, socket) do
-    {:noreply, assign(socket, show_metrics: !socket.assigns.show_metrics)}
+  def handle_event("switch_tab", %{"tab" => tab}, socket) do
+    {:noreply, push_patch(socket, to: videos_url(socket, %{tab: tab}))}
+  end
+
+  def handle_event("add_annotation", %{"annotation" => params}, socket) do
+    file = socket.assigns.selected_file
+
+    if file do
+      ts = parse_timestamp(params["timestamp"] || "0:00")
+      end_ts = if (params["end_timestamp"] || "") != "", do: parse_timestamp(params["end_timestamp"]), else: nil
+
+      %Annotation{}
+      |> Annotation.changeset(%{filename: Path.basename(file), timestamp_seconds: ts, end_seconds: end_ts, text: params["text"]})
+      |> Repo.insert!()
+
+      invalidate_annotations_cache()
+      socket = assign(socket, annotations: list_annotations(file))
+      {:noreply, socket}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("delete_annotation", %{"id" => id}, socket) do
+    Annotation |> Repo.get!(id) |> Repo.delete!()
+
+    invalidate_annotations_cache()
+    socket = assign(socket, annotations: list_annotations(socket.assigns.selected_file))
+    socket = if socket.assigns.active_tab == "annotations", do: assign(socket, all_annotations: load_all_annotations(socket.assigns.annotation_search)), else: socket
+    {:noreply, socket}
+  end
+
+  def handle_event("edit_annotation", %{"id" => id}, socket) do
+    {:noreply, assign(socket, editing_annotation: String.to_integer(id))}
+  end
+
+  def handle_event("cancel_edit_annotation", _params, socket) do
+    {:noreply, assign(socket, editing_annotation: nil)}
+  end
+
+  def handle_event("save_annotation", %{"id" => id, "annotation" => params}, socket) do
+    ann = Repo.get!(Annotation, id)
+    ts = parse_timestamp(params["timestamp"] || "0:00")
+    end_ts = if (params["end_timestamp"] || "") != "", do: parse_timestamp(params["end_timestamp"]), else: nil
+
+    ann
+    |> Annotation.changeset(%{timestamp_seconds: ts, end_seconds: end_ts, text: params["text"]})
+    |> Repo.update!()
+
+    invalidate_annotations_cache()
+    socket = assign(socket, editing_annotation: nil, annotations: list_annotations(socket.assigns.selected_file))
+    socket = if socket.assigns.active_tab == "annotations", do: assign(socket, all_annotations: load_all_annotations(socket.assigns.annotation_search)), else: socket
+    {:noreply, socket}
+  end
+
+  def handle_event("seek_annotation", params, socket) do
+    seconds = params["seconds"]
+    filename = params["filename"]
+
+    socket =
+      if filename && Path.basename(socket.assigns.selected_file || "") != filename do
+        path = resolve_video_path(filename, socket.assigns.current_dir)
+        relative = Path.relative_to(path, @videos_root)
+        preview_url = "/serve/videos/#{relative}"
+
+        socket
+        |> assign(selected_file: path, preview_url: preview_url, annotations: list_annotations(path))
+               |> push_event("preview", %{url: preview_url, filename: filename})
+      else
+        socket
+      end
+
+    {:noreply, push_event(socket, "seek", %{seconds: seconds})}
+  end
+
+  def handle_event("search_annotations", %{"query" => query}, socket) do
+    {:noreply, assign(socket,
+      annotation_search: query,
+      all_annotations: load_all_annotations(query),
+      annotation_suggestions: if(query != "", do: annotation_suggestions(query), else: [])
+    )}
+  end
+
+  def handle_event("select_annotation_file", %{"filename" => filename}, socket) do
+    path = resolve_video_path(filename, socket.assigns.current_dir)
+    relative = Path.relative_to(path, @videos_root)
+    preview_url = "/serve/videos/#{relative}"
+
+    {:noreply,
+     socket
+     |> assign(selected_file: path, preview_url: preview_url, annotations: list_annotations(path))
+         |> push_event("preview", %{url: preview_url, filename: filename})}
+  end
+
+  def handle_event("pick_annotation_suggestion", %{"value" => value}, socket) do
+    {:noreply, assign(socket,
+      annotation_search: value,
+      all_annotations: load_all_annotations(value),
+      annotation_suggestions: []
+    )}
   end
 
   def handle_event("set_metrics_view", %{"view" => view}, socket) do
-    {:noreply, assign(socket, metrics_view: view, metrics_limit: 50) |> recompute_metrics()}
+    {:noreply, push_patch(assign(socket, metrics_limit: 50), to: videos_url(socket, %{view: view}))}
   end
 
   def handle_event("set_scatter_axis", %{"axis" => axis, "value" => value}, socket) do
@@ -1028,7 +1175,14 @@ defmodule NaturecountsWeb.VideosLive do
   end
 
   defp safe_resolve(path) do
-    expanded = Path.expand(path)
+    # If already absolute and under videos_root, use directly
+    # Otherwise treat as relative to videos_root
+    expanded =
+      if String.starts_with?(path, @videos_root) do
+        Path.expand(path)
+      else
+        Path.expand(path, @videos_root)
+      end
 
     if String.starts_with?(expanded, @videos_root) do
       expanded
@@ -1119,14 +1273,14 @@ defmodule NaturecountsWeb.VideosLive do
       |> select([v], {v.path, %{status: v.status, profile: v.processing_profile}})
       |> Repo.all()
       |> Map.new()
-    end, ttl: 3_000, group: :videos)
+    end, ttl: 10_000, group: :videos)
   end
 
   defp list_dir(dir, processed_files) do
     base =
       Naturecounts.Cache.get_or_compute({:file_browser, dir}, fn ->
         list_dir_from_fs(dir)
-      end, ttl: 10_000, group: :file_browser)
+      end, ttl: 30_000, group: :file_browser)
 
     Enum.map(base, fn
       %{type: :file, path: path} = entry ->
@@ -1310,6 +1464,7 @@ defmodule NaturecountsWeb.VideosLive do
           maxes: %{det: 0, brightness: 255, contrast: 0, motion: 0, bbox_mean: 0, duration: 0},
           ranges: %{},
           scanned_only: [],
+          annotations_by_file: %{},
           loading_entries: true
         )
 
@@ -1319,25 +1474,29 @@ defmodule NaturecountsWeb.VideosLive do
 
         all_scanned = Enum.filter(entries, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
         scanned_files = Enum.filter(visible, &(&1.type == :file and &1.metrics != nil and !&1.metrics["error"]))
-        maxes = %{
-          det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["avg_detections_per_frame"] || 0) end),
-          total_det: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["total_detections"] || 0) end),
-          brightness: 255,
-          contrast: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["contrast"] || 0) end),
-          motion: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["motion_score"] || 0) end),
-          bbox_count: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "count"]) || 0) end),
-          bbox_mean: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, get_in(f.metrics, ["bbox_areas", "mean"]) || 0) end),
-          duration: Enum.reduce(scanned_files, 0, fn f, acc -> max(acc, f.metrics["duration_s"] || 0) end)
-        }
+
+        # Single-pass maxes
+        maxes = Enum.reduce(scanned_files, %{det: 0, total_det: 0, brightness: 255, contrast: 0, motion: 0, bbox_count: 0, bbox_mean: 0, duration: 0}, fn f, acc ->
+          m = f.metrics
+          %{acc |
+            det: max(acc.det, m["avg_detections_per_frame"] || 0),
+            total_det: max(acc.total_det, m["total_detections"] || 0),
+            contrast: max(acc.contrast, m["contrast"] || 0),
+            motion: max(acc.motion, m["motion_score"] || 0),
+            bbox_count: max(acc.bbox_count, get_in(m, ["bbox_areas", "count"]) || 0),
+            bbox_mean: max(acc.bbox_mean, get_in(m, ["bbox_areas", "mean"]) || 0),
+            duration: max(acc.duration, m["duration_s"] || 0)
+          }
+        end)
 
         ranges = compute_metric_ranges(all_scanned)
-
-        scanned_only = Enum.filter(scanned_files, &(&1.metrics != nil))
 
         visible_files = Enum.filter(visible, &(&1.type == :file))
         total_visible = length(visible_files)
         metrics_page = Enum.take(visible, assigns.metrics_limit)
         has_more = total_visible > assigns.metrics_limit
+
+        annotations_by_file = cached_annotations_by_file()
 
         assign(socket,
           visible: visible,
@@ -1346,8 +1505,9 @@ defmodule NaturecountsWeb.VideosLive do
           has_more_metrics: has_more,
           summary: summary,
           maxes: maxes,
-          scanned_only: Enum.take(scanned_only, assigns.metrics_limit),
+          scanned_only: Enum.take(scanned_files, assigns.metrics_limit),
           ranges: ranges,
+          annotations_by_file: annotations_by_file,
           loading_entries: false
         )
     end
@@ -1447,16 +1607,26 @@ defmodule NaturecountsWeb.VideosLive do
     if count == 0 do
       nil
     else
-      metrics_list = Enum.map(scanned, & &1.metrics)
+      totals = Enum.reduce(scanned, %{dur: 0, det: 0, bright: 0, contrast: 0, motion: 0, bbox: 0}, fn f, acc ->
+        m = f.metrics
+        %{acc |
+          dur: acc.dur + (m["duration_s"] || 0),
+          det: acc.det + (m["avg_detections_per_frame"] || 0),
+          bright: acc.bright + (m["avg_brightness"] || 0),
+          contrast: acc.contrast + (m["contrast"] || 0),
+          motion: acc.motion + (m["motion_score"] || 0),
+          bbox: acc.bbox + (get_in(m, ["bbox_areas", "count"]) || 0)
+        }
+      end)
 
       %{
         count: count,
-        total_duration: Enum.reduce(metrics_list, 0, &((&1["duration_s"] || 0) + &2)) |> Float.round(1),
-        avg_det: (Enum.reduce(metrics_list, 0, &((&1["avg_detections_per_frame"] || 0) + &2)) / count) |> Float.round(1),
-        avg_brightness: (Enum.reduce(metrics_list, 0, &((&1["avg_brightness"] || 0) + &2)) / count) |> Float.round(1),
-        avg_contrast: (Enum.reduce(metrics_list, 0, &((&1["contrast"] || 0) + &2)) / count) |> Float.round(1),
-        avg_motion: (Enum.reduce(metrics_list, 0, &((&1["motion_score"] || 0) + &2)) / count) |> Float.round(2),
-        total_bbox: Enum.reduce(metrics_list, 0, &((get_in(&1, ["bbox_areas", "count"]) || 0) + &2))
+        total_duration: Float.round(totals.dur, 1),
+        avg_det: Float.round(totals.det / count, 1),
+        avg_brightness: Float.round(totals.bright / count, 1),
+        avg_contrast: Float.round(totals.contrast / count, 1),
+        avg_motion: Float.round(totals.motion / count, 2),
+        total_bbox: totals.bbox
       }
     end
   end
@@ -1607,6 +1777,122 @@ defmodule NaturecountsWeb.VideosLive do
     "hsl(#{hue}, 70%, 55%)"
   end
 
+  defp videos_url(socket, overrides) do
+    assigns = socket.assigns
+    params =
+      %{
+        "tab" => Map.get(overrides, :tab, assigns.active_tab),
+        "sort" => Map.get(overrides, :sort, assigns.sort_by),
+        "dir" => Map.get(overrides, :dir, assigns.sort_dir),
+        "source" => Map.get(overrides, :source, assigns.source),
+        "view" => Map.get(overrides, :view, assigns.metrics_view),
+        "path" => Map.get(overrides, :path, if(assigns.source == "gcs", do: assigns.gcs_prefix, else: Path.relative_to(assigns.current_dir, @videos_root)))
+      }
+      |> Enum.reject(fn {k, v} -> v == nil or v == "" or (k == "tab" and v == "files") or (k == "sort" and v == "name") or (k == "dir" and v == "asc") or (k == "source" and v == "local") or (k == "view" and v == "heatmap") or (k == "path" and v in ["", "."]) end)
+      |> Map.new()
+
+    query = URI.encode_query(params)
+    if query == "", do: "/videos", else: "/videos?" <> query
+  end
+
+  defp resolve_video_path(filename, current_dir) do
+    # 1. Check Video table
+    case Repo.one(from v in Video, where: v.filename == ^filename, select: v.path, limit: 1) do
+      nil ->
+        # 2. Check current directory
+        direct = Path.join(current_dir, filename)
+
+        if File.exists?(direct) do
+          direct
+        else
+          # 3. Search under /videos recursively
+          case Path.wildcard(Path.join(@videos_root, "**/#{filename}")) do
+            [found | _] -> found
+            [] -> direct
+          end
+        end
+
+      path ->
+        path
+    end
+  end
+
+  defp cached_annotations_by_file do
+    Naturecounts.Cache.get_or_compute(:annotations_by_file, fn ->
+      Annotation
+      |> order_by([a], a.timestamp_seconds)
+      |> Repo.all()
+      |> Enum.group_by(& &1.filename)
+    end, ttl: 30_000, group: :annotations)
+  end
+
+  defp list_annotations(file) when is_binary(file) do
+    basename = Path.basename(file)
+    Map.get(cached_annotations_by_file(), basename, [])
+  end
+
+  defp list_annotations(_), do: []
+
+  defp invalidate_annotations_cache do
+    Naturecounts.Cache.invalidate_group(:annotations)
+  end
+
+  defp load_all_annotations(search \\ "") do
+    query = Annotation |> order_by([a], [asc: a.filename, asc: a.timestamp_seconds])
+
+    query =
+      if search != "" do
+        pattern = "%#{search}%"
+        where(query, [a], ilike(a.filename, ^pattern) or ilike(a.text, ^pattern))
+      else
+        query
+      end
+
+    Repo.all(query)
+  end
+
+  defp annotation_suggestions(query) do
+    pattern = "%#{query}%"
+
+    filenames =
+      Annotation
+      |> where([a], ilike(a.filename, ^pattern))
+      |> select([a], a.filename)
+      |> distinct(true)
+      |> limit(5)
+      |> Repo.all()
+      |> Enum.map(&%{type: "file", value: &1})
+
+    texts =
+      Annotation
+      |> where([a], ilike(a.text, ^pattern))
+      |> select([a], a.text)
+      |> distinct(true)
+      |> limit(5)
+      |> Repo.all()
+      |> Enum.map(&%{type: "text", value: &1})
+
+    (filenames ++ texts) |> Enum.take(8)
+  end
+
+  defp parse_timestamp(str) do
+    parts = String.split(str, ":") |> Enum.map(&String.to_integer/1)
+
+    case parts do
+      [h, m, s] -> h * 3600 + m * 60 + s
+      [m, s] -> m * 60 + s
+      [s] -> s
+      _ -> 0
+    end
+  end
+
+  defp format_timestamp(seconds) do
+    seconds = trunc(seconds)
+    m = div(seconds, 60)
+    s = rem(seconds, 60)
+    "#{m}:#{String.pad_leading(Integer.to_string(s), 2, "0")}"
+  end
+
   defp profile_bg("light"), do: "bg-success/10"
   defp profile_bg("standard"), do: "bg-warning/10"
   defp profile_bg("deep"), do: "bg-error/10"
@@ -1623,7 +1909,7 @@ defmodule NaturecountsWeb.VideosLive do
       |> order_by(desc: :inserted_at)
       |> limit(20)
       |> Repo.all()
-    end, ttl: 2_000, group: :videos)
+    end, ttl: 5_000, group: :videos)
   end
 
   defp schedule_refresh do
@@ -1636,38 +1922,39 @@ defmodule NaturecountsWeb.VideosLive do
     <div class="p-4 space-y-4">
       <div class="flex items-center justify-between">
         <h1 class="text-2xl font-bold">Video Processing</h1>
-        <div class="flex items-center gap-1">
-          <%= if @show_metrics do %>
-            <div class="flex flex-col items-end gap-0.5 mr-2">
-              <div class="join">
-                <button :for={v <- [{"heatmap", "Heatmap"}, {"scatter", "Scatter"}]}
-                  class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
-                  phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
-                >
-                  {elem(v, 1)}
-                </button>
-              </div>
-              <div class="join">
-                <button :for={v <- [{"timeline", "Timeline"}, {"temporal_scatter", "T-Scatter"}, {"temporal_heatmap", "T-Heatmap"}]}
-                  class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
-                  phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
-                >
-                  {elem(v, 1)}
-                </button>
-              </div>
-            </div>
-          <% end %>
-          <button
-            class={"btn btn-sm #{if @show_metrics, do: "btn-primary", else: "btn-ghost"}"}
-            phx-click="toggle_metrics"
-          >
-            Metrics
-          </button>
-        </div>
       </div>
 
-      <%!-- Metrics dashboard --%>
-      <%= if @show_metrics do %>
+      <%!-- Tab bar --%>
+      <div class="flex items-center gap-2">
+        <div class="tabs tabs-boxed">
+          <button class={"tab #{if @active_tab == "files", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="files">Files</button>
+          <button class={"tab #{if @active_tab == "metrics", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="metrics">Metrics</button>
+          <button class={"tab #{if @active_tab == "annotations", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="annotations">Annotations</button>
+        </div>
+        <%= if @active_tab == "metrics" do %>
+          <div class="flex items-center gap-1">
+            <div class="join">
+              <button :for={v <- [{"heatmap", "Heatmap"}, {"scatter", "Scatter"}]}
+                class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+                phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
+              >
+                {elem(v, 1)}
+              </button>
+            </div>
+            <div class="join">
+              <button :for={v <- [{"timeline", "Timeline"}, {"temporal_scatter", "T-Scatter"}, {"temporal_heatmap", "T-Heatmap"}]}
+                class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+                phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
+              >
+                {elem(v, 1)}
+              </button>
+            </div>
+          </div>
+        <% end %>
+      </div>
+
+      <%!-- Metrics tab --%>
+      <%= if @active_tab == "metrics" do %>
         <div class="card bg-base-200">
           <div class="card-body p-4">
             <%!-- Summary stats --%>
@@ -1947,7 +2234,10 @@ defmodule NaturecountsWeb.VideosLive do
                         <%= if has_samples?(entry) do %>
                           <% samples = get_samples(entry) %>
                           <% n = length(samples) %>
-                          <svg viewBox="0 0 200 30" class="w-full h-8" preserveAspectRatio="none">
+                          <% file_anns = Map.get(@annotations_by_file, entry.name, []) %>
+                          <% has_anns = file_anns != [] %>
+                          <% svg_h = if has_anns, do: 36, else: 30 %>
+                          <svg viewBox={"0 0 200 #{svg_h}"} class={"w-full #{if has_anns, do: "h-9", else: "h-8"}"} preserveAspectRatio="none">
                             <rect x="0" y="0" width="200" height="30" fill="currentColor" opacity="0.03" rx="2" />
                             <%!-- Detection bars (clickable) --%>
                             <%= for {s, i} <- Enum.with_index(samples) do %>
@@ -1976,6 +2266,32 @@ defmodule NaturecountsWeb.VideosLive do
                             <path d={sparkline_path(samples, "bright", 200, 30, bright_max)} fill="none" stroke="hsl(45, 80%, 55%)" stroke-width="1.5" opacity="0.7" class="pointer-events-none" />
                             <%!-- Motion line --%>
                             <path d={sparkline_path(samples, "motion", 200, 30, motion_max)} fill="none" stroke="hsl(280, 70%, 55%)" stroke-width="1" opacity="0.6" stroke-dasharray="3,2" class="pointer-events-none" />
+                            <%!-- Annotation strip below graph --%>
+                            <%= if has_anns do %>
+                              <% file_duration = entry.metrics["duration_s"] || 1 %>
+                              <rect x="0" y="31" width="200" height="5" fill="currentColor" opacity="0.05" rx="1" class="pointer-events-none" />
+                              <%= for ann <- file_anns do %>
+                                <%= if ann.end_seconds do %>
+                                  <rect
+                                    x={Float.round(ann.timestamp_seconds / file_duration * 200, 1)}
+                                    y="31"
+                                    width={Float.round(max((ann.end_seconds - ann.timestamp_seconds) / file_duration * 200, 2), 1)}
+                                    height="5"
+                                    fill="hsl(200, 80%, 60%)" opacity="0.7" rx="1"
+                                    class="pointer-events-none"
+                                  />
+                                <% else %>
+                                  <rect
+                                    x={Float.round(ann.timestamp_seconds / file_duration * 200 - 1, 1)}
+                                    y="31"
+                                    width="3"
+                                    height="5"
+                                    fill="hsl(200, 80%, 60%)" opacity="0.9" rx="0.5"
+                                    class="pointer-events-none"
+                                />
+                              <% end %>
+                            <% end %>
+                          <% end %>
                           </svg>
                         <% else %>
                           <div class="h-8 flex items-center justify-center">
@@ -2153,13 +2469,8 @@ defmodule NaturecountsWeb.VideosLive do
         </div>
       <% end %>
 
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <%!-- ═══════════════════════════════════════ --%>
-        <%!-- LEFT COLUMN: Browse + Preview (2/3)    --%>
-        <%!-- ═══════════════════════════════════════ --%>
-        <div class="lg:col-span-2 space-y-4">
-
-          <%!-- Browse Files --%>
+      <%!-- Files tab --%>
+      <%= if @active_tab == "files" do %>
           <div class="card bg-base-200">
             <div class="card-body p-4">
               <div class="flex items-center justify-between">
@@ -2418,29 +2729,184 @@ defmodule NaturecountsWeb.VideosLive do
             </div>
           </div>
 
-          <%!-- Preview --%>
-          <div class="card bg-base-200">
-            <div class="card-body p-4">
-              <div
-                id="video-preview-hook"
-                phx-hook="VideoPreview"
-                phx-update="ignore"
-              >
-                <div class="flex items-center justify-center aspect-video bg-base-300 rounded-lg">
-                  <p class="text-base-content/40 text-sm">Select a video to preview</p>
-                </div>
+      <% end %>
+
+      <%!-- Annotations tab --%>
+      <%= if @active_tab == "annotations" do %>
+        <div class="card bg-base-200">
+          <div class="card-body p-4">
+            <h2 class="card-title text-lg">All Annotations</h2>
+
+            <%!-- Search with autocomplete --%>
+            <div class="relative">
+              <form phx-change="search_annotations" class="mb-2">
+                <input
+                  type="text"
+                  name="query"
+                  value={@annotation_search}
+                  placeholder="Search by filename or text..."
+                  class="input input-sm input-bordered w-full"
+                  phx-debounce="200"
+                  autocomplete="off"
+                />
+              </form>
+              <%= if @annotation_suggestions != [] do %>
+                <ul class="absolute z-10 bg-base-100 shadow-lg rounded-box w-full max-h-48 overflow-y-auto border border-base-300">
+                  <%= for sug <- @annotation_suggestions do %>
+                    <li>
+                      <button
+                        class="w-full text-left px-3 py-1.5 hover:bg-base-200 text-sm flex items-center gap-2"
+                        phx-click="pick_annotation_suggestion"
+                        phx-value-value={sug.value}
+                      >
+                        <span class={"badge badge-xs #{if sug.type == "file", do: "badge-primary", else: "badge-ghost"}"}>{sug.type}</span>
+                        <span class="truncate">{sug.value}</span>
+                      </button>
+                    </li>
+                  <% end %>
+                </ul>
+              <% end %>
+            </div>
+
+            <%!-- Results grouped by file --%>
+            <% grouped = Enum.group_by(@all_annotations, & &1.filename) %>
+            <%= if map_size(grouped) == 0 do %>
+              <p class="text-base-content/50 italic text-sm">No annotations found.</p>
+            <% else %>
+              <div class="space-y-4 overflow-y-auto max-h-[60vh]">
+                <%= for {filename, anns} <- grouped do %>
+                  <div>
+                    <div class="flex items-center gap-2 mb-1">
+                      <button class="font-mono text-sm font-bold link link-hover" phx-click="select_annotation_file" phx-value-filename={filename}>{filename}</button>
+                      <span class="badge badge-sm">{length(anns)}</span>
+                    </div>
+
+                    <%!-- Timeline bar --%>
+                    <% max_ts = anns |> Enum.map(fn a -> a.end_seconds || a.timestamp_seconds end) |> Enum.max(fn -> 1 end) %>
+                    <% timeline_end = max(max_ts * 1.1, 1) %>
+                    <div class="relative h-6 bg-base-300 rounded-full mb-2 overflow-hidden">
+                      <%= for ann <- anns do %>
+                        <% left_pct = ann.timestamp_seconds / timeline_end * 100 %>
+                        <%= if ann.end_seconds do %>
+                          <% width_pct = (ann.end_seconds - ann.timestamp_seconds) / timeline_end * 100 %>
+                          <div
+                            class="absolute top-0 h-full bg-primary/40 hover:bg-primary/60 cursor-pointer"
+                            style={"left: #{left_pct}%; width: #{width_pct}%"}
+                            title={"#{format_timestamp(ann.timestamp_seconds)}–#{format_timestamp(ann.end_seconds)}: #{ann.text}"}
+                            phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}
+                          />
+                        <% else %>
+                          <div
+                            class="absolute top-0 h-full w-1 bg-primary hover:bg-primary-focus cursor-pointer rounded-full"
+                            style={"left: #{left_pct}%"}
+                            title={"#{format_timestamp(ann.timestamp_seconds)}: #{ann.text}"}
+                            phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}
+                          />
+                        <% end %>
+                      <% end %>
+                      <%!-- Time labels --%>
+                      <span class="absolute left-1 top-0.5 text-[9px] text-base-content/40">0:00</span>
+                      <span class="absolute right-1 top-0.5 text-[9px] text-base-content/40">{format_timestamp(timeline_end)}</span>
+                    </div>
+
+                    <%!-- Annotation list --%>
+                    <div class="space-y-0.5">
+                      <%= for ann <- anns do %>
+                        <%= if @editing_annotation == ann.id do %>
+                          <form phx-submit="save_annotation" phx-value-id={ann.id} class="flex items-center gap-1 text-sm">
+                            <input type="text" name="annotation[timestamp]" value={format_timestamp(ann.timestamp_seconds)} class="input input-xs input-bordered w-14 font-mono" />
+                            <input type="text" name="annotation[end_timestamp]" value={if ann.end_seconds, do: format_timestamp(ann.end_seconds), else: ""} class="input input-xs input-bordered w-14 font-mono" placeholder="to" />
+                            <input type="text" name="annotation[text]" value={ann.text} class="input input-xs input-bordered flex-1" />
+                            <button type="submit" class="btn btn-xs btn-success">Save</button>
+                            <button type="button" class="btn btn-xs btn-ghost" phx-click="cancel_edit_annotation">Cancel</button>
+                          </form>
+                        <% else %>
+                          <div class="flex items-center gap-2 text-sm">
+                            <button class="font-mono text-xs text-base-content/60 w-20 shrink-0 text-left hover:text-primary cursor-pointer" phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}>
+                              {format_timestamp(ann.timestamp_seconds)}<%= if ann.end_seconds do %>–{format_timestamp(ann.end_seconds)}<% end %>
+                            </button>
+                            <button class="flex-1 text-left hover:text-primary cursor-pointer" phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}>{ann.text}</button>
+                            <button class="btn btn-xs btn-ghost" phx-click="edit_annotation" phx-value-id={ann.id}>Edit</button>
+                            <button class="btn btn-xs btn-ghost text-error" phx-click="delete_annotation" phx-value-id={ann.id}>✕</button>
+                          </div>
+                        <% end %>
+                      <% end %>
+                    </div>
+                  </div>
+                <% end %>
               </div>
+            <% end %>
+          </div>
+        </div>
+      <% end %>
+
+      <%!-- Preview --%>
+      <div class="card bg-base-200">
+        <div class="card-body p-4">
+          <div
+            id="video-preview-hook"
+            phx-hook="VideoPreview"
+            phx-update="ignore"
+          >
+            <div class="flex items-center justify-center aspect-video bg-base-300 rounded-lg">
+              <p class="text-base-content/40 text-sm">Select a video to preview</p>
             </div>
           </div>
 
+
+          <%!-- Annotations --%>
+          <%= if @selected_file do %>
+            <% file_annotations = Map.get(cached_annotations_by_file(), Path.basename(@selected_file), []) %>
+            <div class="mt-2 space-y-2">
+              <h3 class="text-sm font-semibold">Annotations ({length(file_annotations)})</h3>
+
+              <%= if file_annotations != [] do %>
+                <div class="space-y-1">
+                  <%= for ann <- file_annotations do %>
+                    <%= if @editing_annotation == ann.id do %>
+                      <form phx-submit="save_annotation" phx-value-id={ann.id} class="flex items-center gap-1 text-sm">
+                        <input type="text" name="annotation[timestamp]" id={"ann-edit-from-#{ann.id}"} value={format_timestamp(ann.timestamp_seconds)} class="input input-xs input-bordered w-14 font-mono" />
+                        <button type="button" class="btn btn-xs btn-ghost" title="Use current time" onclick={"var v=document.querySelector('#video-preview-hook video');if(v)document.getElementById('ann-edit-from-#{ann.id}').value=window._fmtTime(v.currentTime)"}>Now</button>
+                        <input type="text" name="annotation[end_timestamp]" id={"ann-edit-to-#{ann.id}"} value={if ann.end_seconds, do: format_timestamp(ann.end_seconds), else: ""} class="input input-xs input-bordered w-14 font-mono" placeholder="to" />
+                        <button type="button" class="btn btn-xs btn-ghost" title="Use current time" onclick={"var v=document.querySelector('#video-preview-hook video');if(v)document.getElementById('ann-edit-to-#{ann.id}').value=window._fmtTime(v.currentTime)"}>Now</button>
+                        <input type="text" name="annotation[text]" value={ann.text} class="input input-xs input-bordered flex-1" />
+                        <button type="submit" class="btn btn-xs btn-success">Save</button>
+                        <button type="button" class="btn btn-xs btn-ghost" phx-click="cancel_edit_annotation">Cancel</button>
+                      </form>
+                    <% else %>
+                      <div class="flex items-center gap-2 text-sm">
+                        <button class="btn btn-xs btn-ghost font-mono" onclick={"var v=document.querySelector('#video-preview-hook video');if(v){v.currentTime=#{ann.timestamp_seconds};v.play()}"}>
+                          {format_timestamp(ann.timestamp_seconds)}<%= if ann.end_seconds do %>–{format_timestamp(ann.end_seconds)}<% end %>
+                        </button>
+                        <button class="flex-1 text-left hover:text-primary cursor-pointer" onclick={"var v=document.querySelector('#video-preview-hook video');if(v){v.currentTime=#{ann.timestamp_seconds};v.play()}"}>
+                          {ann.text}
+                        </button>
+                        <button class="btn btn-xs btn-ghost" phx-click="edit_annotation" phx-value-id={ann.id}>Edit</button>
+                        <button class="btn btn-xs btn-ghost text-error" phx-click="delete_annotation" phx-value-id={ann.id}>✕</button>
+                      </div>
+                    <% end %>
+                  <% end %>
+                </div>
+              <% end %>
+
+              <%!-- Add annotation form --%>
+              <form phx-submit="add_annotation" class="flex items-center gap-1">
+                <input type="text" name="annotation[timestamp]" id="ann-from" placeholder="from" class="input input-xs input-bordered w-14 font-mono" />
+                <button type="button" class="btn btn-xs btn-ghost" title="Use current time" onclick="var v=document.querySelector('#video-preview-hook video');if(v)document.getElementById('ann-from').value=window._fmtTime(v.currentTime)">Now</button>
+                <input type="text" name="annotation[end_timestamp]" id="ann-to" placeholder="to" class="input input-xs input-bordered w-14 font-mono" />
+                <button type="button" class="btn btn-xs btn-ghost" title="Use current time" onclick="var v=document.querySelector('#video-preview-hook video');if(v)document.getElementById('ann-to').value=window._fmtTime(v.currentTime)">Now</button>
+                <input type="text" name="annotation[text]" placeholder="Add annotation..." class="input input-xs input-bordered flex-1" />
+                <button type="submit" class="btn btn-xs btn-primary">Add</button>
+              </form>
+            </div>
+          <% end %>
         </div>
+      </div>
 
-        <%!-- ═══════════════════════════════════════ --%>
-        <%!-- RIGHT COLUMN: Processing + Queue (1/3) --%>
-        <%!-- ═══════════════════════════════════════ --%>
-        <div class="space-y-4">
+      <%!-- Processing + Queue --%>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
-          <%!-- Processing config --%>
+        <%!-- Processing config --%>
           <div class="card bg-base-200">
             <div class="card-body p-4">
               <h2 class="card-title text-lg">Processing</h2>
@@ -2603,7 +3069,6 @@ defmodule NaturecountsWeb.VideosLive do
             </div>
           </div>
 
-        </div>
       </div>
     </div>
     """
