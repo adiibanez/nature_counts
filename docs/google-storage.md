@@ -6,7 +6,7 @@
 
 ```bash
 # 1. Login
-gcloud auth login adrianibanez99@gmail.com
+gcloud auth login your-account@gmail.com
 
 # 2. Create a project (or use existing)
 gcloud projects create naturecounts-gcs --name="NatureCounts"
