@@ -7,6 +7,8 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
 
   require Logger
 
+  alias Naturecounts.Pipeline.PipelineState
+
   @poll_interval 5_000
 
   # --- Public API ---
@@ -57,6 +59,12 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
     state =
       if File.exists?(socket_path) do
         send(self(), :poll_status)
+
+        # Restore desired state: auto-start if pipeline was previously running
+        if PipelineState.desired_running?() do
+          send(self(), :restore_pipeline)
+        end
+
         state
       else
         Logger.warning("Docker socket not found at #{socket_path} — pipeline control disabled")
@@ -74,6 +82,7 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
   def handle_call(:start_pipeline, _from, state) do
     case docker_post(state, "/containers/#{state.container}/start") do
       {:ok, status} when status in [204, 304] ->
+        PipelineState.set_desired("running")
         state = %{state | container_status: :running}
         broadcast_status(state)
         {:reply, :ok, state}
@@ -86,6 +95,7 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
   def handle_call(:stop_pipeline, _from, state) do
     case docker_post(state, "/containers/#{state.container}/stop?t=10") do
       {:ok, status} when status in [204, 304] ->
+        PipelineState.set_desired("stopped")
         state = %{state | container_status: :stopped}
         broadcast_status(state)
         {:reply, :ok, state}
@@ -106,6 +116,22 @@ defmodule Naturecounts.Pipeline.DeepstreamControl do
       {:error, reason} ->
         Logger.error("[DeepstreamControl] Failed to restart MediaMTX: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:restore_pipeline, state) do
+    Logger.info("[DeepstreamControl] Restoring pipeline — previous state was running")
+
+    case docker_post(state, "/containers/#{state.container}/start") do
+      {:ok, status} when status in [204, 304] ->
+        state = %{state | container_status: :running}
+        broadcast_status(state)
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.warning("[DeepstreamControl] Failed to restore pipeline: #{inspect(reason)}")
+        {:noreply, state}
     end
   end
 

@@ -31,7 +31,7 @@ Config load_config() {
     cfg.rtsp_output_base = env("RTSP_OUTPUT_BASE", "rtsp://mediamtx:8554/cam");
     cfg.rtsp_bitrate = env_int("RTSP_BITRATE", 4000000);
     cfg.file_loop = env_int("FILE_LOOP", 0) != 0;
-    cfg.infer_interval = env_int("INFER_INTERVAL", 3);
+    cfg.infer_interval = env_int("INFER_INTERVAL", 1);
     cfg.enable_thumbnails = env_int("ENABLE_THUMBNAILS", 0) != 0;
     cfg.min_crop_area = env_int("MIN_CROP_AREA", 2500);
     cfg.min_sharpness = env_int("MIN_SHARPNESS", 0);

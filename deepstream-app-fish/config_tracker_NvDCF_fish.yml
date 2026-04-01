@@ -16,13 +16,26 @@ TargetManagement:
 
   # [Creation & Termination Policy]
   minIouDiff4NewTarget: 0.4    # Lower than default — fish can overlap more
-  minTrackerConfidence: 0.1    # Keep tracks alive even at low visual confidence
+  minTrackerConfidence: 0.05   # Lower threshold before shadow mode — keep tracking through appearance changes
   probationAge: 2              # Confirm new tracks quickly (fish appear/disappear at edges)
-  maxShadowTrackingAge: 90     # Keep lost tracks for ~3s at 30fps — survive brief occlusions
-  earlyTerminationAge: 1
+  maxShadowTrackingAge: 120    # Keep lost tracks for ~4s at 30fps — survive occlusions and detector gaps
+  earlyTerminationAge: 3       # Raised from 1 — give tentative tracks time to survive inference interval gaps
 
 TrajectoryManagement:
   useUniqueID: 0
+  enableReAssoc: 1    # Re-associate broken tracks (critical for track continuity)
+
+  # [Re-Assoc: Motion-based]
+  minTrajectoryLength4Projection: 6     # Shorter than default — fish tracks are shorter-lived
+  prepLength4TrajectoryProjection: 6
+  trajectoryProjectionLength: 120       # Project ~4s ahead
+
+  # [Re-Assoc: Trajectory Similarity — relaxed for underwater]
+  minTrackletMatchingScore: 0.2         # Lower than default — fish trajectories are less predictable
+  maxAngle4TrackletMatching: 90         # Fish can change direction sharply
+  minSpeedSimilarity4TrackletMatching: 0.05  # Fish speed varies a lot
+  minBboxSizeSimilarity4TrackletMatching: 0.3  # Size changes as fish turn
+  maxTrackletMatchingTimeSearchRange: 120
 
 DataAssociator:
   dataAssociatorType: 0
@@ -56,7 +69,7 @@ VisualTracker:
   # [NvDCF: Feature Extraction]
   useColorNames: 1
   useHog: 0              # Skip HOG — not useful underwater
-  featureImgSizeLevel: 2
+  featureImgSizeLevel: 3  # Bumped from 2 — more visual info to bridge inference interval gaps
   featureFocusOffsetFactor_y: -0.2
 
   # [NvDCF: Correlation Filter — faster adaptation for fish]

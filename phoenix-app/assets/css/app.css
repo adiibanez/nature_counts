@@ -104,6 +104,33 @@
 
 /* This file is for your main application CSS */
 
+/* Loading indicators for all phx-click and phx-submit buttons */
+.btn.phx-click-loading,
+.btn.phx-submit-loading {
+  pointer-events: none;
+  opacity: 0.6;
+  position: relative;
+}
+
+.btn.phx-click-loading::after,
+.btn.phx-submit-loading::after {
+  content: "";
+  display: inline-block;
+  width: 0.875em;
+  height: 0.875em;
+  margin-left: 0.4em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 9999px;
+  animation: btn-spin 0.5s linear infinite;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Print mode styles */
 .print-grid {
   display: grid;

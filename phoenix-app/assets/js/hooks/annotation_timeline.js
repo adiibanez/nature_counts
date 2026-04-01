@@ -1,9 +1,3 @@
-// Format seconds to m:ss
-window._fmtTime = (s) => {
-  s = Math.round(s);
-  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
-};
-
 const COLORS = [
   { bg: "rgba(99,102,241,0.35)", border: "rgb(99,102,241)" },
   { bg: "rgba(16,185,129,0.35)", border: "rgb(16,185,129)" },
@@ -19,6 +13,10 @@ const AnnotationTimeline = {
     this._duration = 0;
     this._raf = null;
     this._lastJson = "";
+    this._scrubbing = false;
+
+    this._onScrubMove = this._onScrubMove.bind(this);
+    this._onScrubEnd = this._onScrubEnd.bind(this);
 
     this._buildTimeline();
     this._startSync();
@@ -26,6 +24,8 @@ const AnnotationTimeline = {
 
   destroyed() {
     if (this._raf) cancelAnimationFrame(this._raf);
+    document.removeEventListener("mousemove", this._onScrubMove);
+    document.removeEventListener("mouseup", this._onScrubEnd);
   },
 
   _getVideo() {
@@ -39,8 +39,7 @@ const AnnotationTimeline = {
     if (json === this._lastJson) return;
     this._lastJson = json;
     this._annotations = JSON.parse(json);
-    this.el.style.display = this._annotations.length ? "" : "none";
-    if (this._annotations.length) this.el.classList.add("mt-3");
+    this.el.style.display = this._annotations.length || this._duration ? "" : "none";
     this._renderMarkers();
   },
 
@@ -55,21 +54,43 @@ const AnnotationTimeline = {
     bar.className =
       "relative bg-base-300 rounded cursor-pointer overflow-hidden";
     bar.style.height = "32px";
-    bar.addEventListener("click", (e) => {
+
+    // Click to seek
+    bar.addEventListener("mousedown", (e) => {
       if (e.target.closest("[data-ann]")) return;
+      if (e.target === this._playhead || e.target.closest(".playhead-grip")) {
+        // Start scrubbing from playhead
+        this._startScrub(e);
+        return;
+      }
+      // Click-to-seek
       const video = this._getVideo();
       if (!video || !this._duration) return;
       const rect = bar.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       video.currentTime = pct * this._duration;
       video.play().catch(() => {});
+      // Also start scrubbing from here
+      this._startScrub(e);
     });
     this._bar = bar;
 
+    // Playhead
     const playhead = document.createElement("div");
+    playhead.className = "playhead-grip";
     playhead.style.cssText =
-      "position:absolute;top:0;height:100%;width:2px;background:white;z-index:30;pointer-events:none;box-shadow:0 0 4px rgba(0,0,0,0.5)";
+      "position:absolute;top:-2px;height:calc(100% + 4px);width:12px;" +
+      "z-index:30;cursor:grab;transform:translateX(-50%);" +
+      "display:flex;align-items:center;justify-content:center;";
     playhead.style.left = "0%";
+
+    // Visible line
+    const line = document.createElement("div");
+    line.style.cssText =
+      "width:2px;height:100%;background:white;border-radius:1px;" +
+      "box-shadow:0 0 4px rgba(0,0,0,0.5);pointer-events:none;";
+    playhead.appendChild(line);
+
     this._playhead = playhead;
     bar.appendChild(playhead);
 
@@ -101,6 +122,47 @@ const AnnotationTimeline = {
     wrapper.append(bar, labelsRow, timeRow);
     container.appendChild(wrapper);
   },
+
+  // --- Scrubbing (drag playhead to seek) ---
+
+  _startScrub(e) {
+    e.preventDefault();
+    this._scrubbing = true;
+    this._playhead.style.cursor = "grabbing";
+    this._seekToX(e.clientX);
+    document.addEventListener("mousemove", this._onScrubMove);
+    document.addEventListener("mouseup", this._onScrubEnd);
+  },
+
+  _onScrubMove(e) {
+    if (!this._scrubbing) return;
+    this._seekToX(e.clientX);
+  },
+
+  _onScrubEnd() {
+    this._scrubbing = false;
+    this._playhead.style.cursor = "grab";
+    document.removeEventListener("mousemove", this._onScrubMove);
+    document.removeEventListener("mouseup", this._onScrubEnd);
+
+    const video = this._getVideo();
+    if (video && video.paused) video.play().catch(() => {});
+  },
+
+  _seekToX(clientX) {
+    const video = this._getVideo();
+    if (!video || !this._duration) return;
+    const rect = this._bar.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    video.currentTime = pct * this._duration;
+
+    // Immediately update playhead position for responsiveness
+    this._playhead.style.left = (pct * 100) + "%";
+    if (this._labelCurrent)
+      this._labelCurrent.textContent = window._fmtTime(video.currentTime);
+  },
+
+  // --- Marker rendering ---
 
   _renderMarkers() {
     const markersEl = this._markersEl;
@@ -244,6 +306,8 @@ const AnnotationTimeline = {
     this._labelsRow.style.minHeight = maxTop + 16 + "px";
   },
 
+  // --- Animation loop: sync playhead to video ---
+
   _startSync() {
     const tick = () => {
       this._raf = requestAnimationFrame(tick);
@@ -262,6 +326,9 @@ const AnnotationTimeline = {
         if (this._labelEnd) this._labelEnd.textContent = window._fmtTime(dur);
         this._renderMarkers();
       }
+
+      // Don't update playhead while scrubbing — user controls it
+      if (this._scrubbing) return;
 
       const pct = (video.currentTime / dur) * 100;
       if (this._playhead) this._playhead.style.left = pct + "%";

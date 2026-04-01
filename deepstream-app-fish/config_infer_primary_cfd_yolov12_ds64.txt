@@ -10,8 +10,8 @@ batch-size=3
 # FP16 — ~2x faster than FP32 on GTX 1080 Ti with negligible accuracy loss
 network-mode=2
 num-detected-classes=1
-# Process every 3rd frame; tracker interpolates in between
-interval=3
+# Process every 2nd frame — interval=3 was too sparse for fast-moving fish
+interval=1
 gie-unique-id=1
 process-mode=1
 network-type=0
@@ -27,6 +27,6 @@ custom-lib-path=libnvdsinfer_custom_impl_Yolo_cfd_ds64.so
 
 [class-attrs-all]
 nms-iou-threshold=0.45
-# Raised from 0.15 — fewer low-confidence detections to track
-pre-cluster-threshold=0.25
+# Lower threshold for underwater — fish often have low confidence due to blur/turbidity
+pre-cluster-threshold=0.15
 topk=300

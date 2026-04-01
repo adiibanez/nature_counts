@@ -15,6 +15,12 @@ const RangeSlider = {
     this._buildDOM();
     this._attachEvents();
     this._render();
+
+    this.handleEvent("reset_filters", () => {
+      this._curMin = this._dataMin;
+      this._curMax = this._dataMax;
+      this._render();
+    });
   },
 
   destroyed() {

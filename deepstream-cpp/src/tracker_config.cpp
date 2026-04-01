@@ -10,6 +10,7 @@
 
 static const std::unordered_map<std::string, std::string> preset_files = {
     {"iou",              "config_tracker_IOU.yml"},
+    {"nvdcf_fish",       "config_tracker_NvDCF_fish.yml"},
     {"nvdcf_accuracy",   "config_tracker_NvDCF_accuracy.yml"},
     {"nvdcf_perf",       "config_tracker_NvDCF_perf.yml"},
     {"nvdcf_max_perf",   "config_tracker_NvDCF_max_perf.yml"},

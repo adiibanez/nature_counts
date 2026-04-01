@@ -3,6 +3,7 @@ defmodule NaturecountsWeb.IngestionChannel do
 
   alias Naturecounts.Detection.DetectionEvent
   alias Naturecounts.Detection.TrackerState
+  alias Naturecounts.CameraSettings
 
   require Logger
 
@@ -11,6 +12,10 @@ defmodule NaturecountsWeb.IngestionChannel do
     Logger.info("DeepStream pipeline joined ingestion:lobby")
     Phoenix.PubSub.subscribe(Naturecounts.PubSub, "pipeline:control")
     Phoenix.PubSub.broadcast(Naturecounts.PubSub, "deepstream:connection", {:deepstream_connected, true})
+
+    # Re-apply persisted tracker config and crop filters on reconnect
+    send(self(), :restore_config)
+
     {:ok, socket}
   end
 
@@ -19,6 +24,33 @@ defmodule NaturecountsWeb.IngestionChannel do
     Logger.info("DeepStream pipeline left ingestion:lobby")
     Phoenix.PubSub.broadcast(Naturecounts.PubSub, "deepstream:connection", {:deepstream_connected, false})
     :ok
+  end
+
+  @impl true
+  def handle_info(:restore_config, socket) do
+    # Restore tracker config from persisted camera settings (use cam1 as source of truth)
+    saved = CameraSettings.get("cam1")
+
+    if saved["tracker_params"] do
+      config = %{
+        preset: saved["tracker_preset"] || "nvdcf_accuracy",
+        overrides: saved["tracker_params"]
+      }
+
+      Logger.info("[IngestionChannel] Restoring tracker config: #{config.preset}")
+      push(socket, "set_tracker_config", config)
+    end
+
+    # Restore crop filters
+    push(socket, "set_crop_filters", %{
+      min_crop_area: saved["min_crop_area"] || 2500,
+      min_sharpness: saved["min_sharpness"] || 0.0
+    })
+
+    # Restore thumbnail setting
+    push(socket, "set_thumbnails", %{enabled: saved["show_fish_list"] || false})
+
+    {:noreply, socket}
   end
 
   @impl true

@@ -15,22 +15,23 @@ defmodule NaturecountsWeb.VideoController do
         %{size: file_size} = File.stat!(full_path)
         mime = MIME.from_path(full_path)
 
+        conn = conn
+        |> put_resp_content_type(mime, nil)
+        |> put_resp_header("accept-ranges", "bytes")
+        |> put_resp_header("cache-control", "private, max-age=86400, stale-while-revalidate=604800")
+
         case get_req_header(conn, "range") do
           ["bytes=" <> range_spec] ->
             {range_start, range_end} = parse_range(range_spec, file_size)
             length = range_end - range_start + 1
 
             conn
-            |> put_resp_content_type(mime, nil)
-            |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-range", "bytes #{range_start}-#{range_end}/#{file_size}")
             |> put_resp_header("content-length", "#{length}")
             |> send_file(206, full_path, range_start, length)
 
           _ ->
             conn
-            |> put_resp_content_type(mime, nil)
-            |> put_resp_header("accept-ranges", "bytes")
             |> put_resp_header("content-length", "#{file_size}")
             |> send_file(200, full_path)
         end
@@ -111,7 +112,7 @@ defmodule NaturecountsWeb.VideoController do
               |> put_resp_header("accept-ranges", "bytes")
               |> put_resp_header("content-range", "bytes #{range_start}-#{range_end}/#{file_size}")
               |> put_resp_header("content-length", "#{length}")
-              |> put_resp_header("cache-control", "private, max-age=60")
+              |> put_resp_header("cache-control", "private, max-age=3600, immutable")
               |> send_file(206, clip_path, range_start, length)
 
             _ ->
@@ -119,7 +120,7 @@ defmodule NaturecountsWeb.VideoController do
               |> put_resp_content_type(mime, nil)
               |> put_resp_header("accept-ranges", "bytes")
               |> put_resp_header("content-length", "#{file_size}")
-              |> put_resp_header("cache-control", "private, max-age=60")
+              |> put_resp_header("cache-control", "private, max-age=3600, immutable")
               |> send_file(200, clip_path)
           end
         else

@@ -2,7 +2,8 @@ defmodule NaturecountsWeb.VideosLive do
   use NaturecountsWeb, :live_view
 
   alias Naturecounts.Repo
-  alias Naturecounts.Offline.{Video, Annotation, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, VlmContexts}
+  alias Naturecounts.CameraSettings
+  alias Naturecounts.Offline.{Video, Annotation, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, ThumbnailWorker, VlmContexts}
   alias Naturecounts.Storage.{GCS, GCSBuckets}
 
   import Ecto.Query
@@ -22,6 +23,8 @@ defmodule NaturecountsWeb.VideosLive do
 
     default_profile = Profiles.get("standard")
 
+    saved_ui = CameraSettings.get("videos_ui")
+
     {:ok,
      assign(socket,
        page_title: "Video Processing",
@@ -34,9 +37,11 @@ defmodule NaturecountsWeb.VideosLive do
        preview_url: nil,
        annotations: [],
        all_annotations: [],
+       annotation_thumbs: %{},
        annotation_search: "",
        annotation_suggestions: [],
        editing_annotation: nil,
+       pending_seek: nil,
        selected_files: MapSet.new(),
        selected_profile: "standard",
        profiles: Profiles.all(),
@@ -75,8 +80,11 @@ defmodule NaturecountsWeb.VideosLive do
        new_bucket_id: "",
        new_bucket_prefix: "",
        new_bucket_creds: "",
-       bucket_test_result: nil
+       bucket_test_result: nil,
+       preview_floating: saved_ui["preview_floating"] || false,
+       show_thumbs: saved_ui["show_thumbs"] || false
      )
+     |> then(fn s -> if saved_ui["preview_floating"], do: push_event(s, "set_preview_floating", %{floating: true}), else: s end)
      |> recompute_metrics()}
   end
 
@@ -115,7 +123,8 @@ defmodule NaturecountsWeb.VideosLive do
 
     # Load annotations tab data if needed
     socket = if tab == "annotations" and socket.assigns.all_annotations == [] do
-      assign(socket, all_annotations: load_all_annotations(), annotation_search: "", annotation_suggestions: [])
+      anns = load_all_annotations()
+      assign(socket, all_annotations: anns, annotation_thumbs: load_annotation_thumbs(anns, dir), annotation_search: "", annotation_suggestions: [])
     else
       socket
     end
@@ -152,6 +161,31 @@ defmodule NaturecountsWeb.VideosLive do
 
         true ->
           socket
+      end
+
+    # Restore selected file from URL
+    file_param = params["file"]
+    socket =
+      if file_param && file_param != "" && Path.basename(socket.assigns.selected_file || "") != file_param do
+        file_path = resolve_video_path(file_param, socket.assigns.current_dir)
+        relative = Path.relative_to(file_path, @videos_root)
+        preview_url = "/serve/videos/#{relative}"
+
+        socket
+        |> assign(selected_file: file_path, preview_url: preview_url, annotations: list_annotations(file_path))
+        |> push_event("preview", %{url: preview_url, filename: file_param})
+      else
+        socket
+      end
+
+    # Handle pending seek from seek_annotation
+    socket =
+      case Map.get(socket.assigns, :pending_seek) do
+        nil -> socket
+        seconds ->
+          socket
+          |> assign(pending_seek: nil)
+          |> push_event("seek", %{seconds: seconds})
       end
 
     {:noreply, socket}
@@ -225,8 +259,6 @@ defmodule NaturecountsWeb.VideosLive do
     was_scanning = socket.assigns.scanning
     scanning = scan_running?()
 
-    socket = assign(socket, jobs: list_jobs(), scanning: scanning)
-
     cond do
       # Scan just finished — final reload
       was_scanning and not scanning ->
@@ -238,16 +270,24 @@ defmodule NaturecountsWeb.VideosLive do
 
         {:noreply,
          socket
-         |> assign(entries: entries, processed_files: processed_files, scan_progress: nil)
+         |> assign(jobs: list_jobs(), scanning: false, entries: entries, processed_files: processed_files, scan_progress: nil)
          |> recompute_metrics()}
 
       # Scan running — poll Oban job counts for progress
       scanning ->
         progress = poll_scan_progress()
-        {:noreply, assign(socket, scan_progress: progress)}
+        {:noreply, assign(socket, jobs: list_jobs(), scanning: true, scan_progress: progress)}
 
+      # Idle — only refresh jobs if there are active ones visible
       true ->
-        {:noreply, socket}
+        jobs = list_jobs()
+        has_active = Enum.any?(jobs, &(&1.status in ["processing", "pending"]))
+
+        if has_active do
+          {:noreply, assign(socket, jobs: jobs, scanning: false)}
+        else
+          {:noreply, socket}
+        end
     end
   end
 
@@ -483,7 +523,7 @@ defmodule NaturecountsWeb.VideosLive do
               {:noreply,
                socket
                |> assign(selected_file: file, preview_url: url, annotations: list_annotations(file))
-                             |> push_event("preview", %{url: url, filename: Path.basename(file)})}
+               |> push_event("preview", %{url: url, filename: Path.basename(file)})}
 
             {:error, reason} ->
               {:noreply, put_flash(socket, :error, "GCS signed URL error: #{reason}")}
@@ -493,13 +533,7 @@ defmodule NaturecountsWeb.VideosLive do
         end
 
       _ ->
-        relative = Path.relative_to(file, @videos_root)
-        preview_url = "/serve/videos/#{relative}"
-
-        {:noreply,
-         socket
-         |> assign(selected_file: file, preview_url: preview_url, annotations: list_annotations(file))
-                 |> push_event("preview", %{url: preview_url, filename: Path.basename(file)})}
+        {:noreply, push_patch(socket, to: videos_url(socket, %{file: file}))}
     end
   end
 
@@ -694,8 +728,30 @@ defmodule NaturecountsWeb.VideosLive do
      |> put_flash(:info, "Fixing timestamps for videos in #{Path.basename(socket.assigns.current_dir)}...")}
   end
 
+  def handle_event("generate_thumbnails", _params, socket) do
+    %{
+      "mode" => "dispatch",
+      "directory" => socket.assigns.current_dir,
+      "count" => 8,
+      "force" => socket.assigns.scan_force
+    }
+    |> ThumbnailWorker.new(priority: 1)
+    |> Oban.insert!()
+
+    {:noreply,
+     socket
+     |> assign(scanning: true)
+     |> put_flash(:info, "Generating thumbnails for videos in #{Path.basename(socket.assigns.current_dir)}...")}
+  end
+
   def handle_event("toggle_scan_force", _params, socket) do
     {:noreply, assign(socket, scan_force: !socket.assigns.scan_force)}
+  end
+
+  def handle_event("toggle_thumbs", _params, socket) do
+    val = !socket.assigns.show_thumbs
+    CameraSettings.put("videos_ui", %{"show_thumbs" => val})
+    {:noreply, assign(socket, show_thumbs: val)}
   end
 
   def handle_event("cancel_scan", _params, socket) do
@@ -743,6 +799,16 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("toggle_vlm", _params, socket) do
     {:noreply, assign(socket, vlm_enabled: !socket.assigns.vlm_enabled)}
+  end
+
+  def handle_event("toggle_preview_floating", _params, socket) do
+    floating = !socket.assigns.preview_floating
+    CameraSettings.put("videos_ui", %{"preview_floating" => floating})
+
+    {:noreply,
+     socket
+     |> assign(preview_floating: floating)
+     |> push_event("set_preview_floating", %{floating: floating})}
   end
 
   def handle_event("select_context", %{"id" => ""}, socket), do: {:noreply, socket}
@@ -973,7 +1039,7 @@ defmodule NaturecountsWeb.VideosLive do
       |> Repo.insert!()
 
       invalidate_annotations_cache()
-      socket = assign(socket, annotations: list_annotations(file))
+      socket = assign(socket, annotations: list_annotations(file)) |> recompute_metrics()
       {:noreply, socket}
     else
       {:noreply, socket}
@@ -984,8 +1050,13 @@ defmodule NaturecountsWeb.VideosLive do
     Annotation |> Repo.get!(id) |> Repo.delete!()
 
     invalidate_annotations_cache()
-    socket = assign(socket, annotations: list_annotations(socket.assigns.selected_file))
-    socket = if socket.assigns.active_tab == "annotations", do: assign(socket, all_annotations: load_all_annotations(socket.assigns.annotation_search)), else: socket
+    socket = assign(socket, annotations: list_annotations(socket.assigns.selected_file)) |> recompute_metrics()
+    socket = if socket.assigns.active_tab == "annotations" do
+      anns = load_all_annotations(socket.assigns.annotation_search)
+      assign(socket, all_annotations: anns, annotation_thumbs: load_annotation_thumbs(anns, socket.assigns.current_dir))
+    else
+      socket
+    end
     {:noreply, socket}
   end
 
@@ -1007,8 +1078,13 @@ defmodule NaturecountsWeb.VideosLive do
     |> Repo.update!()
 
     invalidate_annotations_cache()
-    socket = assign(socket, editing_annotation: nil, annotations: list_annotations(socket.assigns.selected_file))
-    socket = if socket.assigns.active_tab == "annotations", do: assign(socket, all_annotations: load_all_annotations(socket.assigns.annotation_search)), else: socket
+    socket = assign(socket, editing_annotation: nil, annotations: list_annotations(socket.assigns.selected_file)) |> recompute_metrics()
+    socket = if socket.assigns.active_tab == "annotations" do
+      anns = load_all_annotations(socket.assigns.annotation_search)
+      assign(socket, all_annotations: anns, annotation_thumbs: load_annotation_thumbs(anns, socket.assigns.current_dir))
+    else
+      socket
+    end
     {:noreply, socket}
   end
 
@@ -1016,45 +1092,39 @@ defmodule NaturecountsWeb.VideosLive do
     seconds = params["seconds"]
     filename = params["filename"]
 
-    socket =
-      if filename && Path.basename(socket.assigns.selected_file || "") != filename do
-        path = resolve_video_path(filename, socket.assigns.current_dir)
-        relative = Path.relative_to(path, @videos_root)
-        preview_url = "/serve/videos/#{relative}"
-
-        socket
-        |> assign(selected_file: path, preview_url: preview_url, annotations: list_annotations(path))
-               |> push_event("preview", %{url: preview_url, filename: filename})
-      else
-        socket
-      end
-
-    {:noreply, push_event(socket, "seek", %{seconds: seconds})}
+    if filename && Path.basename(socket.assigns.selected_file || "") != filename do
+      path = resolve_video_path(filename, socket.assigns.current_dir)
+      # Store pending seek, select file via URL
+      {:noreply,
+       socket
+       |> assign(pending_seek: seconds)
+       |> push_patch(to: videos_url(socket, %{file: path}))}
+    else
+      {:noreply, push_event(socket, "seek", %{seconds: seconds})}
+    end
   end
 
   def handle_event("search_annotations", %{"query" => query}, socket) do
+    anns = load_all_annotations(query)
     {:noreply, assign(socket,
       annotation_search: query,
-      all_annotations: load_all_annotations(query),
+      all_annotations: anns,
+      annotation_thumbs: load_annotation_thumbs(anns, socket.assigns.current_dir),
       annotation_suggestions: if(query != "", do: annotation_suggestions(query), else: [])
     )}
   end
 
   def handle_event("select_annotation_file", %{"filename" => filename}, socket) do
     path = resolve_video_path(filename, socket.assigns.current_dir)
-    relative = Path.relative_to(path, @videos_root)
-    preview_url = "/serve/videos/#{relative}"
-
-    {:noreply,
-     socket
-     |> assign(selected_file: path, preview_url: preview_url, annotations: list_annotations(path))
-         |> push_event("preview", %{url: preview_url, filename: filename})}
+    {:noreply, push_patch(socket, to: videos_url(socket, %{file: path}))}
   end
 
   def handle_event("pick_annotation_suggestion", %{"value" => value}, socket) do
+    anns = load_all_annotations(value)
     {:noreply, assign(socket,
       annotation_search: value,
-      all_annotations: load_all_annotations(value),
+      all_annotations: anns,
+      annotation_thumbs: load_annotation_thumbs(anns, socket.assigns.current_dir),
       annotation_suggestions: []
     )}
   end
@@ -1154,7 +1224,9 @@ defmodule NaturecountsWeb.VideosLive do
         _ -> socket.assigns.metric_filters
       end
 
-    {:noreply, assign(socket, metric_filters: filters, metrics_limit: 50) |> recompute_metrics()}
+    socket = assign(socket, metric_filters: filters, metrics_limit: 50) |> recompute_metrics()
+    socket = if filters == %{}, do: push_event(socket, "reset_filters", %{}), else: socket
+    {:noreply, socket}
   end
 
   defp parse_number(""), do: nil
@@ -1211,7 +1283,8 @@ defmodule NaturecountsWeb.VideosLive do
 
     workers = [
       "Naturecounts.Offline.ScanMetricsWorker",
-      "Naturecounts.Offline.FixTimestampsWorker"
+      "Naturecounts.Offline.FixTimestampsWorker",
+      "Naturecounts.Offline.ThumbnailWorker"
     ]
 
     # Only count active + recently finished jobs (last 2 hours)
@@ -1254,7 +1327,8 @@ defmodule NaturecountsWeb.VideosLive do
       Oban.Job
       |> where([j], j.worker in [
         "Naturecounts.Offline.ScanMetricsWorker",
-        "Naturecounts.Offline.FixTimestampsWorker"
+        "Naturecounts.Offline.FixTimestampsWorker",
+        "Naturecounts.Offline.ThumbnailWorker"
       ])
       |> where([j], j.state in ["available", "executing", "scheduled"])
       |> Repo.exists?()
@@ -1263,7 +1337,9 @@ defmodule NaturecountsWeb.VideosLive do
 
 
   defp load_metrics_index(dir) do
-    Naturecounts.Offline.MetricsStore.read_dir(dir)
+    Naturecounts.Cache.get_or_compute({:metrics_index, dir}, fn ->
+      Naturecounts.Offline.MetricsStore.read_dir(dir)
+    end, ttl: 30_000, group: :file_browser)
   end
 
   defp load_processed_files do
@@ -1294,6 +1370,21 @@ defmodule NaturecountsWeb.VideosLive do
   defp list_dir_from_fs(dir) do
     metrics = load_metrics_index(dir)
 
+    # Pre-load thumb listings in one File.ls call on the .thumbs dir
+    thumbs_dir = Path.join(dir, ".thumbs")
+    thumb_index = case File.ls(thumbs_dir) do
+      {:ok, video_names} ->
+        Map.new(video_names, fn vname ->
+          vdir = Path.join(thumbs_dir, vname)
+          jpgs = case File.ls(vdir) do
+            {:ok, fs} -> fs |> Enum.filter(&String.ends_with?(&1, ".jpg")) |> Enum.sort() |> Enum.map(&Path.join(vdir, &1))
+            _ -> []
+          end
+          {vname, jpgs}
+        end)
+      _ -> %{}
+    end
+
     case File.ls(dir) do
       {:ok, names} ->
         names
@@ -1304,14 +1395,20 @@ defmodule NaturecountsWeb.VideosLive do
           path = Path.join(dir, name)
 
           cond do
-            File.dir?(path) and not String.starts_with?(name, ".") ->
+            not String.starts_with?(name, ".") and File.dir?(path) ->
               {dirs ++ [%{type: :dir, name: name, path: path}], files}
 
             video_file?(name) ->
-              stat = File.stat!(path)
-              size_mb = Float.round(stat.size / 1_048_576, 1)
+              size_mb = case File.stat(path) do
+                {:ok, stat} -> Float.round(stat.size / 1_048_576, 1)
+                _ -> 0.0
+              end
               m = Map.get(metrics, name)
-              {dirs, files ++ [%{type: :file, name: name, path: path, size_mb: size_mb, processed: nil, metrics: m}]}
+              thumbs = Map.get(thumb_index, name, [])
+
+              {dirs,
+               files ++
+                 [%{type: :file, name: name, path: path, size_mb: size_mb, processed: nil, metrics: m, thumbs: thumbs}]}
 
             true ->
               {dirs, files}
@@ -1745,15 +1842,23 @@ defmodule NaturecountsWeb.VideosLive do
   defp has_samples?(entry), do: get_samples(entry) != []
 
   # Generate SVG sparkline path for a metric within samples
-  defp sparkline_path(samples, key, width, height, max_val) do
+  defp sparkline_path(samples, key, width, height, max_val, duration \\ nil) do
     n = length(samples)
     if n < 2 or max_val == 0 do
       ""
     else
+      dur = duration || 1
+
       samples
       |> Enum.with_index()
       |> Enum.map(fn {s, i} ->
-        x = Float.round(i / max(n - 1, 1) * width, 1)
+        x =
+          if dur > 0 do
+            Float.round((s["t"] || 0) / dur * width, 1)
+          else
+            Float.round(i / max(n - 1, 1) * width, 1)
+          end
+
         val = Map.get(s, key, 0) || 0
         y = Float.round(height - val / max_val * height, 1)
         cmd = if i == 0, do: "M", else: "L"
@@ -1761,6 +1866,19 @@ defmodule NaturecountsWeb.VideosLive do
       end)
       |> Enum.join(" ")
     end
+  end
+
+  # Estimate the timestamp for a thumbnail based on its index and the video duration.
+  # Thumbnails are extracted at evenly-spaced positions across the middle 90%.
+  defp thumb_time(thumb_path, entry) do
+    index_str = thumb_path |> Path.basename(".jpg")
+    index = String.to_integer(index_str) - 1
+    duration = (entry.metrics && entry.metrics["duration_s"]) || 1
+    count = length(Map.get(entry, :thumbs, []))
+    start_t = duration * 0.05
+    span = duration * 0.9
+    t = start_t + index * span / max(count - 1, 1)
+    Float.to_string(Float.round(t, 1))
   end
 
   # Max value for a sample key across all files' samples
@@ -1779,6 +1897,9 @@ defmodule NaturecountsWeb.VideosLive do
 
   defp videos_url(socket, overrides) do
     assigns = socket.assigns
+    selected = Map.get(overrides, :file, assigns.selected_file)
+    file_param = if selected, do: Path.basename(selected), else: nil
+
     params =
       %{
         "tab" => Map.get(overrides, :tab, assigns.active_tab),
@@ -1786,7 +1907,8 @@ defmodule NaturecountsWeb.VideosLive do
         "dir" => Map.get(overrides, :dir, assigns.sort_dir),
         "source" => Map.get(overrides, :source, assigns.source),
         "view" => Map.get(overrides, :view, assigns.metrics_view),
-        "path" => Map.get(overrides, :path, if(assigns.source == "gcs", do: assigns.gcs_prefix, else: Path.relative_to(assigns.current_dir, @videos_root)))
+        "path" => Map.get(overrides, :path, if(assigns.source == "gcs", do: assigns.gcs_prefix, else: Path.relative_to(assigns.current_dir, @videos_root))),
+        "file" => file_param
       }
       |> Enum.reject(fn {k, v} -> v == nil or v == "" or (k == "tab" and v == "files") or (k == "sort" and v == "name") or (k == "dir" and v == "asc") or (k == "source" and v == "local") or (k == "view" and v == "heatmap") or (k == "path" and v in ["", "."]) end)
       |> Map.new()
@@ -1849,6 +1971,49 @@ defmodule NaturecountsWeb.VideosLive do
       end
 
     Repo.all(query)
+  end
+
+  defp load_annotation_thumbs(annotations, current_dir) do
+    filenames = annotations |> Enum.map(& &1.filename) |> Enum.uniq()
+
+    Naturecounts.Cache.get_or_compute({:annotation_thumbs, current_dir, filenames}, fn ->
+      Enum.reduce(filenames, %{}, fn filename, acc ->
+        path = resolve_video_path(filename, current_dir)
+        thumbs = ThumbnailWorker.list_thumbs(path)
+        metrics = Naturecounts.Offline.MetricsStore.read_one(path)
+        duration = (metrics && metrics["duration_s"]) || nil
+
+        if thumbs != [] and duration do
+          Map.put(acc, filename, %{thumbs: thumbs, duration: duration})
+        else
+          acc
+        end
+      end)
+    end, ttl: 60_000, group: :file_browser)
+  end
+
+  defp nearest_thumb_url(filename, timestamp, annotation_thumbs) do
+    case Map.get(annotation_thumbs, filename) do
+      %{thumbs: thumbs, duration: duration} when length(thumbs) > 0 ->
+        count = length(thumbs)
+        start_t = duration * 0.05
+        span = duration * 0.9
+
+        # Find the thumbnail closest to the given timestamp
+        {best_path, _} =
+          thumbs
+          |> Enum.with_index()
+          |> Enum.min_by(fn {_path, i} ->
+            t = start_t + i * span / max(count - 1, 1)
+            abs(t - timestamp)
+          end)
+
+        relative = Path.relative_to(best_path, "/videos")
+        "/serve/videos/#{relative}"
+
+      _ ->
+        nil
+    end
   end
 
   defp annotation_suggestions(query) do
@@ -1926,27 +2091,33 @@ defmodule NaturecountsWeb.VideosLive do
 
       <%!-- Tab bar --%>
       <div class="flex items-center gap-2">
-        <div class="tabs tabs-boxed">
-          <button class={"tab #{if @active_tab == "files", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="files">Files</button>
-          <button class={"tab #{if @active_tab == "metrics", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="metrics">Metrics</button>
-          <button class={"tab #{if @active_tab == "annotations", do: "tab-active"}"} phx-click="switch_tab" phx-value-tab="annotations">Annotations</button>
+        <div class="tabs tabs-boxed bg-base-200 p-1">
+          <button class={"tab gap-1.5 #{if @active_tab == "files", do: "tab-active !bg-primary !text-primary-content font-semibold"}"} phx-click="switch_tab" phx-value-tab="files">
+            <.icon name="hero-folder" class="size-4" /> Files
+          </button>
+          <button class={"tab gap-1.5 #{if @active_tab == "metrics", do: "tab-active !bg-primary !text-primary-content font-semibold"}"} phx-click="switch_tab" phx-value-tab="metrics">
+            <.icon name="hero-chart-bar" class="size-4" /> Metrics
+          </button>
+          <button class={"tab gap-1.5 #{if @active_tab == "annotations", do: "tab-active !bg-primary !text-primary-content font-semibold"}"} phx-click="switch_tab" phx-value-tab="annotations">
+            <.icon name="hero-tag" class="size-4" /> Annotations
+          </button>
         </div>
         <%= if @active_tab == "metrics" do %>
-          <div class="flex items-center gap-1">
-            <div class="join">
-              <button :for={v <- [{"heatmap", "Heatmap"}, {"scatter", "Scatter"}]}
-                class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+          <div class="flex items-center gap-2">
+            <div class="tabs tabs-boxed tabs-xs bg-base-200 p-0.5">
+              <button :for={v <- [{"heatmap", "Heatmap", "hero-table-cells"}, {"scatter", "Scatter", "hero-chart-bar-square"}]}
+                class={"tab gap-1 #{if @metrics_view == elem(v, 0), do: "tab-active !bg-primary !text-primary-content font-semibold"}"}
                 phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
               >
-                {elem(v, 1)}
+                <.icon name={elem(v, 2)} class="size-3.5" /> {elem(v, 1)}
               </button>
             </div>
-            <div class="join">
-              <button :for={v <- [{"timeline", "Timeline"}, {"temporal_scatter", "T-Scatter"}, {"temporal_heatmap", "T-Heatmap"}]}
-                class={"join-item btn btn-xs #{if @metrics_view == elem(v, 0), do: "btn-active"}"}
+            <div class="tabs tabs-boxed tabs-xs bg-base-200 p-0.5">
+              <button :for={v <- [{"timeline", "Timeline", "hero-clock"}, {"temporal_scatter", "T-Scatter", "hero-chart-bar-square"}, {"temporal_heatmap", "T-Heatmap", "hero-table-cells"}]}
+                class={"tab gap-1 #{if @metrics_view == elem(v, 0), do: "tab-active !bg-primary !text-primary-content font-semibold"}"}
                 phx-click="set_metrics_view" phx-value-view={elem(v, 0)}
               >
-                {elem(v, 1)}
+                <.icon name={elem(v, 2)} class="size-3.5" /> {elem(v, 1)}
               </button>
             </div>
           </div>
@@ -2006,6 +2177,9 @@ defmodule NaturecountsWeb.VideosLive do
                 <span class="text-xs text-base-content/50 ml-2">
                   {@total_visible} / {length(Enum.filter(@entries, &(&1.type == :file)))} files
                 </span>
+                <button class="btn btn-xs btn-outline btn-error gap-1 ml-1" phx-click="quick_filter" phx-value-preset="clear">
+                  <.icon name="hero-x-mark" class="size-3" /> Reset filters
+                </button>
               <% end %>
             </div>
 
@@ -2197,6 +2371,11 @@ defmodule NaturecountsWeb.VideosLive do
                   <button class={"flex items-center gap-1 hover:text-base-content cursor-pointer #{if @sort_by == "name", do: "font-bold"}"} phx-click="sort_files" phx-value-col="name">
                     Name {sort_indicator(@sort_by, @sort_dir, "name")}
                   </button>
+                  <span class="mx-1 text-base-content/20">|</span>
+                  <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="checkbox" class="checkbox checkbox-xs" checked={@show_thumbs} phx-click="toggle_thumbs" />
+                    <span>Thumbs</span>
+                  </label>
                 </div>
                 <div class="space-y-1">
                   <%= for entry <- @metrics_page, entry.type == :file do %>
@@ -2230,21 +2409,29 @@ defmodule NaturecountsWeb.VideosLive do
                           <% end %>
                         </div>
                       </div>
-                      <div class="flex-1 min-w-[200px]">
+                      <div
+                        class="flex-1 min-w-[200px]"
+                        id={"tl-row-#{entry.name}"}
+                        phx-hook="TimelinePlayhead"
+                        data-duration={if entry.metrics, do: entry.metrics["duration_s"]}
+                        data-active={if @selected_file == entry.path, do: "true"}
+                      >
                         <%= if has_samples?(entry) do %>
                           <% samples = get_samples(entry) %>
                           <% n = length(samples) %>
+                          <% file_duration = (entry.metrics && entry.metrics["duration_s"]) || 1 %>
                           <% file_anns = Map.get(@annotations_by_file, entry.name, []) %>
                           <% has_anns = file_anns != [] %>
                           <% svg_h = if has_anns, do: 36, else: 30 %>
                           <svg viewBox={"0 0 200 #{svg_h}"} class={"w-full #{if has_anns, do: "h-9", else: "h-8"}"} preserveAspectRatio="none">
                             <rect x="0" y="0" width="200" height="30" fill="currentColor" opacity="0.03" rx="2" />
-                            <%!-- Detection bars (clickable) --%>
-                            <%= for {s, i} <- Enum.with_index(samples) do %>
-                              <% bar_w = max(200 / max(n, 1) - 1, 2) %>
+                            <%!-- Detection bars (clickable, time-based x) --%>
+                            <% bar_w = max(200 / max(n, 1) - 1, 2) %>
+                            <%= for {s, _i} <- Enum.with_index(samples) do %>
+                              <% bar_x = (s["t"] || 0) / file_duration * 200 %>
                               <% bar_h = if det_max > 0, do: (s["det"] || 0) / det_max * 28, else: 0 %>
                               <rect
-                                x={Float.round(i / max(n, 1) * 200, 1)}
+                                x={Float.round(bar_x, 1)}
                                 y="0" width={Float.round(bar_w, 1)} height="30"
                                 fill="transparent" class="cursor-pointer"
                                 phx-click="seek_sample"
@@ -2254,7 +2441,7 @@ defmodule NaturecountsWeb.VideosLive do
                                 <title>t={s["t"]}s det={s["det"]} — click to play</title>
                               </rect>
                               <rect
-                                x={Float.round(i / max(n, 1) * 200, 1)}
+                                x={Float.round(bar_x, 1)}
                                 y={Float.round(30 - bar_h, 1)}
                                 width={Float.round(bar_w, 1)}
                                 height={Float.round(max(bar_h, 0), 1)}
@@ -2263,9 +2450,9 @@ defmodule NaturecountsWeb.VideosLive do
                               />
                             <% end %>
                             <%!-- Brightness line --%>
-                            <path d={sparkline_path(samples, "bright", 200, 30, bright_max)} fill="none" stroke="hsl(45, 80%, 55%)" stroke-width="1.5" opacity="0.7" class="pointer-events-none" />
+                            <path d={sparkline_path(samples, "bright", 200, 30, bright_max, file_duration)} fill="none" stroke="hsl(45, 80%, 55%)" stroke-width="1.5" opacity="0.7" class="pointer-events-none" />
                             <%!-- Motion line --%>
-                            <path d={sparkline_path(samples, "motion", 200, 30, motion_max)} fill="none" stroke="hsl(280, 70%, 55%)" stroke-width="1" opacity="0.6" stroke-dasharray="3,2" class="pointer-events-none" />
+                            <path d={sparkline_path(samples, "motion", 200, 30, motion_max, file_duration)} fill="none" stroke="hsl(280, 70%, 55%)" stroke-width="1" opacity="0.6" stroke-dasharray="3,2" class="pointer-events-none" />
                             <%!-- Annotation strip below graph --%>
                             <%= if has_anns do %>
                               <% file_duration = entry.metrics["duration_s"] || 1 %>
@@ -2296,6 +2483,21 @@ defmodule NaturecountsWeb.VideosLive do
                         <% else %>
                           <div class="h-8 flex items-center justify-center">
                             <span class="text-[10px] text-base-content/20 italic">No temporal data</span>
+                          </div>
+                        <% end %>
+                        <%= if @show_thumbs and Map.get(entry, :thumbs, []) != [] do %>
+                          <div class="flex gap-px mt-0.5 overflow-hidden rounded" style="height:24px">
+                            <%= for thumb_path <- Map.get(entry, :thumbs, []) do %>
+                              <% relative = Path.relative_to(thumb_path, "/videos") %>
+                              <img
+                                src={"/serve/videos/#{relative}"}
+                                class="h-full flex-1 object-cover min-w-0 cursor-pointer opacity-70 hover:opacity-100 transition-opacity"
+                                loading="lazy"
+                                phx-click="seek_sample"
+                                phx-value-file={entry.path}
+                                phx-value-time={thumb_time(thumb_path, entry)}
+                              />
+                            <% end %>
                           </div>
                         <% end %>
                       </div>
@@ -2498,6 +2700,7 @@ defmodule NaturecountsWeb.VideosLive do
                       <input type="checkbox" class="checkbox checkbox-xs" checked={@scan_force} phx-click="toggle_scan_force" />
                     </label>
                     <button class="btn btn-ghost btn-xs" phx-click="scan_metrics">Scan</button>
+                    <button class="btn btn-ghost btn-xs" phx-click="generate_thumbnails" title="Extract thumbnail frames from each video">Thumbs</button>
                     <button class="btn btn-ghost btn-xs" phx-click="fix_timestamps" title="Remux MP4s to fix non-zero start_time (enables browser seeking)">Fix seek</button>
                     <button class="btn btn-ghost btn-xs" phx-click="select_black_videos" title="Select videos with 0 detections">Select empty</button>
                   <% end %>
@@ -2821,7 +3024,21 @@ defmodule NaturecountsWeb.VideosLive do
                             <button type="button" class="btn btn-xs btn-ghost" phx-click="cancel_edit_annotation">Cancel</button>
                           </form>
                         <% else %>
+                          <% thumb_url = nearest_thumb_url(filename, ann.timestamp_seconds, @annotation_thumbs) %>
                           <div class="flex items-center gap-2 text-sm">
+                            <button
+                              class="shrink-0 cursor-pointer overflow-hidden rounded ann-thumb-trigger"
+                              phx-click="select_annotation_file" phx-value-filename={filename}
+                              onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}
+                            >
+                              <%= if thumb_url do %>
+                                <img src={thumb_url} class="w-12 h-8 object-cover" loading="lazy" data-full-thumb={thumb_url} />
+                              <% else %>
+                                <div class="w-12 h-8 bg-base-300 flex items-center justify-center">
+                                  <.icon name="hero-film" class="size-3 text-base-content/30" />
+                                </div>
+                              <% end %>
+                            </button>
                             <button class="font-mono text-xs text-base-content/60 w-20 shrink-0 text-left hover:text-primary cursor-pointer" phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}>
                               {format_timestamp(ann.timestamp_seconds)}<%= if ann.end_seconds do %>–{format_timestamp(ann.end_seconds)}<% end %>
                             </button>
@@ -2841,8 +3058,21 @@ defmodule NaturecountsWeb.VideosLive do
       <% end %>
 
       <%!-- Preview --%>
-      <div class="card bg-base-200">
+      <div id="floating-preview-container" phx-hook="FloatingPreview" class="card bg-base-200 relative">
         <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="text-sm font-semibold">Preview</h3>
+            <button
+              class={"btn btn-xs btn-ghost gap-1 #{if @preview_floating, do: "btn-active"}"}
+              phx-click="toggle_preview_floating"
+              title={if @preview_floating, do: "Dock preview", else: "Float preview"}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zm0 6a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6z" />
+              </svg>
+              <%= if @preview_floating, do: "Dock", else: "Float" %>
+            </button>
+          </div>
           <div
             id="video-preview-hook"
             phx-hook="VideoPreview"

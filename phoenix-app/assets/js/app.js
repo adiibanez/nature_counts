@@ -30,6 +30,8 @@ import FishList from "./hooks/fish_list"
 import PrintMode from "./hooks/print_mode"
 import CropZoom from "./hooks/crop_zoom"
 import RangeSlider from "./hooks/range_slider"
+import FloatingPreview from "./hooks/floating_preview"
+import TimelinePlayhead from "./hooks/timeline_playhead"
 import { createPlayerHook } from "membrane_webrtc_plugin"
 
 const iceServers = [{ urls: "stun:stun.l.google.com:19302" }]
@@ -56,11 +58,37 @@ window._fmtTime = (s) => {
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 };
 
+// Thumbnail hover preview (fixed position to escape overflow:hidden containers)
+;(() => {
+  let tip = null
+  let current = null
+  document.addEventListener("mouseover", (e) => {
+    const img = e.target.closest("[data-full-thumb]")
+    if (!img || img === current) return
+    current = img
+    if (tip) { tip.remove(); tip = null }
+    const src = img.dataset.fullThumb
+    const rect = img.getBoundingClientRect()
+    tip = document.createElement("img")
+    tip.src = src
+    tip.style.cssText = `position:fixed;z-index:9999;pointer-events:none;width:320px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.35);left:${rect.left}px;top:${rect.top - 4}px;transform:translateY(-100%);`
+    document.body.appendChild(tip)
+  })
+  document.addEventListener("mouseout", (e) => {
+    const img = e.target.closest("[data-full-thumb]")
+    if (!img) return
+    const related = e.relatedTarget
+    if (related && img.contains(related)) return
+    current = null
+    if (tip) { tip.remove(); tip = null }
+  })
+})();
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, RangeSlider, Player, InfiniteScroll},
+  hooks: {...colocatedHooks, VideoOverlay, VideoPreview, FishList, PrintMode, CropZoom, RangeSlider, FloatingPreview, TimelinePlayhead, Player, InfiniteScroll},
 })
 
 // Show progress bar on live navigation and form submits
