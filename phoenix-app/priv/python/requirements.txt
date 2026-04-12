@@ -1,4 +1,5 @@
 ultralytics>=8.3
+rfdetr
 opencv-python-headless>=4.9
 numpy>=1.26
 supervision>=0.25

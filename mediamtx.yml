@@ -23,7 +23,7 @@ paths:
   raw-cam1:
     runOnInit: >
       ffmpeg -re -stream_loop -1
-      -i /videos/fulhadoo/2023-01-23_02-20-02_cam3.mp4
+      -i /videos/rtsp-ready/P5_2025-03-07_420.mp4
       -an -c:v copy
       -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnInitRestart: yes
@@ -31,7 +31,7 @@ paths:
   raw-cam2:
     runOnInit: >
       ffmpeg -re -stream_loop -1
-      -i /videos/fulhadoo/2023-01-28_02-00-01_cam3.mp4
+      -i /videos/rtsp-ready/cam_1.mp4
       -an -c:v copy
       -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnInitRestart: yes
@@ -39,7 +39,7 @@ paths:
   raw-cam3:
     runOnInit: >
       ffmpeg -re -stream_loop -1
-      -i /videos/fulhadoo/2023-02-08_01-20-01_cam3.mp4
+      -i /videos/rtsp-ready/cam_2.mp4
       -an -c:v copy
       -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnInitRestart: yes

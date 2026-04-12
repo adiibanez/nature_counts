@@ -13,8 +13,8 @@ defmodule Naturecounts.Offline.PythonBridge do
   import base64
   import json
   import os
+  import sys
   from collections import defaultdict
-  from ultralytics import YOLO
 
   # Pythonx passes Elixir strings as bytes — decode to str
   if isinstance(model_path, bytes):
@@ -23,6 +23,14 @@ defmodule Naturecounts.Offline.PythonBridge do
       video_path = video_path.decode("utf-8")
   if isinstance(progress_file, bytes):
       progress_file = progress_file.decode("utf-8")
+  if isinstance(priv_python_dir, bytes):
+      priv_python_dir = priv_python_dir.decode("utf-8")
+
+  # Add priv/python to sys.path so we can import detectors module
+  if priv_python_dir not in sys.path:
+      sys.path.insert(0, priv_python_dir)
+
+  from detectors import create_detector
 
   def sharpness(frame, bbox):
       # Laplacian variance of the cropped region - higher = sharper
@@ -61,8 +69,7 @@ defmodule Naturecounts.Offline.PythonBridge do
   # Load model
   write_progress(0, 0, 0, 0, 0)
   device = "cuda:0" if cuda_available else "cpu"
-  model = YOLO(model_path, task="detect")
-  model.to(device)
+  model = create_detector(model_path, device)
 
   # Open video
   cap = cv2.VideoCapture(video_path)
@@ -97,14 +104,10 @@ defmodule Naturecounts.Offline.PythonBridge do
           break
 
       if frame_idx % step == 0:
-          # Run YOLO detection
-          results = model(frame, imgsz=imgsz, conf=conf_threshold, verbose=False)
+          # Run detection
+          xyxy, confs, class_ids = model.predict(frame, imgsz=imgsz, conf=conf_threshold)
 
-          if len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
-              boxes = results[0].boxes
-              xyxy = boxes.xyxy.cpu().numpy()
-              confs = boxes.conf.cpu().numpy()
-              class_ids = boxes.cls.cpu().numpy().astype(int)
+          if len(xyxy) > 0:
               total_detections += len(xyxy)
 
               detections = sv.Detections(
@@ -173,7 +176,7 @@ defmodule Naturecounts.Offline.PythonBridge do
   that receives `%{pct: int, frame: int, total_frames: int, tracks: int, detections: int}`.
   """
   def run(video_path, profile, opts \\ []) do
-    model_path = default_model_path()
+    model_path = model_path_for(profile)
 
     unless File.exists?(video_path) do
       {:error, "Video file not found: #{video_path}"}
@@ -191,6 +194,7 @@ defmodule Naturecounts.Offline.PythonBridge do
     globals = %{
       "video_path" => video_path,
       "model_path" => model_path,
+      "priv_python_dir" => priv_python_dir(),
       "fps" => profile.fps,
       "imgsz" => profile.imgsz,
       "conf_threshold" => profile.detection_threshold,
@@ -252,8 +256,22 @@ defmodule Naturecounts.Offline.PythonBridge do
     poll_progress(progress_file, callback)
   end
 
-  defp default_model_path do
-    System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.onnx")
+  defp model_path_for(profile) do
+    case Map.get(profile, :detector_model, :default) do
+      :rfdetr_nano ->
+        System.get_env("RFDETR_MODEL_PATH", "/models/community-fish-detector-2026.02.02-rf-detr-nano-640.pth")
+
+      :yolov12x ->
+        System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.pt")
+
+      _ ->
+        System.get_env("DETECTOR_MODEL_PATH",
+          System.get_env("YOLO_MODEL_PATH", "/models/cfd-yolov12x-1.00.pt"))
+    end
+  end
+
+  defp priv_python_dir do
+    Application.app_dir(:naturecounts, "priv/python")
   end
 
   # ---------------------------------------------------------------------------

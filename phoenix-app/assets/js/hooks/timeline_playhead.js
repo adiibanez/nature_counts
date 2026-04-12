@@ -6,9 +6,16 @@ const TimelinePlayhead = {
     this._line = null;
     this._handle = null;
     this._tip = null;
+    this._metricsTip = null;
 
     this._onMove = this._onMove.bind(this);
     this._onUp = this._onUp.bind(this);
+    this._onBarEnter = this._onBarEnter.bind(this);
+    this._onBarLeave = this._onBarLeave.bind(this);
+    this._onBarMove = this._onBarMove.bind(this);
+
+    this._buildMetricsTip();
+    this._bindSampleBars();
 
     if (this.el.dataset.active === "true") this._activate();
   },
@@ -22,12 +29,17 @@ const TimelinePlayhead = {
     } else {
       this._deactivate();
     }
+
+    this._bindSampleBars();
   },
 
   destroyed() {
     this._stopRaf();
     document.removeEventListener("mousemove", this._onMove);
     document.removeEventListener("mouseup", this._onUp);
+    if (this._metricsTip && this._metricsTip.parentNode) {
+      this._metricsTip.parentNode.removeChild(this._metricsTip);
+    }
   },
 
   _activate() {
@@ -165,6 +177,76 @@ const TimelinePlayhead = {
       cancelAnimationFrame(this._raf);
       this._raf = null;
     }
+  },
+
+  _buildMetricsTip() {
+    const tip = document.createElement("div");
+    tip.className = "tl-metrics-tip";
+    tip.style.cssText =
+      "position:fixed;z-index:100;pointer-events:none;opacity:0;" +
+      "transition:opacity 0.12s;font-size:11px;font-family:monospace;" +
+      "background:rgba(0,0,0,0.88);color:#e0e0e0;padding:6px 10px;" +
+      "border-radius:6px;border:1px solid rgba(255,255,255,0.12);" +
+      "backdrop-filter:blur(6px);line-height:1.5;white-space:nowrap;" +
+      "box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+    document.body.appendChild(tip);
+    this._metricsTip = tip;
+  },
+
+  _bindSampleBars() {
+    const bars = this.el.querySelectorAll(".tl-sample-bar");
+    bars.forEach((bar) => {
+      if (bar._tlBound) return;
+      bar._tlBound = true;
+      bar.addEventListener("mouseenter", this._onBarEnter);
+      bar.addEventListener("mouseleave", this._onBarLeave);
+      bar.addEventListener("mousemove", this._onBarMove);
+    });
+  },
+
+  _onBarEnter(e) {
+    const bar = e.currentTarget;
+    const d = bar.dataset;
+    const time = parseFloat(d.time) || 0;
+    const det = d.det ?? "—";
+    const bright = d.bright ?? "—";
+    const motion = d.motion ?? "—";
+    const contrast = d.contrast ?? "—";
+
+    const fmtTime = window._fmtTime ? window._fmtTime(time) : time.toFixed(1) + "s";
+
+    this._metricsTip.innerHTML =
+      `<div style="font-weight:600;color:white;margin-bottom:2px;font-size:12px">⏱ ${fmtTime}</div>` +
+      `<div style="display:grid;grid-template-columns:auto auto;gap:0 8px">` +
+      `<span style="color:hsl(142,70%,55%)">● det</span><span style="text-align:right">${det}</span>` +
+      `<span style="color:hsl(45,80%,60%)">● bright</span><span style="text-align:right">${bright}</span>` +
+      `<span style="color:hsl(280,70%,60%)">● motion</span><span style="text-align:right">${parseFloat(motion) ? parseFloat(motion).toFixed(2) : motion}</span>` +
+      `<span style="color:hsl(200,70%,60%)">● contrast</span><span style="text-align:right">${parseFloat(contrast) ? parseFloat(contrast).toFixed(2) : contrast}</span>` +
+      `</div>` +
+      `<div style="margin-top:3px;font-size:9px;color:rgba(255,255,255,0.4)">click to play</div>`;
+    this._metricsTip.style.opacity = "1";
+    this._positionTip(e);
+  },
+
+  _onBarLeave() {
+    this._metricsTip.style.opacity = "0";
+  },
+
+  _onBarMove(e) {
+    this._positionTip(e);
+  },
+
+  _positionTip(e) {
+    const tip = this._metricsTip;
+    const pad = 12;
+    let x = e.clientX + pad;
+    let y = e.clientY - tip.offsetHeight - pad;
+
+    if (x + tip.offsetWidth > window.innerWidth) x = e.clientX - tip.offsetWidth - pad;
+    if (y < 0) y = e.clientY + pad;
+
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
   },
 };
 

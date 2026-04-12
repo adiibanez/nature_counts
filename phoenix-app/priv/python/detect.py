@@ -27,10 +27,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 # supervision provides ByteTrack
 import supervision as sv
+
+from detectors import create_detector
 
 
 def extract_frames(video_path: str, fps: float):
@@ -87,7 +88,7 @@ def main():
 
     # Load model
     model_path = args.model or "yolov8n.pt"  # fallback; real path passed from Elixir
-    model = YOLO(model_path)
+    detector = create_detector(model_path)
 
     # ByteTrack tracker
     tracker = sv.ByteTrack(
@@ -112,14 +113,9 @@ def main():
 
     for frame_idx, frame, total_frames in extract_frames(args.video, fps):
         # Run detection
-        results = model(frame, imgsz=imgsz, conf=conf_threshold, verbose=False)
+        xyxy, confs, class_ids = detector.predict(frame, imgsz=imgsz, conf=conf_threshold)
 
-        if len(results) > 0 and results[0].boxes is not None:
-            boxes = results[0].boxes
-            xyxy = boxes.xyxy.cpu().numpy()
-            confs = boxes.conf.cpu().numpy()
-            class_ids = boxes.cls.cpu().numpy().astype(int)
-
+        if len(xyxy) > 0:
             # Create supervision Detections
             detections = sv.Detections(
                 xyxy=xyxy,

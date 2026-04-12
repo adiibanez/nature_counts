@@ -21,6 +21,7 @@ static std::atomic<bool> g_config_changed{false};
 static std::string g_config_dir;
 static std::mutex g_config_mtx;
 static std::string g_new_tracker_config;
+static std::string g_new_infer_config;
 
 static void signal_handler(int) {
     g_running = false;
@@ -117,6 +118,19 @@ static void phoenix_thread_fn(const Config& cfg) {
                 if (g_main_loop) g_main_loop_quit(g_main_loop);
                 LOG("Tracker config updated — restarting pipeline");
             }
+        } else if (event == "set_infer_config") {
+            std::string config_path = payload.value("config_path", "");
+            if (!config_path.empty()) {
+                // If relative path, resolve from config dir
+                if (config_path[0] != '/') {
+                    config_path = g_config_dir + "/" + config_path;
+                }
+                std::lock_guard<std::mutex> lk(g_config_mtx);
+                g_new_infer_config = config_path;
+                g_config_changed.store(true);
+                if (g_main_loop) g_main_loop_quit(g_main_loop);
+                LOG("Inference config changed to %s — restarting pipeline", config_path.c_str());
+            }
         }
     });
 
@@ -166,12 +180,17 @@ int main(int argc, char* argv[]) {
 
     // GStreamer pipeline loop
     while (g_running) {
-        // Apply pending tracker config change
+        // Apply pending config changes
         if (g_config_changed.load()) {
             std::lock_guard<std::mutex> lk(g_config_mtx);
             if (!g_new_tracker_config.empty()) {
                 cfg.tracker_config = g_new_tracker_config;
                 LOG("Using new tracker config: %s", cfg.tracker_config.c_str());
+            }
+            if (!g_new_infer_config.empty()) {
+                cfg.infer_config = g_new_infer_config;
+                g_new_infer_config.clear();
+                LOG("Using new inference config: %s", cfg.infer_config.c_str());
             }
             g_config_changed.store(false);
         }
@@ -196,7 +215,7 @@ int main(int argc, char* argv[]) {
         LOG("Pipeline stopped");
 
         if (g_config_changed.load()) {
-            LOG("Restarting pipeline with new tracker config...");
+            LOG("Restarting pipeline with new config...");
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }

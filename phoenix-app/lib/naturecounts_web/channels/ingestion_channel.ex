@@ -47,6 +47,19 @@ defmodule NaturecountsWeb.IngestionChannel do
       min_sharpness: saved["min_sharpness"] || 0.0
     })
 
+    # Restore detector model config
+    if saved["detector_model"] do
+      detector_models = %{
+        "rfdetr_nano" => "config_infer_primary_cfd_rfdetr_nano.txt",
+        "yolov12x" => "config_infer_primary_cfd_yolov12_ds64.txt"
+      }
+
+      if config_file = Map.get(detector_models, saved["detector_model"]) do
+        Logger.info("[IngestionChannel] Restoring detector model: #{saved["detector_model"]}")
+        push(socket, "set_infer_config", %{config_path: config_file})
+      end
+    end
+
     # Restore thumbnail setting
     push(socket, "set_thumbnails", %{enabled: saved["show_fish_list"] || false})
 
@@ -68,6 +81,12 @@ defmodule NaturecountsWeb.IngestionChannel do
   @impl true
   def handle_info({:set_crop_filters, filters}, socket) do
     push(socket, "set_crop_filters", filters)
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_info({:set_infer_config, config_map}, socket) do
+    push(socket, "set_infer_config", config_map)
     {:noreply, socket}
   end
 

@@ -12,7 +12,7 @@ struct Config {
 
     // Inference
     std::string infer_config;
-    int infer_interval = 3;
+    int infer_interval = 1;
 
     // Tracker
     int tracker_width = 640;

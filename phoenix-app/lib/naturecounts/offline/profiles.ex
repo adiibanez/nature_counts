@@ -14,7 +14,8 @@ defmodule Naturecounts.Offline.Profiles do
       vlm_concurrency: 3,
       fishial_enabled: true,
       fishial_confidence_threshold: 0.5,
-      vlm_enabled: true
+      vlm_enabled: true,
+      detector_model: :rfdetr_nano
     },
     "standard" => %{
       label: "Standard",
@@ -28,7 +29,8 @@ defmodule Naturecounts.Offline.Profiles do
       vlm_concurrency: 5,
       fishial_enabled: true,
       fishial_confidence_threshold: 0.5,
-      vlm_enabled: true
+      vlm_enabled: true,
+      detector_model: :default
     },
     "deep" => %{
       label: "Deep",
@@ -42,7 +44,8 @@ defmodule Naturecounts.Offline.Profiles do
       vlm_concurrency: 5,
       fishial_enabled: true,
       fishial_confidence_threshold: 0.4,
-      vlm_enabled: true
+      vlm_enabled: true,
+      detector_model: :yolov12x
     }
   }
 

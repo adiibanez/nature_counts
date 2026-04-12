@@ -10,6 +10,17 @@ defmodule NaturecountsWeb.CameraLive do
   @retry_interval 5_000
   @max_retries 12
 
+  @detector_models %{
+    "rfdetr_nano" => %{
+      label: "RF-DETR Nano (fast)",
+      config_file: "config_infer_primary_cfd_rfdetr_nano.txt"
+    },
+    "yolov12x" => %{
+      label: "YOLOv12x (accurate)",
+      config_file: "config_infer_primary_cfd_yolov12_ds64.txt"
+    }
+  }
+
   @tracker_presets %{
     "iou" => %{label: "IOU (fastest)", has_visual: false, defaults: %{
       "minDetectorConfidence" => 0.0, "probationAge" => 4,
@@ -87,7 +98,9 @@ defmodule NaturecountsWeb.CameraLive do
         tracker_presets: @tracker_presets,
         pipeline_restarting: false,
         min_crop_area: saved["min_crop_area"],
-        min_sharpness: saved["min_sharpness"]
+        min_sharpness: saved["min_sharpness"],
+        detector_model: saved["detector_model"] || "rfdetr_nano",
+        detector_models: @detector_models
       )
 
     socket =
@@ -257,6 +270,24 @@ defmodule NaturecountsWeb.CameraLive do
     save_setting(socket, %{"min_sharpness" => val})
     broadcast_crop_filters(socket.assigns.min_crop_area, val)
     {:noreply, assign(socket, min_sharpness: val)}
+  end
+
+  def handle_event("set_detector_model", %{"model" => model_key}, socket) do
+    case Map.get(@detector_models, model_key) do
+      nil ->
+        {:noreply, socket}
+
+      model_info ->
+        save_setting(socket, %{"detector_model" => model_key})
+
+        Phoenix.PubSub.broadcast(
+          Naturecounts.PubSub,
+          "pipeline:control",
+          {:set_infer_config, %{config_path: model_info.config_file}}
+        )
+
+        {:noreply, assign(socket, detector_model: model_key, pipeline_restarting: true)}
+    end
   end
 
   def handle_event("apply_tracker_config", _params, socket) do
@@ -460,6 +491,28 @@ defmodule NaturecountsWeb.CameraLive do
                       0 = off, ~100 = moderate, ~300 = sharp only
                     </span>
                   </label>
+                </form>
+              </div>
+
+              <%!-- Detector model --%>
+              <div class="divider my-0 text-xs">Detector
+                <span class="badge badge-xs badge-neutral">{@detector_models[@detector_model].label}</span>
+              </div>
+              <div class="flex flex-wrap items-end gap-4">
+                <form class="form-control" phx-change="set_detector_model">
+                  <label class="label py-0"><span class="label-text text-xs">Model</span></label>
+                  <select
+                    class="select select-bordered select-xs w-56"
+                    name="model"
+                  >
+                    <option
+                      :for={{key, info} <- @detector_models}
+                      value={key}
+                      selected={key == @detector_model}
+                    >
+                      {info.label}
+                    </option>
+                  </select>
                 </form>
               </div>
 

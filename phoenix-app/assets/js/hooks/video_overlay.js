@@ -278,7 +278,11 @@ const VideoOverlay = {
         video.srcObject = event.streams[0];
         video.play().catch(() => {});
 
-        video.addEventListener("playing", () => this._hideSpinner(), { once: true });
+        if (video.requestVideoFrameCallback) {
+          video.requestVideoFrameCallback(() => this._hideSpinner());
+        } else {
+          video.addEventListener("playing", () => this._hideSpinner(), { once: true });
+        }
       };
 
       pc.oniceconnectionstatechange = () => {

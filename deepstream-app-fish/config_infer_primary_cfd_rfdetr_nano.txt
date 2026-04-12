@@ -1,0 +1,30 @@
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+# RGB: RF-DETR expects RGB input (ImageNet normalization baked into ONNX)
+model-color-format=1
+# RF-DETR Nano model (community-fish-detector)
+onnx-file=cfd-rfdetr-nano-640.onnx
+model-engine-file=cfd-rfdetr-nano-640.onnx_b3_gpu0_fp16.engine
+labelfile-path=cfd_labels.txt
+batch-size=3
+# FP16 for performance
+network-mode=2
+num-detected-classes=1
+interval=1
+gie-unique-id=1
+process-mode=1
+# Detector
+network-type=0
+# No NMS for DETR — uses set prediction with learned object queries
+cluster-mode=4
+maintain-aspect-ratio=1
+symmetric-padding=1
+infer-dims=3;640;640
+# Custom RF-DETR parser
+parse-bbox-func-name=NvDsInferParseRFDETR
+custom-lib-path=libnvdsinfer_custom_impl_rfdetr.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.3
+topk=300

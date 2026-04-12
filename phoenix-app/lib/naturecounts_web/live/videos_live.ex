@@ -1287,36 +1287,40 @@ defmodule NaturecountsWeb.VideosLive do
       "Naturecounts.Offline.ThumbnailWorker"
     ]
 
-    # Only count active + recently finished jobs (last 2 hours)
-    cutoff = DateTime.add(DateTime.utc_now(), -2, :hour)
+    try do
+      # Only count active + recently finished jobs (last 2 hours)
+      cutoff = DateTime.add(DateTime.utc_now(), -2, :hour)
 
-    counts =
-      Oban.Job
-      |> where([j], j.worker in ^workers)
-      |> where([j], j.state in ["available", "executing", "completed", "discarded", "retryable"])
-      |> where([j], j.inserted_at >= ^cutoff)
-      |> group_by([j], j.state)
-      |> select([j], {j.state, count(j.id)})
-      |> Repo.all()
-      |> Map.new()
+      counts =
+        Oban.Job
+        |> where([j], j.worker in ^workers)
+        |> where([j], j.state in ["available", "executing", "completed", "discarded", "retryable"])
+        |> where([j], j.inserted_at >= ^cutoff)
+        |> group_by([j], j.state)
+        |> select([j], {j.state, count(j.id)})
+        |> Repo.all()
+        |> Map.new()
 
-    executing = Map.get(counts, "executing", 0)
-    available = Map.get(counts, "available", 0)
-    completed = Map.get(counts, "completed", 0)
-    failed = Map.get(counts, "discarded", 0) + Map.get(counts, "retryable", 0)
+      executing = Map.get(counts, "executing", 0)
+      available = Map.get(counts, "available", 0)
+      completed = Map.get(counts, "completed", 0)
+      failed = Map.get(counts, "discarded", 0) + Map.get(counts, "retryable", 0)
 
-    total = executing + available + completed + failed
+      total = executing + available + completed + failed
 
-    if total > 0 do
-      %{
-        "done" => completed,
-        "total" => total,
-        "executing" => executing,
-        "pending" => available,
-        "failed" => failed
-      }
-    else
-      nil
+      if total > 0 do
+        %{
+          "done" => completed,
+          "total" => total,
+          "executing" => executing,
+          "pending" => available,
+          "failed" => failed
+        }
+      else
+        nil
+      end
+    rescue
+      _ -> nil
     end
   end
 
@@ -1324,14 +1328,18 @@ defmodule NaturecountsWeb.VideosLive do
     import Ecto.Query
 
     Naturecounts.Cache.get_or_compute(:scan_running, fn ->
-      Oban.Job
-      |> where([j], j.worker in [
-        "Naturecounts.Offline.ScanMetricsWorker",
-        "Naturecounts.Offline.FixTimestampsWorker",
-        "Naturecounts.Offline.ThumbnailWorker"
-      ])
-      |> where([j], j.state in ["available", "executing", "scheduled"])
-      |> Repo.exists?()
+      try do
+        Oban.Job
+        |> where([j], j.worker in [
+          "Naturecounts.Offline.ScanMetricsWorker",
+          "Naturecounts.Offline.FixTimestampsWorker",
+          "Naturecounts.Offline.ThumbnailWorker"
+        ])
+        |> where([j], j.state in ["available", "executing", "scheduled"])
+        |> Repo.exists?()
+      rescue
+        _ -> false
+      end
     end, ttl: 2_000, group: :videos)
   end
 
@@ -1992,9 +2000,10 @@ defmodule NaturecountsWeb.VideosLive do
     end, ttl: 60_000, group: :file_browser)
   end
 
+  defp nearest_thumb_url(_filename, nil, _annotation_thumbs), do: nil
   defp nearest_thumb_url(filename, timestamp, annotation_thumbs) do
     case Map.get(annotation_thumbs, filename) do
-      %{thumbs: thumbs, duration: duration} when length(thumbs) > 0 ->
+      %{thumbs: [_ | _] = thumbs, duration: duration} ->
         count = length(thumbs)
         start_t = duration * 0.05
         span = duration * 0.9
@@ -2005,7 +2014,7 @@ defmodule NaturecountsWeb.VideosLive do
           |> Enum.with_index()
           |> Enum.min_by(fn {_path, i} ->
             t = start_t + i * span / max(count - 1, 1)
-            abs(t - timestamp)
+            abs(t - (timestamp || 0))
           end)
 
         relative = Path.relative_to(best_path, "/videos")
@@ -2433,13 +2442,16 @@ defmodule NaturecountsWeb.VideosLive do
                               <rect
                                 x={Float.round(bar_x, 1)}
                                 y="0" width={Float.round(bar_w, 1)} height="30"
-                                fill="transparent" class="cursor-pointer"
+                                fill="transparent" class="cursor-pointer tl-sample-bar"
                                 phx-click="seek_sample"
                                 phx-value-file={entry.path}
                                 phx-value-time={"#{s["t"] / 1}"}
-                              >
-                                <title>t={s["t"]}s det={s["det"]} — click to play</title>
-                              </rect>
+                                data-time={s["t"]}
+                                data-det={s["det"]}
+                                data-bright={s["bright"]}
+                                data-motion={s["motion"]}
+                                data-contrast={s["contrast"]}
+                              />
                               <rect
                                 x={Float.round(bar_x, 1)}
                                 y={Float.round(30 - bar_h, 1)}
@@ -2491,11 +2503,9 @@ defmodule NaturecountsWeb.VideosLive do
                               <% relative = Path.relative_to(thumb_path, "/videos") %>
                               <img
                                 src={"/serve/videos/#{relative}"}
+                                data-full-thumb={"/serve/videos/#{relative}"}
                                 class="h-full flex-1 object-cover min-w-0 cursor-pointer opacity-70 hover:opacity-100 transition-opacity"
                                 loading="lazy"
-                                phx-click="seek_sample"
-                                phx-value-file={entry.path}
-                                phx-value-time={thumb_time(thumb_path, entry)}
                               />
                             <% end %>
                           </div>

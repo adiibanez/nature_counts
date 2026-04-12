@@ -4,7 +4,7 @@
 
 static std::string env(const char* name, const char* fallback) {
     const char* val = std::getenv(name);
-    return val ? std::string(val) : std::string(fallback);
+    return (val && val[0] != '\0') ? std::string(val) : std::string(fallback);
 }
 
 static int env_int(const char* name, int fallback) {
@@ -19,7 +19,8 @@ Config load_config() {
     std::string config_dir = env("DS_CONFIG_DIR",
         (ds_root + "/samples/configs/deepstream-app-fish").c_str());
 
-    cfg.infer_config = config_dir + "/config_infer_primary_cfd_yolov12_ds64.txt";
+    cfg.infer_config = env("INFER_CONFIG",
+        (config_dir + "/config_infer_primary_cfd_rfdetr_nano.txt").c_str());
     cfg.tracker_config = env("TRACKER_CONFIG",
         (config_dir + "/config_tracker_NvDCF_fish.yml").c_str());
     cfg.tracker_lib = ds_root + "/lib/libnvds_nvmultiobjecttracker.so";

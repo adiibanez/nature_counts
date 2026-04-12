@@ -77,6 +77,8 @@ services:
       DEEPSTREAM_TOKEN: "${DEEPSTREAM_TOKEN:-dev-secret-token}"
       # Set to 0 to disable thumbnail generation on boot (can be toggled at runtime from UI)
       ENABLE_THUMBNAILS: "${ENABLE_THUMBNAILS:-0}"
+      # Override to switch detector model (e.g. RF-DETR config path)
+      INFER_CONFIG: "${INFER_CONFIG:-}"
     volumes:
       - ./deepstream-app-fish:/opt/nvidia/deepstream/deepstream-6.4/samples/configs/deepstream-app-fish
       - ./videos:/videos
@@ -111,7 +113,9 @@ services:
       DATABASE_URL: "ecto://naturecounts:${POSTGRES_PASSWORD:-naturecounts_dev}@postgres:5433/naturecounts"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       VLM_MODEL: "${VLM_MODEL:-claude-sonnet-4-6}"
+      DETECTOR_MODEL_PATH: "${DETECTOR_MODEL_PATH:-/models/community-fish-detector-2026.02.02-rf-detr-nano-640.pth}"
       YOLO_MODEL_PATH: "/models/cfd-yolov12x-1.00.pt"
+      RFDETR_MODEL_PATH: "/models/community-fish-detector-2026.02.02-rf-detr-nano-640.pth"
       FISHIAL_MODEL_DIR: "/models/fishial"
       DEEPSTREAM_CONTAINER_NAME: "2022_naturecounts-deepstream-1"
     volumes:

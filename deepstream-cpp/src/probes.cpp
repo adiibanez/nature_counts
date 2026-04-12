@@ -2,7 +2,10 @@
 #include "thumbnail.h"
 
 #include <gstnvdsmeta.h>
+#include <nvdsmeta.h>
+#include <nvll_osd_struct.h>
 
+#include <algorithm>
 #include <atomic>
 #include <ctime>
 #include <unordered_map>
@@ -31,7 +34,38 @@ static GstPadProbeReturn tracker_src_probe(
         int source_id = frame_meta->source_id;
         guint64 pts = frame_meta->buf_pts;
 
-        // Rate limit: ~2 pushes per second per source (time-based)
+        // --- OSD label styling (runs on EVERY frame) ---
+        for (NvDsMetaList* l_obj = frame_meta->obj_meta_list;
+             l_obj != nullptr; l_obj = l_obj->next)
+        {
+            auto* obj_meta = static_cast<NvDsObjectMeta*>(l_obj->data);
+            int class_id = obj_meta->class_id;
+            const char* lbl = (class_id < static_cast<int>(g_cfg->labels.size()))
+                ? g_cfg->labels[class_id].c_str() : "object";
+
+            char txt[64];
+            float conf = obj_meta->confidence;
+            if (conf >= 0.0f)
+                snprintf(txt, sizeof(txt), "%s #%lu %.0f%%",
+                         lbl, obj_meta->object_id, conf * 100.0f);
+            else
+                snprintf(txt, sizeof(txt), "%s #%lu",
+                         lbl, obj_meta->object_id);
+
+            // Zero the struct to avoid freeing unknown pointers, then populate.
+            memset(&obj_meta->text_params, 0, sizeof(obj_meta->text_params));
+            auto& tp = obj_meta->text_params;
+            tp.display_text = g_strdup(txt);
+            tp.x_offset = static_cast<int>(obj_meta->rect_params.left);
+            tp.y_offset = std::max(0, static_cast<int>(obj_meta->rect_params.top) - 28);
+            tp.font_params.font_name = g_strdup("Sans Bold");
+            tp.font_params.font_size = 18;
+            tp.font_params.font_color = {1.0, 1.0, 1.0, 1.0};  // white
+            tp.set_bg_clr = 1;
+            tp.text_bg_clr = {0.0, 0.0, 0.0, 0.6};  // semi-transparent black
+        }
+
+        // --- Rate-limited Phoenix push (~2/sec per source) ---
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         int64_t now_ms = static_cast<int64_t>(ts.tv_sec) * 1000
@@ -50,7 +84,6 @@ static GstPadProbeReturn tracker_src_probe(
             int class_id = obj_meta->class_id;
             const char* label = (class_id < static_cast<int>(g_cfg->labels.size()))
                 ? g_cfg->labels[class_id].c_str() : "object";
-
             auto& rect = obj_meta->rect_params;
 
             objects.push_back({

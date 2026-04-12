@@ -4,6 +4,7 @@
 *.onnx
 *.onnx.data
 *.pt
+*.pth
 *.whl
 *.zip
 *.tar.gz

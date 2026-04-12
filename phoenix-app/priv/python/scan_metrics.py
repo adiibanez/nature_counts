@@ -14,7 +14,7 @@ import numpy as np
 from datetime import datetime, timezone
 
 def scan_video(video_path, model_path, sample_frames):
-    from ultralytics import YOLO
+    from detectors import create_detector
 
     SIDECAR_SUFFIX = ".metrics.json"
 
@@ -59,7 +59,7 @@ def scan_video(video_path, model_path, sample_frames):
         return {"status": "error", "file": os.path.basename(video_path), "reason": "no frames"}
 
     # Load model
-    model = YOLO(model_path)
+    model = create_detector(model_path)
 
     all_areas = []
     all_confidences = []
@@ -90,20 +90,16 @@ def scan_video(video_path, model_path, sample_frames):
         frame_det_count = 0
         frame_max_conf = 0.0
         frame_classes = set()
-        results = model(frame, verbose=False, imgsz=640, conf=0.15)
-        for r in results:
-            boxes = r.boxes
-            if boxes is not None and len(boxes) > 0:
-                frame_det_count += len(boxes)
-                confs = boxes.conf.cpu().numpy()
-                frame_max_conf = max(frame_max_conf, float(confs.max()))
-                all_confidences.extend(confs.tolist())
-                cls_ids = boxes.cls.cpu().numpy().astype(int).tolist()
-                frame_classes.update(cls_ids)
-                for box in boxes.xyxy.cpu().numpy():
-                    x1, y1, x2, y2 = box[:4]
-                    area = int((x2 - x1) * (y2 - y1))
-                    all_areas.append(area)
+        xyxy, confs, cls_ids = model.predict(frame, imgsz=640, conf=0.15)
+        if len(xyxy) > 0:
+            frame_det_count = len(xyxy)
+            frame_max_conf = float(confs.max())
+            all_confidences.extend(confs.tolist())
+            frame_classes.update(cls_ids.tolist())
+            for box in xyxy:
+                x1, y1, x2, y2 = box[:4]
+                area = int((x2 - x1) * (y2 - y1))
+                all_areas.append(area)
         total_detections += frame_det_count
         per_frame_detections.append(frame_det_count)
         per_frame_max_conf.append(round(frame_max_conf, 2))

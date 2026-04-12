@@ -58,30 +58,36 @@ window._fmtTime = (s) => {
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 };
 
-// Thumbnail hover preview (fixed position to escape overflow:hidden containers)
+// Thumbnail click-to-magnify (fixed position to escape overflow:hidden containers)
 ;(() => {
   let tip = null
-  let current = null
-  document.addEventListener("mouseover", (e) => {
+  const dismiss = () => { if (tip) { tip.remove(); tip = null } }
+
+  document.addEventListener("click", (e) => {
     const img = e.target.closest("[data-full-thumb]")
-    if (!img || img === current) return
-    current = img
-    if (tip) { tip.remove(); tip = null }
+    if (!img) { dismiss(); return }
+    e.preventDefault()
+    e.stopPropagation()
+    dismiss()
     const src = img.dataset.fullThumb
     const rect = img.getBoundingClientRect()
+    // Position above the thumbnail, clamp to viewport
+    let top = rect.top - 4
+    let left = rect.left
     tip = document.createElement("img")
     tip.src = src
-    tip.style.cssText = `position:fixed;z-index:9999;pointer-events:none;width:320px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.35);left:${rect.left}px;top:${rect.top - 4}px;transform:translateY(-100%);`
+    tip.style.cssText = `position:fixed;z-index:9999;width:320px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.35);cursor:pointer;left:${left}px;top:${top}px;transform:translateY(-100%);`
+    // Dismiss on click
+    tip.addEventListener("click", dismiss)
     document.body.appendChild(tip)
-  })
-  document.addEventListener("mouseout", (e) => {
-    const img = e.target.closest("[data-full-thumb]")
-    if (!img) return
-    const related = e.relatedTarget
-    if (related && img.contains(related)) return
-    current = null
-    if (tip) { tip.remove(); tip = null }
-  })
+    // Clamp to viewport after image loads
+    tip.onload = () => {
+      if (!tip) return
+      const tr = tip.getBoundingClientRect()
+      if (tr.top < 4) tip.style.transform = "none"
+      if (tr.right > window.innerWidth - 4) tip.style.left = (window.innerWidth - 4 - tr.width) + "px"
+    }
+  }, true)
 })();
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")

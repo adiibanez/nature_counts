@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Model manifest for DeepStream fish pipeline.",
+    "'source' entries are upstream training checkpoints fetched by `mix models.fetch`.",
+    "sha256 is auto-pinned on first download — review the diff before committing.",
+    "ONNX exports are produced locally via `mix models.export` (export_*.py scripts).",
+    ".engine files are built by DeepStream on first launch and cached. Never store.",
+    ".so plugins are built from nvdsinfer_custom_impl_* via make."
+  ],
+  "models": [
+    {
+      "path": "community-fish-detector-2026.02.02-rf-detr-nano-640.pth",
+      "role": "source",
+      "sha256": "076b0a80d5dbc3361fb2be707d521ce96fe990b453fb1c215d99194fc65b4762",
+      "size": 122064141,
+      "url": "https://github.com/filippovarini/community-fish-detector/releases/download/cfd-2026.02.02-rf-detr-nano/community-fish-detector-2026.02.02-rf-detr-nano-640.pth"
+    },
+    {
+      "path": "cfd-yolov12x-1.00.pt",
+      "role": "source",
+      "sha256": "0b259afb3dca1d1d7f9d842ebf136884b2e3706b151172b266bb24e07f2b8e98",
+      "size": 119113078,
+      "url": "https://github.com/filippovarini/community-fish-detector/releases/download/cfd-1.00-yolov12x/cfd-yolov12x-1.00.pt"
+    }
+  ]
+}
