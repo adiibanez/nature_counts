@@ -64,8 +64,12 @@ const TimelinePlayhead = {
     return svg ? svg.getBoundingClientRect() : null;
   },
 
+  _getSlot() {
+    return this.el.querySelector('[id^="tl-playhead-slot-"]') || this.el;
+  },
+
   _buildPlayhead() {
-    this.el.style.position = "relative";
+    const slot = this._getSlot();
 
     const line = document.createElement("div");
     line.className = "tl-playhead";
@@ -79,7 +83,7 @@ const TimelinePlayhead = {
     handle.className = "tl-playhead-handle";
     handle.style.cssText =
       "position:absolute;top:0;bottom:0;width:14px;z-index:21;" +
-      "cursor:grab;left:0px;margin-left:-7px;";
+      "cursor:grab;left:0px;margin-left:-7px;pointer-events:auto;";
     handle.addEventListener("mousedown", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -105,8 +109,8 @@ const TimelinePlayhead = {
       if (!this._scrubbing) tip.style.opacity = "0";
     });
 
-    this.el.appendChild(line);
-    this.el.appendChild(handle);
+    slot.appendChild(line);
+    slot.appendChild(handle);
   },
 
   // Convert a fraction (0-1) to pixel offset within the container,

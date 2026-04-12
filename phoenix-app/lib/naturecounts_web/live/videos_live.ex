@@ -2419,12 +2419,17 @@ defmodule NaturecountsWeb.VideosLive do
                         </div>
                       </div>
                       <div
-                        class="flex-1 min-w-[200px]"
+                        class="flex-1 min-w-[200px] relative"
                         id={"tl-row-#{entry.name}"}
                         phx-hook="TimelinePlayhead"
                         data-duration={if entry.metrics, do: entry.metrics["duration_s"]}
                         data-active={if @selected_file == entry.path, do: "true"}
                       >
+                        <div
+                          id={"tl-playhead-slot-#{entry.name}"}
+                          phx-update="ignore"
+                          class="absolute inset-0 pointer-events-none z-20"
+                        ></div>
                         <%= if has_samples?(entry) do %>
                           <% samples = get_samples(entry) %>
                           <% n = length(samples) %>
