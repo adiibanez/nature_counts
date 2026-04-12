@@ -45,6 +45,8 @@ defmodule NaturecountsWeb.Router do
       live "/videos", VideosLive
       live "/inventory", InventoryLive
       live "/crops", CropsLive
+      live "/projects", ProjectsLive
+      live "/projects/:id", ProjectLive
     end
   end
 

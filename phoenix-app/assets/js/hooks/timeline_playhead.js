@@ -14,8 +14,14 @@ const TimelinePlayhead = {
     this._onBarLeave = this._onBarLeave.bind(this);
     this._onBarMove = this._onBarMove.bind(this);
 
+    this._dragStart = null;
+    this._dragRect = null;
+    this._onDragMove = this._onDragMove.bind(this);
+    this._onDragUp = this._onDragUp.bind(this);
+
     this._buildMetricsTip();
     this._bindSampleBars();
+    this._bindDragCreate();
 
     if (this.el.dataset.active === "true") this._activate();
   },
@@ -31,12 +37,15 @@ const TimelinePlayhead = {
     }
 
     this._bindSampleBars();
+    this._bindDragCreate();
   },
 
   destroyed() {
     this._stopRaf();
     document.removeEventListener("mousemove", this._onMove);
     document.removeEventListener("mouseup", this._onUp);
+    document.removeEventListener("mousemove", this._onDragMove);
+    document.removeEventListener("mouseup", this._onDragUp);
     if (this._metricsTip && this._metricsTip.parentNode) {
       this._metricsTip.parentNode.removeChild(this._metricsTip);
     }
@@ -238,6 +247,83 @@ const TimelinePlayhead = {
 
   _onBarMove(e) {
     this._positionTip(e);
+  },
+
+  _bindDragCreate() {
+    const svg = this.el.querySelector("svg");
+    if (!svg) return;
+    if (this._boundSvg === svg) return;
+    this._boundSvg = svg;
+    svg.addEventListener("mousedown", (e) => this._onDragDown(e));
+  },
+
+  _onDragDown(e) {
+    if (this.el.dataset.projectActive !== "true") return;
+    if (e.button !== 0) return;
+    if (e.shiftKey || e.metaKey || e.ctrlKey) return;
+
+    const dur = parseFloat(this.el.dataset.duration);
+    if (!dur || !isFinite(dur)) return;
+
+    this._dragStart = { x: e.clientX, frac: this._clientXToFrac(e.clientX) };
+    document.addEventListener("mousemove", this._onDragMove);
+    document.addEventListener("mouseup", this._onDragUp);
+  },
+
+  _onDragMove(e) {
+    if (!this._dragStart) return;
+    const dx = Math.abs(e.clientX - this._dragStart.x);
+    if (dx < 4) return;
+
+    if (!this._dragRect) {
+      const slot = this._getSlot();
+      const r = document.createElement("div");
+      r.style.cssText =
+        "position:absolute;top:0;bottom:0;background:hsl(142,70%,50%);" +
+        "opacity:0.35;pointer-events:none;z-index:15;border:1px solid hsl(142,70%,40%);";
+      slot.appendChild(r);
+      this._dragRect = r;
+    }
+
+    const frac = this._clientXToFrac(e.clientX);
+    const a = Math.min(this._dragStart.frac, frac);
+    const b = Math.max(this._dragStart.frac, frac);
+    const ax = this._fracToPx(a);
+    const bx = this._fracToPx(b);
+    this._dragRect.style.left = ax + "px";
+    this._dragRect.style.width = (bx - ax) + "px";
+  },
+
+  _onDragUp(e) {
+    document.removeEventListener("mousemove", this._onDragMove);
+    document.removeEventListener("mouseup", this._onDragUp);
+
+    const start = this._dragStart;
+    this._dragStart = null;
+
+    if (this._dragRect) {
+      this._dragRect.remove();
+      this._dragRect = null;
+    }
+
+    if (!start) return;
+
+    const dx = Math.abs(e.clientX - start.x);
+    if (dx < 4) return; // treat as click — let other handlers fire
+
+    const dur = parseFloat(this.el.dataset.duration);
+    const file = this.el.dataset.file;
+    if (!dur || !file) return;
+
+    const endFrac = this._clientXToFrac(e.clientX);
+    const a = Math.min(start.frac, endFrac);
+    const b = Math.max(start.frac, endFrac);
+
+    this.pushEvent("add_segment_from_drag", {
+      file: file,
+      start: a * dur,
+      end: b * dur,
+    });
   },
 
   _positionTip(e) {

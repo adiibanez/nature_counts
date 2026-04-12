@@ -3,6 +3,7 @@ defmodule NaturecountsWeb.VideosLive do
 
   alias Naturecounts.Repo
   alias Naturecounts.CameraSettings
+  alias Naturecounts.Clips
   alias Naturecounts.Offline.{Video, Annotation, Profiles, ProcessVideoWorker, ScanMetricsWorker, FixTimestampsWorker, ThumbnailWorker, VlmContexts}
   alias Naturecounts.Storage.{GCS, GCSBuckets}
 
@@ -82,8 +83,12 @@ defmodule NaturecountsWeb.VideosLive do
        new_bucket_creds: "",
        bucket_test_result: nil,
        preview_floating: saved_ui["preview_floating"] || false,
-       show_thumbs: saved_ui["show_thumbs"] || false
+       show_thumbs: saved_ui["show_thumbs"] || false,
+       projects: Clips.list_projects(),
+       active_project: load_active_project(saved_ui["active_project_id"]),
+       project_segments_by_file: %{}
      )
+     |> reload_project_segments()
      |> then(fn s -> if saved_ui["preview_floating"], do: push_event(s, "set_preview_floating", %{floating: true}), else: s end)
      |> recompute_metrics()}
   end
@@ -1066,6 +1071,100 @@ defmodule NaturecountsWeb.VideosLive do
 
   def handle_event("cancel_edit_annotation", _params, socket) do
     {:noreply, assign(socket, editing_annotation: nil)}
+  end
+
+  def handle_event("set_active_project", %{"id" => id}, socket) do
+    project_id =
+      case id do
+        "" -> nil
+        id -> String.to_integer(id)
+      end
+
+    CameraSettings.put("videos_ui", %{"active_project_id" => project_id})
+
+    {:noreply,
+     socket
+     |> assign(active_project: load_active_project(project_id))
+     |> reload_project_segments()}
+  end
+
+  def handle_event("create_project_inline", %{"name" => name}, socket) do
+    name = String.trim(name)
+
+    if name == "" do
+      {:noreply, socket}
+    else
+      case Clips.create_project(%{"name" => name}) do
+        {:ok, project} ->
+          CameraSettings.put("videos_ui", %{"active_project_id" => project.id})
+
+          {:noreply,
+           socket
+           |> assign(projects: Clips.list_projects(), active_project: load_active_project(project.id))
+           |> reload_project_segments()
+           |> put_flash(:info, "Project '#{project.name}' created and activated")}
+
+        {:error, _} ->
+          {:noreply, put_flash(socket, :error, "could not create project")}
+      end
+    end
+  end
+
+  def handle_event("add_annotation_to_project", %{"id" => ann_id}, socket) do
+    case socket.assigns.active_project do
+      nil ->
+        {:noreply, put_flash(socket, :error, "Select an active project first")}
+
+      project ->
+        ann = Repo.get!(Annotation, String.to_integer(ann_id))
+        file_path = resolve_annotation_file_path(ann.filename, socket.assigns.current_dir)
+
+        end_s = ann.end_seconds || ann.timestamp_seconds + 5.0
+
+        attrs = %{
+          "file_path" => file_path,
+          "start_seconds" => ann.timestamp_seconds,
+          "end_seconds" => end_s,
+          "label" => ann.text,
+          "source_annotation_id" => ann.id
+        }
+
+        case Clips.add_segment(project, attrs) do
+          {:ok, _seg} ->
+            {:noreply,
+             socket
+             |> reload_project_segments()
+             |> put_flash(:info, "Added segment to '#{project.name}'")}
+
+          {:error, _cs} ->
+            {:noreply, put_flash(socket, :error, "could not add segment")}
+        end
+    end
+  end
+
+  def handle_event("add_segment_from_drag", %{"file" => file, "start" => start_s, "end" => end_s}, socket) do
+    case socket.assigns.active_project do
+      nil ->
+        {:noreply, put_flash(socket, :error, "Select an active project first")}
+
+      project ->
+        attrs = %{
+          "file_path" => file,
+          "start_seconds" => to_float(start_s),
+          "end_seconds" => to_float(end_s)
+        }
+
+        case Clips.add_segment(project, attrs) do
+          {:ok, _} ->
+            {:noreply,
+             socket
+             |> reload_project_segments()
+             |> put_flash(:info, "Segment added")}
+
+          {:error, _} ->
+            {:noreply, put_flash(socket, :error, "could not add segment")}
+        end
+    end
   end
 
   def handle_event("save_annotation", %{"id" => id, "annotation" => params}, socket) do
@@ -2090,12 +2189,78 @@ defmodule NaturecountsWeb.VideosLive do
     Process.send_after(self(), :refresh, @refresh_interval)
   end
 
+  defp load_active_project(nil), do: nil
+  defp load_active_project(id) when is_integer(id), do: Clips.get_project(id)
+  defp load_active_project(id) when is_binary(id) do
+    case Integer.parse(id) do
+      {n, _} -> Clips.get_project(n)
+      :error -> nil
+    end
+  end
+
+  defp reload_project_segments(socket) do
+    case socket.assigns[:active_project] do
+      nil ->
+        assign(socket, project_segments_by_file: %{})
+
+      project ->
+        by_file = Enum.group_by(project.segments, & &1.file_path)
+        # Reload project to pick up any new segments
+        fresh = Clips.get_project(project.id)
+        assign(socket, active_project: fresh, project_segments_by_file: by_file_from(fresh))
+    end
+  end
+
+  defp by_file_from(nil), do: %{}
+  defp by_file_from(project), do: Enum.group_by(project.segments, & &1.file_path)
+
+  # Annotations store only the basename; resolve to a full file_path using the
+  # current directory or by searching the file browser tree.
+  defp resolve_annotation_file_path(filename, current_dir) do
+    candidate = Path.join(current_dir, filename)
+    if File.exists?(candidate), do: candidate, else: filename
+  end
+
+  defp to_float(v) when is_number(v), do: v / 1
+  defp to_float(v) when is_binary(v) do
+    case Float.parse(v) do
+      {f, _} -> f
+      :error -> 0.0
+    end
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
     <div class="p-4 space-y-4">
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between gap-4">
         <h1 class="text-2xl font-bold">Video Processing</h1>
+
+        <div class="flex items-center gap-2 text-xs">
+          <span class="text-base-content/60">Active project:</span>
+          <form phx-change="set_active_project" class="m-0">
+            <select name="id" class="select select-xs select-bordered min-w-[180px]">
+              <option value="">— none —</option>
+              <%= for p <- @projects do %>
+                <option value={p.id} selected={@active_project && @active_project.id == p.id}>
+                  {p.name} ({length(p.segments)})
+                </option>
+              <% end %>
+            </select>
+          </form>
+          <%= if @active_project do %>
+            <.link navigate={~p"/projects/#{@active_project.id}"} class="btn btn-xs btn-ghost">
+              Open
+            </.link>
+          <% end %>
+          <form phx-submit="create_project_inline" class="flex gap-1 m-0">
+            <input
+              name="name"
+              placeholder="New project…"
+              class="input input-xs input-bordered w-32"
+            />
+          </form>
+        </div>
       </div>
 
       <%!-- Tab bar --%>
@@ -2424,6 +2589,8 @@ defmodule NaturecountsWeb.VideosLive do
                         phx-hook="TimelinePlayhead"
                         data-duration={if entry.metrics, do: entry.metrics["duration_s"]}
                         data-active={if @selected_file == entry.path, do: "true"}
+                        data-file={entry.path}
+                        data-project-active={if @active_project, do: "true"}
                       >
                         <div
                           id={"tl-playhead-slot-#{entry.name}"}
@@ -2436,8 +2603,15 @@ defmodule NaturecountsWeb.VideosLive do
                           <% file_duration = (entry.metrics && entry.metrics["duration_s"]) || 1 %>
                           <% file_anns = Map.get(@annotations_by_file, entry.name, []) %>
                           <% has_anns = file_anns != [] %>
-                          <% svg_h = if has_anns, do: 36, else: 30 %>
-                          <svg viewBox={"0 0 200 #{svg_h}"} class={"w-full #{if has_anns, do: "h-9", else: "h-8"}"} preserveAspectRatio="none">
+                          <% file_segs = Map.get(@project_segments_by_file, entry.path, []) %>
+                          <% has_segs = file_segs != [] %>
+                          <% svg_h = 30 + (if has_anns, do: 6, else: 0) + (if has_segs, do: 6, else: 0) %>
+                          <% svg_class_h = cond do
+                            has_anns and has_segs -> "h-10"
+                            has_anns or has_segs -> "h-9"
+                            true -> "h-8"
+                          end %>
+                          <svg viewBox={"0 0 200 #{svg_h}"} class={"w-full #{svg_class_h}"} preserveAspectRatio="none">
                             <rect x="0" y="0" width="200" height="30" fill="currentColor" opacity="0.03" rx="2" />
                             <%!-- Detection bars (clickable, time-based x) --%>
                             <% bar_w = max(200 / max(n, 1) - 1, 2) %>
@@ -2494,6 +2668,23 @@ defmodule NaturecountsWeb.VideosLive do
                                     class="pointer-events-none"
                                 />
                               <% end %>
+                            <% end %>
+                          <% end %>
+                          <%!-- Project segment ghosts --%>
+                          <%= if has_segs do %>
+                            <% seg_y = if has_anns, do: 37, else: 31 %>
+                            <rect x="0" y={seg_y} width="200" height="5" fill="hsl(142, 70%, 50%)" opacity="0.08" rx="1" class="pointer-events-none" />
+                            <%= for seg <- file_segs do %>
+                              <rect
+                                x={Float.round(seg.start_seconds / file_duration * 200, 1)}
+                                y={seg_y}
+                                width={Float.round(max((seg.end_seconds - seg.start_seconds) / file_duration * 200, 2), 1)}
+                                height="5"
+                                fill="hsl(142, 70%, 50%)" opacity="0.85" rx="1"
+                                class="pointer-events-none"
+                              >
+                                <title>segment #{seg.position}: {seg.label || "(unlabeled)"}</title>
+                              </rect>
                             <% end %>
                           <% end %>
                           </svg>
@@ -3058,6 +3249,14 @@ defmodule NaturecountsWeb.VideosLive do
                               {format_timestamp(ann.timestamp_seconds)}<%= if ann.end_seconds do %>–{format_timestamp(ann.end_seconds)}<% end %>
                             </button>
                             <button class="flex-1 text-left hover:text-primary cursor-pointer" phx-click="select_annotation_file" phx-value-filename={filename} onclick={"window._pendingSeek=#{ann.timestamp_seconds}"}>{ann.text}</button>
+                            <%= if @active_project do %>
+                              <button
+                                class="btn btn-xs btn-ghost text-primary"
+                                phx-click="add_annotation_to_project"
+                                phx-value-id={ann.id}
+                                title={"Add to '#{@active_project.name}'"}
+                              >+ clip</button>
+                            <% end %>
                             <button class="btn btn-xs btn-ghost" phx-click="edit_annotation" phx-value-id={ann.id}>Edit</button>
                             <button class="btn btn-xs btn-ghost text-error" phx-click="delete_annotation" phx-value-id={ann.id}>✕</button>
                           </div>
@@ -3126,6 +3325,14 @@ defmodule NaturecountsWeb.VideosLive do
                         <button class="flex-1 text-left hover:text-primary cursor-pointer" onclick={"var v=document.querySelector('#video-preview-hook video');if(v){v.currentTime=#{ann.timestamp_seconds};v.play()}"}>
                           {ann.text}
                         </button>
+                        <%= if @active_project do %>
+                          <button
+                            class="btn btn-xs btn-ghost text-primary"
+                            phx-click="add_annotation_to_project"
+                            phx-value-id={ann.id}
+                            title={"Add to '#{@active_project.name}'"}
+                          >+ clip</button>
+                        <% end %>
                         <button class="btn btn-xs btn-ghost" phx-click="edit_annotation" phx-value-id={ann.id}>Edit</button>
                         <button class="btn btn-xs btn-ghost text-error" phx-click="delete_annotation" phx-value-id={ann.id}>✕</button>
                       </div>

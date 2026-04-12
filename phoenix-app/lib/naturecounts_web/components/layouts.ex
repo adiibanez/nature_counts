@@ -50,6 +50,7 @@ defmodule NaturecountsWeb.Layouts do
             <li><.link navigate={~p"/videos"} class={nav_class(@current_path, "/videos")}>Offline videos</.link></li>
             <li><.link navigate={~p"/inventory"} class={nav_class(@current_path, "/inventory")}>Inventory</.link></li>
             <li><.link navigate={~p"/crops"} class={nav_class(@current_path, "/crops")}>Crops</.link></li>
+            <li><.link navigate={~p"/projects"} class={nav_class(@current_path, "/projects")}>Projects</.link></li>
             <li><.theme_toggle /></li>
           </ul>
         </div>
